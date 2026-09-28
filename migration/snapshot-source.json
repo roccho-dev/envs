@@ -1,6 +1,7 @@
 {
   "kind": "envs.cleanSnapshotSource.v1",
-  "source_repository": "roccho-dev/envs",
+  "source_repository": "roccho-dev/envs-old",
+  "source_repository_at_snapshot": "roccho-dev/envs",
   "source_commit": "79a9c5e3cef5420c14a240ea60d7eddfc925af73",
   "source_tree": "34a370d8b57ed0101e2dd4bb27aa851c7f8e5e80",
   "history_imported": false,

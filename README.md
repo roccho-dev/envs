@@ -4,6 +4,12 @@ This repository is the public clean snapshot of `envs`. Historical private Git a
 
 `envs` owns environment selection and binding meaning. Artifact-producing repositories remain responsible for source, version, immutable bytes, hash, runtime closure, unpacking, and package identity.
 
+## Migration provenance
+
+Current migration authority is `roccho-dev/envs#2`. Exact snapshot lineage and the terminal disposition of the former private GitHub surface are recorded under [`migration/`](migration/README.md).
+
+The private historical repository is evidence only. Building, reviewing, or extending current `envs` must not require access to it.
+
 ## Package boundary
 
 A package binding contains only:

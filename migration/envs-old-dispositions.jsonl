@@ -1,0 +1,35 @@
+{"kind":"envs.oldGitHubDisposition.v1","old_ref":"roccho-dev/envs-old#10","old_item_kind":"issue","disposition":"REAUTHOR_NOW","current_ref":"roccho-dev/envs#5"}
+{"kind":"envs.oldGitHubDisposition.v1","old_ref":"roccho-dev/envs-old#11","old_item_kind":"issue","disposition":"HOLD","current_ref":"roccho-dev/envs#8","restart_condition":"A current ownership decision and current consumer require Windows-native Herdr placement."}
+{"kind":"envs.oldGitHubDisposition.v1","old_ref":"roccho-dev/envs-old#22","old_item_kind":"issue","disposition":"HOLD","current_ref":"roccho-dev/envs#8","restart_condition":"A current owner and consumer adopt the Windows-native terminal path."}
+{"kind":"envs.oldGitHubDisposition.v1","old_ref":"roccho-dev/envs-old#30","old_item_kind":"issue","disposition":"ABSORB","current_ref":"roccho-dev/envs#8"}
+{"kind":"envs.oldGitHubDisposition.v1","old_ref":"roccho-dev/envs-old#81","old_item_kind":"issue","disposition":"SUPERSEDED","current_ref":"roccho-dev/envs#8","restart_condition":"Only a new accepted owner decision may introduce a bounded current OCI responsibility."}
+{"kind":"envs.oldGitHubDisposition.v1","old_ref":"roccho-dev/envs-old#83","old_item_kind":"issue","disposition":"REAUTHOR_NOW","current_ref":"roccho-dev/envs#6"}
+{"kind":"envs.oldGitHubDisposition.v1","old_ref":"roccho-dev/envs-old#85","old_item_kind":"issue","disposition":"HOLD","current_ref":"roccho-dev/envs#8","restart_condition":"A current accepted home-retirement boundary and current consumer require an envs-owned projection."}
+{"kind":"envs.oldGitHubDisposition.v1","old_ref":"roccho-dev/envs-old#87","old_item_kind":"issue","disposition":"ABSORB","current_ref":"roccho-dev/envs#2"}
+{"kind":"envs.oldGitHubDisposition.v1","old_ref":"roccho-dev/envs-old#89","old_item_kind":"issue","disposition":"HOLD","current_ref":"roccho-dev/envs#8","restart_condition":"A current accepted parent and exact producer handoff require envs-owned target placement."}
+{"kind":"envs.oldGitHubDisposition.v1","old_ref":"roccho-dev/envs-old#91","old_item_kind":"issue","disposition":"HOLD","current_ref":"roccho-dev/envs#8","restart_condition":"Current envs imports the affected Windows path guard and reproduces the regression."}
+{"kind":"envs.oldGitHubDisposition.v1","old_ref":"roccho-dev/envs-old#92","old_item_kind":"issue","disposition":"HOLD","current_ref":"roccho-dev/envs#8","restart_condition":"Current envs imports the affected policy source and renderer."}
+{"kind":"envs.oldGitHubDisposition.v1","old_ref":"roccho-dev/envs-old#93","old_item_kind":"issue","disposition":"REJECT","current_ref":"roccho-dev/envs#2","restart_condition":"A new accepted current issue defines a concrete consumer and bounded contract."}
+{"kind":"envs.oldGitHubDisposition.v1","old_ref":"roccho-dev/envs-old#94","old_item_kind":"issue","disposition":"RETAIN_PRIVATE_HISTORY","current_ref":"roccho-dev/envs-old#137"}
+{"kind":"envs.oldGitHubDisposition.v1","old_ref":"roccho-dev/envs-old#96","old_item_kind":"issue","disposition":"ABSORB","current_ref":"roccho-dev/envs#2"}
+{"kind":"envs.oldGitHubDisposition.v1","old_ref":"roccho-dev/envs-old#103","old_item_kind":"issue","disposition":"REAUTHOR_NOW","current_ref":"roccho-dev/envs#7"}
+{"kind":"envs.oldGitHubDisposition.v1","old_ref":"roccho-dev/envs-old#105","old_item_kind":"issue","disposition":"SUPERSEDED","current_ref":"roccho-dev/envs#2"}
+{"kind":"envs.oldGitHubDisposition.v1","old_ref":"roccho-dev/envs-old#129","old_item_kind":"issue","disposition":"SUPERSEDED","current_ref":"roccho-dev/envs#2"}
+{"kind":"envs.oldGitHubDisposition.v1","old_ref":"roccho-dev/envs-old#133","old_item_kind":"issue","disposition":"ABSORB","current_ref":"roccho-dev/envs#2"}
+{"kind":"envs.oldGitHubDisposition.v1","old_ref":"roccho-dev/envs-old#134","old_item_kind":"issue","disposition":"ABSORB","current_ref":"roccho-dev/envs#2"}
+{"kind":"envs.oldGitHubDisposition.v1","old_ref":"roccho-dev/envs-old#16","old_item_kind":"pull_request","disposition":"HOLD","current_ref":"roccho-dev/envs#8","restart_condition":"A current ownership decision requires the same behavior and a clean PR is written from public main."}
+{"kind":"envs.oldGitHubDisposition.v1","old_ref":"roccho-dev/envs-old#59","old_item_kind":"pull_request","disposition":"RETAIN_PRIVATE_HISTORY","current_ref":"roccho-dev/envs#8"}
+{"kind":"envs.oldGitHubDisposition.v1","old_ref":"roccho-dev/envs-old#73","old_item_kind":"pull_request","disposition":"RETAIN_PRIVATE_HISTORY","current_ref":"roccho-dev/envs#8"}
+{"kind":"envs.oldGitHubDisposition.v1","old_ref":"roccho-dev/envs-old#82","old_item_kind":"pull_request","disposition":"SUPERSEDED","current_ref":"roccho-dev/envs#8","restart_condition":"A new accepted current contract requires a bounded envs-owned OCI surface."}
+{"kind":"envs.oldGitHubDisposition.v1","old_ref":"roccho-dev/envs-old#84","old_item_kind":"pull_request","disposition":"REAUTHOR_NOW","current_ref":"roccho-dev/envs#6"}
+{"kind":"envs.oldGitHubDisposition.v1","old_ref":"roccho-dev/envs-old#86","old_item_kind":"pull_request","disposition":"HOLD","current_ref":"roccho-dev/envs#8","restart_condition":"The current classification accepts an envs-owned home-retirement projection."}
+{"kind":"envs.oldGitHubDisposition.v1","old_ref":"roccho-dev/envs-old#88","old_item_kind":"pull_request","disposition":"RETAIN_PRIVATE_HISTORY","current_ref":"roccho-dev/envs#8"}
+{"kind":"envs.oldGitHubDisposition.v1","old_ref":"roccho-dev/envs-old#90","old_item_kind":"pull_request","disposition":"HOLD","current_ref":"roccho-dev/envs#8","restart_condition":"A current accepted producer/target contract assigns bounded placement to envs."}
+{"kind":"envs.oldGitHubDisposition.v1","old_ref":"roccho-dev/envs-old#104","old_item_kind":"pull_request","disposition":"REAUTHOR_NOW","current_ref":"roccho-dev/envs#7"}
+{"kind":"envs.oldGitHubDisposition.v1","old_ref":"roccho-dev/envs-old#114","old_item_kind":"pull_request","disposition":"SUPERSEDED","current_ref":"roccho-dev/envs#2"}
+{"kind":"envs.oldGitHubDisposition.v1","old_ref":"roccho-dev/envs-old#120","old_item_kind":"pull_request","disposition":"SUPERSEDED","current_ref":"roccho-dev/envs#2"}
+{"kind":"envs.oldGitHubDisposition.v1","old_ref":"roccho-dev/envs-old#121","old_item_kind":"pull_request","disposition":"SUPERSEDED","current_ref":"roccho-dev/envs#2"}
+{"kind":"envs.oldGitHubDisposition.v1","old_ref":"roccho-dev/envs-old#125","old_item_kind":"pull_request","disposition":"SUPERSEDED","current_ref":"roccho-dev/envs#2"}
+{"kind":"envs.oldGitHubDisposition.v1","old_ref":"roccho-dev/envs-old#130","old_item_kind":"pull_request","disposition":"SUPERSEDED","current_ref":"roccho-dev/envs#2","restart_condition":"A target without a native auth slot has a concrete current need for an auxiliary distribution."}
+{"kind":"envs.oldGitHubDisposition.v1","old_ref":"roccho-dev/envs-old#131","old_item_kind":"pull_request","disposition":"OWNED_BY_OTHER_REPOSITORY","current_ref":"roccho-dev/windows#2"}
+{"kind":"envs.oldGitHubDisposition.v1","old_ref":"roccho-dev/envs-old#132","old_item_kind":"pull_request","disposition":"OWNED_BY_OTHER_REPOSITORY","current_ref":"roccho-dev/ops#434"}
