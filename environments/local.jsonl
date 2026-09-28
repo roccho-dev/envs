@@ -1,0 +1,2 @@
+{"id":"voice-ui.local","kind":"envs.applicationEnvironment.v1","application":"voice-ui","environment":"local","bindingRef":"voice-ui"}
+{"id":"local-auth","kind":"envs.authEnvironment.v1","environment":"local","availableCapabilities":["jev-api"]}

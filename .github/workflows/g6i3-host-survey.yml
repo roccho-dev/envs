@@ -1,0 +1,90 @@
+name: g6i3-host-survey
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - proposals
+    paths:
+      - hosts/g6i3.profile.json
+      - hosts/g6i3.desired.jsonl
+      - internal/hostsurvey/**
+      - cmd/envctl-survey/**
+      - .github/workflows/g6i3-host-survey.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build-survey:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version-file: go.mod
+      - name: Build the survey binary
+        run: go build -trimpath -o envctl-survey ./cmd/envctl-survey
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: envctl-survey-linux-amd64
+          path: envctl-survey
+          if-no-files-found: error
+
+  survey-g6i3:
+    needs: build-survey
+    runs-on: [self-hosted, linux, x64, g6i3]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: envctl-survey-linux-amd64
+      - name: Assert the exact target host
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(hostname -s | tr '[:upper:]' '[:lower:]')" = g6i3
+      - name: Verify the tailnet SSOT projection
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error \
+            http://nixos-vm:46121/v1/hosts/g6i3 \
+            --output "$RUNNER_TEMP/g6i3.tailnet.jsonl"
+          cmp hosts/g6i3.desired.jsonl "$RUNNER_TEMP/g6i3.tailnet.jsonl"
+      - name: Survey and reconcile twice
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x ./envctl-survey
+          ./envctl-survey \
+            -host g6i3 \
+            -profile hosts/g6i3.profile.json \
+            -requirements "$RUNNER_TEMP/g6i3.tailnet.jsonl" \
+            -survey-output "$RUNNER_TEMP/survey-1.json" \
+            -reconciliation-output "$RUNNER_TEMP/reconciliation-1.json"
+          ./envctl-survey \
+            -host g6i3 \
+            -profile hosts/g6i3.profile.json \
+            -requirements "$RUNNER_TEMP/g6i3.tailnet.jsonl" \
+            -survey-output "$RUNNER_TEMP/survey-2.json" \
+            -reconciliation-output "$RUNNER_TEMP/reconciliation-2.json"
+          test "$(jq -r .status "$RUNNER_TEMP/reconciliation-1.json")" = survey-converged
+          cmp "$RUNNER_TEMP/reconciliation-1.json" "$RUNNER_TEMP/reconciliation-2.json"
+      - name: Upload exact host evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: g6i3-host-survey-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/g6i3.tailnet.jsonl
+            ${{ runner.temp }}/survey-1.json
+            ${{ runner.temp }}/survey-2.json
+            ${{ runner.temp }}/reconciliation-1.json
+            ${{ runner.temp }}/reconciliation-2.json
+          if-no-files-found: error
