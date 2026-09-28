@@ -35,14 +35,14 @@ case "$mode" in
     gh api --method PUT "repos/$repo/environments/dev-projection" >/dev/null
 
     printf '%s' "$JEV_API_KEY" \
-      | gh secret set JEV_API_KEY --repo "$repo" --env dev-authoring --body -
+      | gh secret set JEV_API_KEY --repo "$repo" --env dev-authoring
     gh variable set SOPS_AGE_RECIPIENTS \
       --repo "$repo" --env dev-authoring --body "$recipients"
 
     gh secret set SOPS_AGE_KEY \
       --repo "$repo" --env dev-projection < "$AGE_IDENTITY_FILE"
     printf '%s' "$CLOUDFLARE_API_TOKEN" \
-      | gh secret set CLOUDFLARE_API_TOKEN --repo "$repo" --env dev-projection --body -
+      | gh secret set CLOUDFLARE_API_TOKEN --repo "$repo" --env dev-projection
     gh variable set CLOUDFLARE_ACCOUNT_ID \
       --repo "$repo" --env dev-projection --body "$CLOUDFLARE_ACCOUNT_ID"
 
@@ -63,7 +63,7 @@ case "$mode" in
 
   status)
     gh api "repos/$repo/environments" \
-      --jq '.environments[] | [.name, .protection_rules | length] | @tsv'
+      --jq '.environments[] | [.name, (.protection_rules | length)] | @tsv'
     ;;
 
   *)
