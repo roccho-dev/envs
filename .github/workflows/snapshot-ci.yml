@@ -100,7 +100,7 @@ jobs:
 
   go-contract:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -109,8 +109,23 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Verify module dependency closure
+      - name: Verify dependencies
         run: go mod verify
+      - name: Test imported implementation
+        run: go test ./... -count=1
+      - name: Vet imported implementation
+        run: go vet ./...
+      - name: Build imported commands
+        run: go build ./...
+      - name: Prove deterministic appearance projection
+        shell: bash
+        run: |
+          set -euo pipefail
+          first="$RUNNER_TEMP/appearance-first"
+          second="$RUNNER_TEMP/appearance-second"
+          go run ./cmd/envctl-appearance -input appearance/desired.jsonl -output "$first"
+          go run ./cmd/envctl-appearance -input appearance/desired.jsonl -output "$second"
+          diff -ru "$first" "$second"
 
   nix-contract:
     runs-on: ubuntu-24.04
