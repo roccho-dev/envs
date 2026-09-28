@@ -62,7 +62,7 @@ jobs:
 
   nix-contract:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -80,3 +80,12 @@ jobs:
           nix-instantiate --parse modules/ssot-github-refs.nix >/dev/null
       - name: Evaluate root flake contracts
         run: nix flake check -L --show-trace --no-write-lock-file
+      - name: Prove real SOPS age authoring roundtrip
+        shell: bash
+        run: |
+          set -euo pipefail
+          nix shell \
+            github:NixOS/nixpkgs/f9948418dc8628ac02b6d6337e191ade9429d59d#age \
+            github:NixOS/nixpkgs/f9948418dc8628ac02b6d6337e191ade9429d59d#sops \
+            github:NixOS/nixpkgs/f9948418dc8628ac02b6d6337e191ade9429d59d#jq \
+            --command bash tests/sops-authoring-roundtrip.sh
