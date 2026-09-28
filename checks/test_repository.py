@@ -99,6 +99,7 @@ def main() -> None:
             stream.write("\nDelete `main` after migration.\n")
 
     expect_red(propose_main_deletion)
+    expect_red(replace_text("README.md", "retained compatibility branch: `main`", "retained compatibility mirror: `main`"))
 
     obsolete_field = "age_" + "recipients"
     obsolete_source = "SOURCE_" + "JEV_API_KEY"

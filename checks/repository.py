@@ -251,7 +251,7 @@ def check_readme(root: Path, environments: dict[str, dict[str, Any]]) -> None:
             require(marker in text, f"README missing {marker}")
     for marker in (
         "canonical branch: `proposals`",
-        "retained compatibility mirror: `main`",
+        "retained compatibility branch: `main`",
         "contracts/",
         "adapters/jev_api.py",
         "handoffs/dev-jev-api.json",
@@ -260,7 +260,7 @@ def check_readme(root: Path, environments: dict[str, dict[str, Any]]) -> None:
     require("delete `main`" not in text.lower(), "README proposes deleting main")
 
 
-def check_main_mirror(root: Path) -> None:
+def check_main_compatibility_refresh(root: Path) -> None:
     fetch = subprocess.run(
         ["git", "fetch", "--no-tags", "origin", "proposals"],
         cwd=root,
@@ -277,10 +277,10 @@ def check_main_mirror(root: Path) -> None:
         ["git", "rev-parse", "FETCH_HEAD"], cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, text=True
     )
     require(head.returncode == 0 and canonical.returncode == 0, "cannot resolve branch revisions")
-    require(head.stdout.strip() == canonical.stdout.strip(), "main is not an exact proposals mirror")
+    require(head.stdout.strip() == canonical.stdout.strip(), "main compatibility refresh does not equal canonical proposals")
 
 
-def inspect(root: Path = ROOT, *, verify_main_mirror: bool = False) -> dict[str, Any]:
+def inspect(root: Path = ROOT, *, verify_main_compatibility_refresh: bool = False) -> dict[str, Any]:
     check_shape(root)
     check_text(root)
     check_jsonl(root)
@@ -290,8 +290,8 @@ def inspect(root: Path = ROOT, *, verify_main_mirror: bool = False) -> dict[str,
         adapter.load_receipt(root / adapter.HANDOFF)
     check_workflows(root, environments)
     check_readme(root, environments)
-    if verify_main_mirror:
-        check_main_mirror(root)
+    if verify_main_compatibility_refresh:
+        check_main_compatibility_refresh(root)
     readiness = adapter.readiness(root)
     require(readiness["consumer_runtime_readiness"] == "OUT_OF_SCOPE", "envs claims consumer runtime readiness")
     return {
@@ -309,10 +309,10 @@ def inspect(root: Path = ROOT, *, verify_main_mirror: bool = False) -> dict[str,
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, default=ROOT)
-    parser.add_argument("--verify-main-mirror", action="store_true")
+    parser.add_argument("--verify-main-compatibility-refresh", action="store_true")
     args = parser.parse_args()
     try:
-        result = inspect(args.root.resolve(), verify_main_mirror=args.verify_main_mirror)
+        result = inspect(args.root.resolve(), verify_main_compatibility_refresh=args.verify_main_compatibility_refresh)
     except (RepositoryError, ValueError, OSError) as exc:
         print(f"REPOSITORY_CHECK=RED: {exc}", file=sys.stderr)
         return 1

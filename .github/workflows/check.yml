@@ -37,6 +37,6 @@ jobs:
       - name: Test Jev adapter
         run: python3 checks/test_jev_api.py
 
-      - name: Verify retained main mirror
+      - name: Verify explicit main compatibility refresh
         if: github.ref_name == 'main'
-        run: python3 checks/repository.py --verify-main-mirror
+        run: python3 checks/repository.py --verify-main-compatibility-refresh

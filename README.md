@@ -3,10 +3,10 @@
 `envs` holds public environment contracts, performs bounded provider projection, and returns a non-secret exact-SHA handoff.
 
 - canonical branch: `proposals`
-- retained compatibility mirror: `main`
+- retained compatibility branch: `main`
 - accepted handoff identity: exact commit SHA
 
-`main` remains available, but it has no independent meaning, direct changes, pull-request base, Environment effect, or handoff identity. Compatibility refreshes copy an accepted `proposals` revision only.
+`main` remains available, but it has no independent meaning, direct changes, pull-request base, Environment effect, or handoff identity. When `main` is refreshed, its push-time check requires that revision to equal the then-current `proposals` revision. There is no continuous synchronization claim; `main` may be stale between explicit compatibility refreshes.
 
 ## Ownership
 
