@@ -1,0 +1,134 @@
+name: snapshot-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: snapshot-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  safety-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout exact snapshot
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Verify public snapshot safety and JSONL contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+
+          root = Path('.')
+          forbidden_names = {'.env', 'id_rsa', 'id_ed25519'}
+          forbidden_suffixes = {'.pem', '.p12', '.pfx'}
+          forbidden_patterns = {
+              'age private identity': re.compile(rb'AGE-SECRET-KEY-1[0-9A-Z]{20,}'),
+              'private key header': re.compile(rb'-----BEGIN (?:OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----'),
+              'GitHub token': re.compile(rb'\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b'),
+              'AWS access key': re.compile(rb'\b(?:AKIA|ASIA)[0-9A-Z]{16}\b'),
+              'npm token': re.compile(rb'\bnpm_[A-Za-z0-9]{30,}\b'),
+              'Google API key': re.compile(rb'\bAIza[0-9A-Za-z_-]{30,}\b'),
+              'Slack token': re.compile(rb'\bxox[baprs]-[0-9A-Za-z-]{20,}\b'),
+              'Stripe live key': re.compile(rb'\bsk_live_[0-9A-Za-z]{20,}\b'),
+              'basic-auth URL': re.compile(rb'https?://[^\s/:@]+:[^\s/@]+@[^\s]+'),
+          }
+
+          for path in root.rglob('*'):
+              if not path.is_file() or '.git' in path.parts:
+                  continue
+              if path.name in forbidden_names or path.suffix.lower() in forbidden_suffixes:
+                  raise SystemExit(f'forbidden private-material filename: {path}')
+              data = path.read_bytes()
+              for label, pattern in forbidden_patterns.items():
+                  if pattern.search(data):
+                      raise SystemExit(f'{label} found in {path}')
+              if path.suffix == '.jsonl':
+                  for number, line in enumerate(data.decode().splitlines(), 1):
+                      if line.strip():
+                          value = json.loads(line)
+                          if not isinstance(value, dict):
+                              raise SystemExit(f'{path}:{number}: JSONL row is not an object')
+
+          planes = {}
+          path = Path('environments/secret-planes.jsonl')
+          for line in path.read_text().splitlines():
+              if line.strip():
+                  row = json.loads(line)
+                  planes[row['id']] = row
+
+          expected_ids = {
+              'dev.authoring', 'dev.projection', 'dev.runtime',
+              'stg.projection', 'stg.runtime',
+              'prd.projection', 'prd.runtime',
+          }
+          if set(planes) != expected_ids:
+              raise SystemExit('secret-plane set differs')
+          for plane_id in ('dev.authoring', 'dev.projection', 'stg.projection', 'prd.projection'):
+              row = planes[plane_id]
+              if row['owner'] != 'envs':
+                  raise SystemExit(f'{plane_id}: owner must be envs')
+              if row['active_github_environment'] is not None:
+                  raise SystemExit(f'{plane_id}: active Environment must be absent before configuration')
+              if row['migration_state'] != 'NOT_CONFIGURED':
+                  raise SystemExit(f'{plane_id}: migration state must be NOT_CONFIGURED')
+          for plane_id in ('dev.runtime', 'stg.runtime', 'prd.runtime'):
+              if planes[plane_id]['owner'] != 'target':
+                  raise SystemExit(f'{plane_id}: runtime must be target-owned')
+          if any('std' in value for value in planes):
+              raise SystemExit('std is forbidden; use stg')
+
+          if Path('secrets').exists():
+              raise SystemExit('secrets/ must not exist before new-key authoring')
+
+          print('SNAPSHOT_SAFETY=PASS')
+          print('SECRET_PLANES=PASS')
+          PY
+
+  go-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify module dependency closure
+        run: go mod verify
+
+  nix-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
+        with:
+          extra_nix_config: |
+            extra-experimental-features = nix-command flakes
+      - name: Parse Nix sources
+        run: |
+          set -euo pipefail
+          nix-instantiate --parse flake.nix >/dev/null
+          nix-instantiate --parse bindings/duckdb/flake.nix >/dev/null
+          nix-instantiate --parse lib/package-bindings.nix >/dev/null
+          nix-instantiate --parse modules/ssot-github-refs.nix >/dev/null
+      - name: Evaluate root flake contracts
+        run: nix flake check -L --show-trace --no-write-lock-file
