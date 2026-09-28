@@ -1,0 +1,420 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Iterable, Mapping, Sequence
+
+ROOT = Path(__file__).resolve().parents[1]
+ENVIRONMENTS = Path("contracts/environments.jsonl")
+BINDINGS = Path("contracts/bindings.jsonl")
+BOUNDARY = Path("contracts/provider-consumer.jsonl")
+CIPHERTEXT = Path("ciphertexts/dev-jev-api.sops.yaml")
+HANDOFF = Path("handoffs/dev-jev-api.json")
+RECEIPT_KIND = "envs.projectionReceipt.v1"
+
+SHA40 = re.compile(r"^[0-9a-f]{40}$")
+SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
+AGE_RECIPIENT = re.compile(r"^age1[0-9a-z]+$")
+PRIVATE_MATERIAL = (
+    re.compile(r"AGE-SECRET-KEY-1[0-9A-Z]{20,}"),
+    re.compile(r"-----BEGIN (?:OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----"),
+    re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b"),
+)
+FORBIDDEN_RECEIPT_KEYS = {
+    "secret", "secret_value", "plaintext", "private_key", "age_identity",
+    "decrypted_value", "secret_hash",
+}
+
+
+class EnvsError(ValueError):
+    pass
+
+
+Runner = Callable[
+    [Sequence[str], bytes | None, Mapping[str, str] | None],
+    subprocess.CompletedProcess[bytes],
+]
+
+
+def require(ok: bool, message: str) -> None:
+    if not ok:
+        raise EnvsError(message)
+
+
+def load_jsonl(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise EnvsError(f"{path}:{number}: invalid JSON") from exc
+        require(isinstance(value, dict), f"{path}:{number}: row must be an object")
+        rows.append(value)
+    return rows
+
+
+def write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "".join(json.dumps(row, separators=(",", ":"), ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+
+def index(path: Path) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    for row in load_jsonl(path):
+        identity = row.get("id")
+        require(isinstance(identity, str) and identity, f"{path}: missing id")
+        require(identity not in result, f"{path}: duplicate id {identity}")
+        result[identity] = row
+    return result
+
+
+def expected_bindings() -> dict[str, dict[str, Any]]:
+    return {
+        "voice-ui": {
+            "id": "voice-ui",
+            "kind": "envs.applicationBinding.v1",
+            "application": "roccho-dev/apps/packages/voice-ui",
+        },
+        "jev-api": {
+            "id": "jev-api",
+            "kind": "envs.authCapability.v1",
+            "capability": "jev-api",
+            "ciphertext": CIPHERTEXT.as_posix(),
+            "source_key": "JEV_API_KEY",
+            "target": {
+                "provider": "cloudflare-pages",
+                "project": "voice-ui",
+                "secret_name": "JEV_API_KEY",
+            },
+        },
+    }
+
+
+def validate_contracts(root: Path = ROOT) -> dict[str, dict[str, dict[str, Any]]]:
+    envs = index(root / ENVIRONMENTS)
+    bindings = index(root / BINDINGS)
+    boundary = index(root / BOUNDARY)
+
+    require(set(envs) == {
+        "dev.authoring", "dev.projection", "dev.runtime",
+        "stg.projection", "stg.runtime", "prd.projection", "prd.runtime",
+        "voice-ui.dev", "voice-ui.stg", "voice-ui.prd",
+    }, "environment set differs")
+
+    authoring = envs["dev.authoring"]
+    projection = envs["dev.projection"]
+    require(authoring["github_environment"] == "dev-authoring", "dev authoring Environment differs")
+    require(projection["github_environment"] == "dev-projection", "dev projection Environment differs")
+    recipients = authoring.get("age_recipients")
+    require(isinstance(recipients, list), "dev age recipients must be a list")
+    require(len(recipients) == len(set(recipients)), "duplicate age recipient")
+    require(all(isinstance(value, str) and AGE_RECIPIENT.fullmatch(value) for value in recipients), "invalid age recipient")
+
+    for stage in ("dev", "stg", "prd"):
+        runtime = envs[f"{stage}.runtime"]
+        require(runtime["owner"] == "target", f"{stage}.runtime must be target-owned")
+        require(runtime["github_environment"] is None, f"{stage}.runtime must not be a GitHub Environment")
+        app = envs[f"voice-ui.{stage}"]
+        require(app == {
+            "id": f"voice-ui.{stage}", "kind": "envs.applicationEnvironment.v1",
+            "application": "voice-ui", "environment": stage, "binding_ref": "voice-ui",
+        }, f"voice-ui.{stage} differs")
+
+    for stage in ("stg", "prd"):
+        item = envs[f"{stage}.projection"]
+        require(item["migration_state"] == "NOT_CONFIGURED", f"{stage}.projection must be NOT_CONFIGURED")
+        require(item["active_github_environment"] is None, f"{stage}.projection must not be active")
+
+    cipher = root / CIPHERTEXT
+    if cipher.is_file():
+        require(bool(recipients), "configured ciphertext requires an age recipient")
+        for identity, name in (("dev.authoring", "dev-authoring"), ("dev.projection", "dev-projection")):
+            item = envs[identity]
+            require(item["active_github_environment"] == name, f"{identity} active Environment differs")
+            require(item["migration_state"] == "ACTIVE", f"{identity} must be ACTIVE")
+        validate_ciphertext(cipher.read_bytes(), None, recipients)
+    else:
+        for identity in ("dev.authoring", "dev.projection"):
+            item = envs[identity]
+            require(item["active_github_environment"] is None, f"{identity} must not be active")
+            require(item["migration_state"] == "NOT_CONFIGURED", f"{identity} must be NOT_CONFIGURED")
+
+    require(bindings == expected_bindings(), "binding set differs")
+    require(set(boundary) == {
+        "repository.branch-policy", "dev.jev-api.provider",
+        "apps.voice-ui.consumer", "ops.voice-ui.consumer", "normal.consumer.path",
+    }, "provider-consumer boundary set differs")
+    require(boundary["repository.branch-policy"] == {
+        "id": "repository.branch-policy", "kind": "envs.branchPolicy.v1",
+        "canonical_branch": "proposals", "default_branch": "proposals",
+        "retained_compatibility_branches": ["main"],
+        "direct_change_forbidden": ["main"],
+        "effect_source_branches": ["proposals"],
+        "handoff_ref_kind": "exact_commit_sha",
+    }, "branch policy differs")
+    require(boundary["dev.jev-api.provider"]["does_not_own"] == [
+        "application_runtime_acceptance", "consumer_independent_execution",
+    ], "provider must not own consumer readiness")
+    return {"environments": envs, "bindings": bindings, "boundary": boundary}
+
+
+def default_runner(argv: Sequence[str], input_data: bytes | None, env: Mapping[str, str] | None) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        list(argv), input=input_data, env=None if env is None else dict(env),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, shell=False,
+    )
+
+
+def run_checked(argv: Sequence[str], *, label: str, input_data: bytes | None = None,
+                env: Mapping[str, str] | None = None, runner: Runner = default_runner) -> subprocess.CompletedProcess[bytes]:
+    result = runner(argv, input_data, env)
+    require(result.returncode == 0, f"{label} failed")
+    return result
+
+
+def validate_ciphertext(data: bytes, secret: bytes | None, recipients: list[str]) -> None:
+    text = data.decode("utf-8", errors="strict")
+    require("JEV_API_KEY: ENC[AES256_GCM," in text and "\nsops:" in text, "invalid SOPS ciphertext")
+    require(not any(pattern.search(text) for pattern in PRIVATE_MATERIAL), "private material found in ciphertext")
+    if secret is not None:
+        require(secret not in data, "plaintext survived encryption")
+    actual = sorted(re.findall(r"(?m)^\s*-?\s*recipient:\s*(age1[0-9a-z]+)\s*$", text))
+    require(actual == sorted(recipients), "ciphertext recipient set differs")
+
+
+def set_dev_active(root: Path, active: bool) -> None:
+    rows = load_jsonl(root / ENVIRONMENTS)
+    for row in rows:
+        if row.get("id") in {"dev.authoring", "dev.projection"}:
+            row["active_github_environment"] = row["github_environment"] if active else None
+            row["migration_state"] = "ACTIVE" if active else "NOT_CONFIGURED"
+    write_jsonl(root / ENVIRONMENTS, rows)
+
+
+def clean_env(extra: Mapping[str, str]) -> dict[str, str]:
+    result = {key: value for key, value in os.environ.items() if key in {"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "CI"}}
+    result.update(extra)
+    return result
+
+
+def author(root: Path = ROOT, runner: Runner = default_runner) -> dict[str, Any]:
+    contracts = validate_contracts(root)
+    source = os.environ.get("SOURCE_JEV_API_KEY", "")
+    require(source != "", "SOURCE_JEV_API_KEY is missing")
+    recipients = contracts["environments"]["dev.authoring"]["age_recipients"]
+    require(bool(recipients), "dev age recipient is not configured")
+
+    payload = json.dumps({"JEV_API_KEY": source}, separators=(",", ":")).encode() + b"\n"
+    result = run_checked(
+        [os.environ.get("SOPS_BIN", "sops"), "--encrypt", "--input-type", "json", "--output-type", "yaml", "/dev/stdin"],
+        input_data=payload,
+        env=clean_env({"SOPS_AGE_RECIPIENTS": ",".join(recipients)}),
+        runner=runner,
+        label="SOPS encryption",
+    )
+    validate_ciphertext(result.stdout, source.encode(), recipients)
+    target = root / CIPHERTEXT
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(result.stdout)
+    set_dev_active(root, True)
+    stale = root / HANDOFF
+    if stale.exists():
+        stale.unlink()
+    validate_contracts(root)
+    return {"kind": "envs.authoringResult.v1", "status": "PASS", "ciphertext": CIPHERTEXT.as_posix()}
+
+
+def walk_receipt(value: Any) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            require(key not in FORBIDDEN_RECEIPT_KEYS, f"forbidden receipt key {key}")
+            walk_receipt(item)
+    elif isinstance(value, list):
+        for item in value:
+            walk_receipt(item)
+    elif isinstance(value, str):
+        require(not any(pattern.search(value) for pattern in PRIVATE_MATERIAL), "private material found in receipt")
+
+
+def validate_receipt(receipt: dict[str, Any]) -> None:
+    require(set(receipt) == {
+        "kind", "status", "envs_sha", "environment", "capability", "source",
+        "target", "projector", "effect", "readback", "workflow", "created_at",
+    }, "receipt fields differ")
+    require(receipt["kind"] == RECEIPT_KIND and receipt["status"] == "PASS", "receipt is not PASS")
+    require(isinstance(receipt["envs_sha"], str) and SHA40.fullmatch(receipt["envs_sha"]), "invalid envs SHA")
+    require(receipt["environment"] == "dev" and receipt["capability"] == "jev-api", "receipt identity differs")
+    source = receipt["source"]
+    require(source.get("kind") == "public_sops" and source.get("ref") == CIPHERTEXT.as_posix(), "receipt source differs")
+    require(isinstance(source.get("sha256"), str) and SHA256.fullmatch(source["sha256"]), "invalid ciphertext digest")
+    require(receipt["target"] == {
+        "provider": "cloudflare-pages", "account_id": receipt["target"].get("account_id"),
+        "project": "voice-ui", "secret_name": "JEV_API_KEY",
+    } and bool(receipt["target"]["account_id"]), "receipt target differs")
+    require(receipt["projector"] == {
+        "workflow": ".github/workflows/project-dev-jev-api.yml", "adapter": "adapters/jev_api.py",
+    }, "projector identity differs")
+    require(receipt["effect"] == {"operation": "cloudflare_pages_secret_put", "status": "PASS"}, "provider effect is not PASS")
+    require(receipt["readback"] == {"kind": "secret_name_presence", "status": "PASS", "present": True}, "provider readback is not PASS")
+    workflow = receipt["workflow"]
+    require(workflow.get("repository") == "roccho-dev/envs" and workflow.get("ref") == "proposals", "workflow identity differs")
+    require(isinstance(workflow.get("run_id"), int) and workflow["run_id"] > 0, "invalid workflow run id")
+    require(isinstance(workflow.get("run_attempt"), int) and workflow["run_attempt"] > 0, "invalid workflow run attempt")
+    created_at = receipt["created_at"]
+    require(isinstance(created_at, str) and created_at.endswith("Z"), "invalid timestamp")
+    try:
+        datetime.fromisoformat(created_at[:-1] + "+00:00")
+    except ValueError as exc:
+        raise EnvsError("invalid timestamp") from exc
+    walk_receipt(receipt)
+
+
+def build_receipt(*, envs_sha: str, ciphertext_sha256: str, account_id: str,
+                  run_id: int, run_attempt: int, created_at: str) -> dict[str, Any]:
+    receipt = {
+        "kind": RECEIPT_KIND, "status": "PASS", "envs_sha": envs_sha,
+        "environment": "dev", "capability": "jev-api",
+        "source": {"kind": "public_sops", "ref": CIPHERTEXT.as_posix(), "sha256": "sha256:" + ciphertext_sha256},
+        "target": {"provider": "cloudflare-pages", "account_id": account_id, "project": "voice-ui", "secret_name": "JEV_API_KEY"},
+        "projector": {"workflow": ".github/workflows/project-dev-jev-api.yml", "adapter": "adapters/jev_api.py"},
+        "effect": {"operation": "cloudflare_pages_secret_put", "status": "PASS"},
+        "readback": {"kind": "secret_name_presence", "status": "PASS", "present": True},
+        "workflow": {"repository": "roccho-dev/envs", "ref": "proposals", "run_id": run_id, "run_attempt": run_attempt},
+        "created_at": created_at,
+    }
+    validate_receipt(receipt)
+    return receipt
+
+
+def project(*, envs_sha: str, run_id: int, run_attempt: int, created_at: str,
+            output: Path, root: Path = ROOT, runner: Runner = default_runner) -> dict[str, Any]:
+    validate_contracts(root)
+    require(SHA40.fullmatch(envs_sha) is not None, "expected exact envs SHA")
+    cipher = root / CIPHERTEXT
+    require(cipher.is_file(), "ciphertext is not configured")
+    age_key = os.environ.get("SOPS_AGE_KEY", "")
+    account = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
+    token = os.environ.get("CLOUDFLARE_API_TOKEN", "")
+    require(age_key != "" and account != "" and token != "", "projection inputs are missing")
+
+    decrypted = run_checked(
+        [os.environ.get("SOPS_BIN", "sops"), "--decrypt", "--output-type", "json", str(cipher)],
+        env=clean_env({"SOPS_AGE_KEY": age_key}), runner=runner, label="SOPS decryption",
+    ).stdout
+    try:
+        payload = json.loads(decrypted)
+    except json.JSONDecodeError as exc:
+        raise EnvsError("decrypted payload is not JSON") from exc
+    require(isinstance(payload, dict) and set(payload) == {"JEV_API_KEY"}, "decrypted payload fields differ")
+    secret = payload["JEV_API_KEY"]
+    require(isinstance(secret, str) and secret, "decrypted JEV_API_KEY is empty")
+
+    provider_env = clean_env({"CLOUDFLARE_ACCOUNT_ID": account, "CLOUDFLARE_API_TOKEN": token})
+    npx = os.environ.get("NPX_BIN", "npx")
+    wrangler = os.environ.get("WRANGLER_PACKAGE", "wrangler@4.112.0")
+    run_checked(
+        [npx, "--yes", wrangler, "pages", "secret", "put", "JEV_API_KEY", "--project-name", "voice-ui"],
+        input_data=secret.encode(), env=provider_env, runner=runner, label="Cloudflare secret projection",
+    )
+    readback = run_checked(
+        [npx, "--yes", wrangler, "pages", "secret", "list", "--project-name", "voice-ui"],
+        env=provider_env, runner=runner, label="Cloudflare secret readback",
+    )
+    require(b"JEV_API_KEY" in readback.stdout + readback.stderr, "provider readback did not contain JEV_API_KEY")
+
+    receipt = build_receipt(
+        envs_sha=envs_sha, ciphertext_sha256=hashlib.sha256(cipher.read_bytes()).hexdigest(),
+        account_id=account, run_id=run_id, run_attempt=run_attempt, created_at=created_at,
+    )
+    destination = root / output
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return receipt
+
+
+def load_receipt(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise EnvsError("handoff receipt is invalid JSON") from exc
+    require(isinstance(value, dict), "handoff receipt must be an object")
+    validate_receipt(value)
+    return value
+
+
+def readiness(root: Path = ROOT) -> dict[str, Any]:
+    validate_contracts(root)
+    cipher, handoff = root / CIPHERTEXT, root / HANDOFF
+    configured = cipher.is_file()
+    physical, state = ("NOT_RUN", "ABSENT") if configured else ("NOT_CONFIGURED", "ABSENT")
+    current = "sha256:" + hashlib.sha256(cipher.read_bytes()).hexdigest() if configured else None
+    receipt_digest = None
+    if handoff.is_file():
+        require(configured, "handoff cannot exist without ciphertext")
+        receipt_digest = load_receipt(handoff)["source"]["sha256"]
+        physical = state = "PASS" if receipt_digest == current else "STALE"
+    return {
+        "kind": "envs.providerReadiness.v1", "repository": "roccho-dev/envs",
+        "canonical_branch": "proposals", "retained_compatibility_branch": "main",
+        "stage": "dev", "capability": "jev-api", "public_source_provider": "PASS",
+        "provider_mechanism": "PASS_SOURCE", "physical_dev_projection": physical,
+        "provider_handoff_receipt": state, "provider_handoff_ready": state == "PASS",
+        "consumer_runtime_readiness": "OUT_OF_SCOPE",
+        "current_ciphertext_sha256": current, "receipt_ciphertext_sha256": receipt_digest,
+    }
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("check")
+    sub.add_parser("readiness")
+    sub.add_parser("author")
+    project_parser = sub.add_parser("project")
+    project_parser.add_argument("--envs-sha", required=True)
+    project_parser.add_argument("--run-id", type=int, required=True)
+    project_parser.add_argument("--run-attempt", type=int, required=True)
+    project_parser.add_argument("--created-at")
+    project_parser.add_argument("--output", type=Path, default=HANDOFF)
+    args = parser.parse_args(argv)
+    try:
+        if args.command == "check":
+            validate_contracts(ROOT)
+            if (ROOT / HANDOFF).is_file():
+                load_receipt(ROOT / HANDOFF)
+            print("JEV_API_CONTRACT=PASS")
+        elif args.command == "readiness":
+            print(json.dumps(readiness(ROOT), indent=2, sort_keys=True))
+        elif args.command == "author":
+            print(json.dumps(author(ROOT), indent=2, sort_keys=True))
+        else:
+            receipt = project(
+                envs_sha=args.envs_sha, run_id=args.run_id, run_attempt=args.run_attempt,
+                created_at=args.created_at or utc_now(), output=args.output, root=ROOT,
+            )
+            print(json.dumps({"kind": receipt["kind"], "status": "PASS", "output": str(args.output)}, sort_keys=True))
+    except (EnvsError, OSError) as exc:
+        print(f"JEV_API=RED: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

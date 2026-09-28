@@ -1,0 +1,42 @@
+name: check
+
+on:
+  pull_request:
+    branches:
+      - proposals
+  push:
+    branches:
+      - proposals
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  repository:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout exact revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check repository contract
+        run: python3 checks/repository.py
+
+      - name: Test repository oracle
+        run: python3 checks/test_repository.py
+
+      - name: Test Jev adapter
+        run: python3 checks/test_jev_api.py
+
+      - name: Verify retained main mirror
+        if: github.ref_name == 'main'
+        run: python3 checks/repository.py --verify-main-mirror

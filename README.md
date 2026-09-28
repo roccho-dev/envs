@@ -1,82 +1,72 @@
 # envs
 
-This repository is the public clean snapshot of `envs`. Historical private Git and GitHub surfaces are intentionally not imported.
+`envs` holds public environment contracts, performs bounded provider projection, and returns a non-secret exact-SHA handoff.
 
-`envs` owns environment selection and binding meaning. Artifact-producing repositories remain responsible for source, version, immutable bytes, hash, runtime closure, unpacking, and package identity.
+- canonical branch: `proposals`
+- retained compatibility mirror: `main`
+- accepted handoff identity: exact commit SHA
 
-## Migration provenance
+`main` remains available, but it has no independent meaning, direct changes, pull-request base, Environment effect, or handoff identity. Compatibility refreshes copy an accepted `proposals` revision only.
 
-Current migration authority is `roccho-dev/envs#2`. Exact snapshot lineage and the terminal disposition of the former private GitHub surface are recorded under [`migration/`](migration/README.md).
-
-The private historical repository is evidence only. Building, reviewing, or extending current `envs` must not require access to it.
-
-## Provider / consumer boundary
-
-`envs` owns secret-source admission, target-native projection, provider readback, and a non-secret projection receipt. It does not own application runtime PASS or independent consumer PASS. Consumers do not require `cmd/envctl`; the provider may use the trusted thin workflow/script projector.
-
-Normal `apps` / `ops` execution must not use envs checkout or workflow, `envctl` as a parent process, `envctl auth exec`, auth bundles, SOPS, age identities, GitHub Environment source secrets, `envs-old`, or old private artifacts.
-
-`envs-old` is historical evidence only. The machine-readable boundary is `contracts/provider-consumer.jsonl`; the current provider state is derived with:
+## Ownership
 
 ```text
-python3 scripts/provider_readiness.py
+contracts  = public meaning, IDs, relationships, and forbidden dependencies
+ciphertexts = versioned dev ciphertext only
+adapters   = bounded envs-owned authoring/projection/readback
+handoffs   = non-secret provider-effect receipts
+checks     = executable repository and adapter specifications
 ```
 
-A provider handoff requires an exact envs SHA and a validated `handoffs/dev/jev-api.json`. `main` and `proposals` are navigation refs, not sufficient trust anchors. A provider handoff does not replace apps real runtime acceptance or ops independent execution twice.
+`envs` does not own application runtime acceptance, independent consumer execution, generic deployment, UI meaning, live target observation, secret issuance, or target runtime state.
 
-See `docs/provider-consumer-boundary.md`.
-
-## Package boundary
-
-A package binding contains only:
-
-- producer identity;
-- exact producer revision;
-- producer subflake and output;
-- environment scope.
-
-It does not contain a forge URL, credential, copied package recipe, or vendored producer tree. Nix receives the concrete resolver at execution time.
-
-`parts` adoption is intentionally deferred. Keep new surface area minimal until the primitive shape is proven by concrete consumers.
-
-## DuckDB OS/user bindings
-
-The first concrete binding consumes:
+## Durable tree
 
 ```text
-producer  flakes
-revision  b369525b9d1ca998b7fc9ebeeec4517a6f167558
-subflake  published/duckdb-cli
-output    packages.x86_64-linux.duckdb-cli
-scope     os | user
+.github/workflows/
+contracts/
+ciphertexts/       # absent while dev is NOT_CONFIGURED
+adapters/jev_api.py
+handoffs/          # absent until real projection/readback PASS
+checks/
+LICENSES/
+LICENSE_POLICY.md
+THIRD_PARTY_NOTICES.md
 ```
 
-`envs` exposes the concrete entrypoints from `bindings/duckdb`:
+## Contracts
 
-- `os-duckdb-cli` with `scope = "os"`;
-- `user-duckdb-cli` with `scope = "user"`.
+- `contracts/environments.jsonl` — stage and secret-plane ownership
+- `contracts/bindings.jsonl` — application and capability bindings
+- `contracts/targets.jsonl` — desired target meaning only
+- `contracts/provider-consumer.jsonl` — envs/apps/ops responsibility and normal-path exclusions
+- `handoffs/dev-jev-api.json` — real projection/readback PASS after exact-SHA non-secret handoff
 
-Both resolve to one producer-owned derivation and one store output. DuckDB source, version, artifact URL, hash, musl/C++ runtime repair, and build logic remain exclusively in `flakes`.
-
-The SSOT bare repository is injected through Nix, not encoded in the contract:
+## Dev Jev flow
 
 ```text
-REV=b369525b9d1ca998b7fc9ebeeec4517a6f167558
-INPUT="git+file:///home/nixos/repos/flakes.git?rev=${REV}&dir=published/duckdb-cli"
+public age recipient in contracts
++ dev-authoring/SOURCE_JEV_API_KEY
+→ author-dev-jev-api
+→ ciphertext PR
+→ merge to exact proposals SHA
+→ remove one-shot source secret
 
-nix flake check ./bindings/duckdb --no-write-lock-file \
-  --override-input packagePrimitives "${INPUT}"
-
-nix build ./bindings/duckdb#os-duckdb-cli \
-  ./bindings/duckdb#user-duckdb-cli \
-  --no-write-lock-file \
-  --override-input packagePrimitives "${INPUT}"
+ciphertext
++ dev-projection decrypt/effect authority
+→ project-dev-jev-api
+→ provider effect + name-only readback
+→ non-secret handoff PR
 ```
 
-A Nix registry may supply the same resolver. The exact revision and primitive identity are asserted by the binding flake, so a mutable or incorrect mapping fails closed.
+Normal apps/ops execution uses only target-native auth. It does not start or wait for envs, use envctl as a parent, decrypt SOPS, or receive an age identity.
 
-This slice proves build-time composition only. It does not claim target-host placement, activation, convergence, rollback, or host observation.
+## Checks
 
-## SSOT GitHub refs
+```text
+python3 checks/repository.py
+python3 checks/test_repository.py
+python3 checks/test_jev_api.py
+```
 
-`nixosModules.ssot-github-refs` maintains read-side GitHub mirrors for the SSOT bare repositories. Those mirrors are replaceable read adapters; package binding meaning and Nix builds do not require GitHub credentials or GitHub URLs.
+The repository oracle calculates accepted structure and state. Its tests deliberately create invalid states and require RED rather than repeating only happy-path execution.
