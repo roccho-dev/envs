@@ -21,9 +21,18 @@ BECH32 = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 # Live Variable values are generated per run so their bytes never appear in tracked source.
 RECIPIENT = "age1" + "".join(secrets.choice(BECH32) for _ in range(58))
 ACCOUNT_ID = secrets.token_hex(16)
-AGE_KEY = "AGE-SECRET-KEY-1" +"".join(secrets.choice(BECH32.upper()) for _ in range(58))
+AGE_PREFIX = "AGE-SECRET-KEY-1"
+AGE_IDENTITY = AGE_PREFIX + "".join(secrets.choice(BECH32.upper()) for _ in range(58))
 OBSOLETE_SOURCE = "SOURCE_" + "JEV_API_KEY"
 CREATED_AT = "2026-09-28T00:00:00Z"
+
+
+def age_key_file(*identities: str) -> str:
+    # Native age-keygen key-file shape: comment lines, then the identity lines.
+    return "".join([f"# created: {CREATED_AT}\n", f"# public key: {RECIPIENT}\n", *(f"{item}\n" for item in identities)])
+
+
+AGE_KEY = age_key_file(AGE_IDENTITY)
 
 
 def author_env(**overrides: str) -> dict[str, str]:
@@ -227,6 +236,12 @@ def test_project_red_inputs() -> None:
     expect_project_red(project_env(CLOUDFLARE_API_TOKEN=""))
     expect_project_red(project_env(SOPS_AGE_KEY=""))
     expect_project_red(project_env(SOPS_AGE_KEY="not-an-age-identity"))
+    other = AGE_PREFIX + "".join(secrets.choice(BECH32.upper()) for _ in range(58))
+    expect_project_red(project_env(SOPS_AGE_KEY=age_key_file()))
+    expect_project_red(project_env(SOPS_AGE_KEY=age_key_file(AGE_IDENTITY, other)))
+    expect_project_red(project_env(SOPS_AGE_KEY=age_key_file(AGE_IDENTITY[:-1])))
+    expect_project_red(project_env(SOPS_AGE_KEY=age_key_file(AGE_IDENTITY[:-1] + "B")))
+    expect_project_red(project_env(SOPS_AGE_KEY=age_key_file(AGE_IDENTITY + "Q")))
     expect_project_red(project_env(), mutate=lambda root: append(root / "README.md", f"\n{ACCOUNT_ID}\n"))
     expect_project_red(project_env(), mutate=lambda root: append(root / jev.CIPHERTEXT, f"# {ACCOUNT_ID}\n"))
 

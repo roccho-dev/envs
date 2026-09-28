@@ -23,7 +23,7 @@ RECEIPT_KIND = "envs.projectionReceipt.v1"
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 AGE_RECIPIENT = re.compile(r"^age1[02-9ac-hj-np-z]{58}$")
-AGE_IDENTITY = re.compile(r"^AGE-SECRET-KEY-1[0-9A-Z]+$")
+AGE_IDENTITY = re.compile(r"^AGE-SECRET-KEY-1[02-9AC-HJ-NP-Z]{58}$")
 CLOUDFLARE_ACCOUNT_ID = re.compile(r"^[0-9a-f]{32}$")
 RECIPIENT_METADATA = re.compile(r"(?m)^[ \t]*-?[ \t]*recipient:[ \t]*(age1[0-9a-z]+)[ \t]*$")
 PRIVATE_MATERIAL = (
@@ -147,9 +147,16 @@ def recipient_items(value: str) -> list[str] | None:
     return None
 
 
+def is_age_identity(value: str) -> bool:
+    # Native age-keygen output: comment and blank lines plus exactly one X25519 identity.
+    lines = [line.strip() for line in value.splitlines()]
+    identities = [line for line in lines if line and not line.startswith("#")]
+    return len(identities) == 1 and AGE_IDENTITY.fullmatch(identities[0]) is not None
+
+
 INPUT_TYPES: dict[str, Callable[[str], bool]] = {
     "opaque": lambda value: True,
-    "age_identity": lambda value: AGE_IDENTITY.fullmatch(value.strip()) is not None,
+    "age_identity": is_age_identity,
     "age_recipient_list": lambda value: recipient_items(value) is not None,
     "cloudflare_account_id": lambda value: CLOUDFLARE_ACCOUNT_ID.fullmatch(value) is not None,
 }
