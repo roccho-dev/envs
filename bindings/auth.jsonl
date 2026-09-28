@@ -1,1 +1,0 @@
-{"id":"jev-api","kind":"envs.authCapability.v1","capability":"jev-api","secret":"secrets/jev-api-key.sops.yaml","inject":{"type":"env","name":"JEV_API_KEY","sourceKey":"JEV_API_KEY"}}

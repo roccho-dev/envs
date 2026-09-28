@@ -1,0 +1,1 @@
+{"id":"g6i3","kind":"envs.target.v1","platform":"linux","architecture":"amd64","required_capabilities":["git","nix","tailscale"],"observation_owner":"roccho-dev/ops"}

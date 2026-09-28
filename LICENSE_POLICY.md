@@ -2,10 +2,6 @@
 
 This repository does not grant a project-wide open-source license.
 
-Unless a file explicitly states otherwise, all rights are reserved by the
-applicable copyright holder. Public visibility permits inspection of the source
-but does not itself grant permission to use, modify, or redistribute it.
+Unless a file explicitly states otherwise, all rights are reserved by the applicable copyright holder. Public visibility permits inspection but does not itself grant permission to use, modify, or redistribute the source.
 
-Third-party components and redistributed materials remain governed by their own
-licenses. Their notices are recorded under `LICENSES/` and in
-`THIRD_PARTY_NOTICES.md`.
+Third-party tools invoked by workflows are obtained separately and remain governed by their upstream licenses. Before third-party source or binary material is committed or redistributed, its exact notice and license text must be added under `LICENSES/` and `THIRD_PARTY_NOTICES.md`.

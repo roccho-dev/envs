@@ -1,31 +1,27 @@
-## Summary
+## Purpose
 
-<!-- Explain the proposal in one or two sentences. -->
+<!-- One durable outcome. -->
 
-## Session
+## Authority
 
-- URL:
+- Canonical base: `proposals`
+- Exact base SHA:
+- Issue / contract:
 
-## Scope
-
-- Repository:
-- Base branch:
-- Head branch:
-
-## Changes
+## Change
 
 -
 
-## Validation
+## Checks
 
-- [ ] Documentation-only change
-- [ ] Tests or checks run
-- [ ] Not run
+- [ ] `python3 checks/repository.py`
+- [ ] `python3 checks/test_repository.py`
+- [ ] `python3 checks/test_jev_api.py`
+- [ ] GitHub `check` workflow Green
 
-Notes:
+## Boundaries
 
--
-
-## Follow-up
-
--
+- [ ] No direct `main` change
+- [ ] No plaintext secret or private key
+- [ ] No consumer-runtime PASS claimed by envs
+- [ ] No temporary migration machinery retained
