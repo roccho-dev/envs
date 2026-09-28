@@ -1,0 +1,102 @@
+name: Jev frozen semantic benchmark
+
+on:
+  pull_request:
+    branches: [proposals]
+    paths:
+      - ".github/workflows/jev-frozen-semantic-benchmark.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  jev:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: dev-projection
+    env:
+      SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
+      OPS_BENCH_SHA: 11dbabeadd55239786902fb7ce08f581ab976f29
+    steps:
+      - name: Checkout envs authority
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify configured Jev secret authority
+        run: |
+          set -euo pipefail
+          test -n "$SOPS_AGE_KEY"
+          bash scripts/runtime-secret-projection.sh check-configured
+
+      - name: Install pinned SOPS
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            extra-experimental-features = nix-command flakes
+
+      - name: Resolve SOPS
+        run: |
+          set -euo pipefail
+          out="$(nix build --no-link --print-out-paths github:NixOS/nixpkgs/f9948418dc8628ac02b6d6337e191ade9429d59d#sops)"
+          test -x "$out/bin/sops"
+          echo "SOPS_BIN=$out/bin/sops" >> "$GITHUB_ENV"
+
+      - name: Checkout exact ops benchmark source
+        uses: actions/checkout@v4
+        with:
+          repository: roccho-dev/ops
+          ref: ${{ env.OPS_BENCH_SHA }}
+          path: ops
+          persist-credentials: false
+
+      - name: Run Jev 1.13.0 benchmark without exposing secret
+        env:
+          BENCH_PROVIDER: jev
+          BENCH_MODEL: jev-1.13.0
+          BENCH_ENDPOINT: https://api.typesafe.ai/v1/systemone
+          BENCH_TIMEOUT_MS: "30000"
+        run: |
+          set -euo pipefail
+          key_json="$(mktemp "$RUNNER_TEMP/jev-key.XXXXXX.json")"
+          trap 'rm -f "$key_json"' EXIT
+          "$SOPS_BIN" --decrypt --output-type json secrets/jev-api-key.sops.yaml > "$key_json"
+          JEV_API_KEY="$(python3 - "$key_json" <<'PY'
+          import json, pathlib, sys
+          x=json.loads(pathlib.Path(sys.argv[1]).read_text())
+          key=x.get("JEV_API_KEY")
+          if not isinstance(key,str) or not key:
+              raise SystemExit("missing JEV_API_KEY")
+          print(key)
+          PY
+          )"
+          export JEV_API_KEY
+          rm -f "$key_json"
+          trap - EXIT
+
+          mkdir -p "$RUNNER_TEMP/evidence"
+          (
+            cd ops
+            node experiments/jev-winnow-e4b/benchmark.mjs "$RUNNER_TEMP/evidence/jev.json"
+          )
+          unset JEV_API_KEY
+
+          python3 - "$RUNNER_TEMP/evidence/jev.json" <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, pathlib, sys
+          x=json.loads(pathlib.Path(sys.argv[1]).read_text())
+          q,l=x["quality"],x["latencyMs"]
+          print("## Jev 1.13.0")
+          print()
+          print(f"- expected-order hits: **{q['expectedOrderHits']}/36**")
+          print(f"- stable cases: **{q['stableCases']}/18**")
+          print(f"- ties: **{q['ties']}**")
+          print(f"- latency p50/p95: **{l['p50']:.1f} / {l['p95']:.1f} ms**")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jev-frozen-semantic-evidence-${{ github.run_id }}
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: error
+          retention-days: 30
