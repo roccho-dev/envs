@@ -1,0 +1,3 @@
+{"kind":"envs.hostRequirement.v1","id":"capability.git","command":"git","args":["--version"]}
+{"kind":"envs.hostRequirement.v1","id":"capability.nix","command":"nix","args":["--version"]}
+{"kind":"envs.hostRequirement.v1","id":"capability.tailscale","command":"tailscale","args":["version"]}
