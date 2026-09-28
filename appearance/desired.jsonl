@@ -1,0 +1,6 @@
+{"kind":"envs.appearance.palette.v1","id":"catppuccin-mocha","name":"Catppuccin Mocha","colors":{"background":"#1E1E2E","foreground":"#CDD6F4","surface":"#313244","selection":"#45475A","primary":"#89B4FA","diagnostic":"#89DCEB","warning":"#F9E2AF","error":"#F38BA8"}}
+{"kind":"envs.appearance.roles.v1","id":"terminal-default","palette":"catppuccin-mocha","roles":{"background":"background","foreground":"foreground","surface":"surface","selection":"selection","primary":"primary","diagnostic":"diagnostic","warning":"warning","error":"error"}}
+{"kind":"envs.appearance.font.v1","id":"terminal-font","family":"HackGen35 Console NF","size":9}
+{"kind":"envs.appearance.target.v1","id":"windows-terminal","target":"windows-terminal","enabled":true}
+{"kind":"envs.appearance.target.v1","id":"vim","target":"vim","enabled":true}
+{"kind":"envs.appearance.target.v1","id":"yazi","target":"yazi","enabled":true}
