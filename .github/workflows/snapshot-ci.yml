@@ -2,7 +2,7 @@ name: snapshot-ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, proposals]
   pull_request:
   workflow_dispatch:
 
@@ -23,7 +23,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Verify public snapshot safety and JSONL contracts
+      - name: Verify public snapshot safety and contracts
         shell: bash
         run: |
           set -euo pipefail
@@ -64,8 +64,7 @@ jobs:
                               raise SystemExit(f'{path}:{number}: JSONL row is not an object')
 
           planes = {}
-          path = Path('environments/secret-planes.jsonl')
-          for line in path.read_text().splitlines():
+          for line in Path('environments/secret-planes.jsonl').read_text().splitlines():
               if line.strip():
                   row = json.loads(line)
                   planes[row['id']] = row
@@ -77,26 +76,97 @@ jobs:
           }
           if set(planes) != expected_ids:
               raise SystemExit('secret-plane set differs')
-          for plane_id in ('dev.authoring', 'dev.projection', 'stg.projection', 'prd.projection'):
-              row = planes[plane_id]
-              if row['owner'] != 'envs':
-                  raise SystemExit(f'{plane_id}: owner must be envs')
-              if row['active_github_environment'] is not None:
-                  raise SystemExit(f'{plane_id}: active Environment must be absent before configuration')
-              if row['migration_state'] != 'NOT_CONFIGURED':
-                  raise SystemExit(f'{plane_id}: migration state must be NOT_CONFIGURED')
-          for plane_id in ('dev.runtime', 'stg.runtime', 'prd.runtime'):
-              if planes[plane_id]['owner'] != 'target':
-                  raise SystemExit(f'{plane_id}: runtime must be target-owned')
           if any('std' in value for value in planes):
               raise SystemExit('std is forbidden; use stg')
 
-          if Path('secrets').exists():
-              raise SystemExit('secrets/ must not exist before new-key authoring')
+          for plane_id in ('dev.runtime', 'stg.runtime', 'prd.runtime'):
+              if planes[plane_id]['owner'] != 'target':
+                  raise SystemExit(f'{plane_id}: runtime must be target-owned')
+
+          for plane_id in ('stg.projection', 'prd.projection'):
+              row = planes[plane_id]
+              if row['owner'] != 'envs' or row['migration_state'] != 'NOT_CONFIGURED':
+                  raise SystemExit(f'{plane_id}: must remain envs-owned and NOT_CONFIGURED')
+              if row['active_github_environment'] is not None:
+                  raise SystemExit(f'{plane_id}: active Environment must be absent')
+
+          cipher = Path('secrets/jev-api-key.sops.yaml')
+          configured = cipher.is_file()
+          expected_dev = {
+              'dev.authoring': 'dev-authoring',
+              'dev.projection': 'dev-projection',
+          }
+          for plane_id, environment in expected_dev.items():
+              row = planes[plane_id]
+              if row['owner'] != 'envs' or row['github_environment'] != environment:
+                  raise SystemExit(f'{plane_id}: desired Environment contract mismatch')
+              if configured:
+                  if row['active_github_environment'] != environment or row['migration_state'] != 'ACTIVE':
+                      raise SystemExit(f'{plane_id}: configured ciphertext requires ACTIVE state')
+              else:
+                  if row['active_github_environment'] is not None or row['migration_state'] != 'NOT_CONFIGURED':
+                      raise SystemExit(f'{plane_id}: pre-authoring state must be NOT_CONFIGURED')
+
+          secrets_dir = Path('secrets')
+          if configured:
+              actual = sorted(str(path) for path in secrets_dir.rglob('*') if path.is_file())
+              if actual != ['secrets/jev-api-key.sops.yaml']:
+                  raise SystemExit(f'unexpected secret files: {actual}')
+              body = cipher.read_text(encoding='utf-8')
+              if 'JEV_API_KEY: ENC[AES256_GCM,' not in body or '\nsops:' not in body:
+                  raise SystemExit('invalid SOPS ciphertext')
+              recipients = re.findall(r'(?m)^\s*recipient:\s*(age1[0-9a-z]+)\s*$', body)
+              if not recipients or len(recipients) != len(set(recipients)):
+                  raise SystemExit('unique public age recipient is required')
+          elif secrets_dir.exists() and any(secrets_dir.iterdir()):
+              raise SystemExit('secrets/ must be empty before new-key authoring')
+
+          workflows = {
+              'authoring': Path('.github/workflows/secret-materialize.yml').read_text(),
+              'projection': Path('.github/workflows/runtime-secret-projection.yml').read_text(),
+          }
+          for name, text in workflows.items():
+              for forbidden in ('pull_request_target:', 'secrets: inherit', 'environment: ${{'):
+                  if forbidden in text:
+                      raise SystemExit(f'{name}: forbidden workflow marker {forbidden}')
+              for action, ref in re.findall(r'(?m)^\s*(?:-\s*)?uses:\s*([^@\s]+)@([^\s#]+)', text):
+                  if not action.startswith(('./', 'docker://')) and not re.fullmatch(r'[0-9a-f]{40}', ref):
+                      raise SystemExit(f'{name}: mutable Action {action}@{ref}')
+
+          authoring = workflows['authoring']
+          for marker in (
+              "github.repository == 'roccho-dev/envs'",
+              "github.ref_name == 'proposals'",
+              'environment: dev-authoring',
+              'environment: dev-projection',
+              'github.event_name == \'workflow_dispatch\'',
+          ):
+              if marker not in authoring:
+                  raise SystemExit(f'authoring workflow missing {marker}')
+
+          projection = workflows['projection']
+          for marker in (
+              'workflow_dispatch:',
+              "github.repository == 'roccho-dev/envs'",
+              "github.ref_name == 'proposals'",
+              'environment: dev-projection',
+          ):
+              if marker not in projection:
+                  raise SystemExit(f'projection workflow missing {marker}')
+          if '\n  push:' in projection or '\n  pull_request:' in projection:
+              raise SystemExit('projection effect must be manual-only')
 
           print('SNAPSHOT_SAFETY=PASS')
           print('SECRET_PLANES=PASS')
+          print('SOPS_STATE=' + ('ACTIVE' if configured else 'NOT_CONFIGURED'))
           PY
+
+      - name: Verify consumer and projection contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/runtime-secret-projection.sh check
+          bash tests/runtime-secret-projection-destructive.sh
 
   go-contract:
     runs-on: ubuntu-24.04
