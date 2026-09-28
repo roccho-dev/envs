@@ -11,7 +11,7 @@
 ## Ownership
 
 ```text
-contracts  = public meaning, IDs, relationships, and forbidden dependencies
+contracts  = public meaning, IDs, relationships, required input names/types/lifecycles, and forbidden dependencies; never values
 ciphertexts = versioned dev ciphertext only
 adapters   = bounded envs-owned authoring/projection/readback
 handoffs   = non-secret provider-effect receipts
@@ -42,22 +42,45 @@ THIRD_PARTY_NOTICES.md
 - `contracts/provider-consumer.jsonl` — envs/apps/ops responsibility and normal-path exclusions
 - `handoffs/dev-jev-api.json` — real projection/readback PASS after exact-SHA non-secret handoff
 
+## Environment inputs
+
+`contracts/environments.jsonl` declares each GitHub Environment's `required_secrets` and `required_variables` by name, type, and lifecycle. The actual values live only in the GitHub Environment; the owner sets them there without a commit. Git never stores a value body: before any provider effect the adapter turns a missing or invalid required input RED, and turns RED when a live Variable value appears anywhere in the repository. The only exception is the recipient metadata that sops writes into `ciphertexts/dev-jev-api.sops.yaml`.
+
+| Environment input | Kind | Type | Lifecycle |
+|---|---|---|---|
+| `dev-authoring/JEV_API_KEY` | secret | opaque | one_shot_ingress |
+| `dev-authoring/SOPS_AGE_RECIPIENTS` | variable | age_recipient_list | persistent |
+| `dev-projection/SOPS_AGE_KEY` | secret | age_identity | persistent |
+| `dev-projection/CLOUDFLARE_API_TOKEN` | secret | opaque | persistent |
+| `dev-projection/CLOUDFLARE_ACCOUNT_ID` | variable | cloudflare_account_id | persistent |
+| `stg-projection/JEV_API_KEY` | secret | opaque | persistent |
+| `stg-projection/CLOUDFLARE_API_TOKEN` | secret | opaque | persistent |
+| `stg-projection/CLOUDFLARE_ACCOUNT_ID` | variable | cloudflare_account_id | persistent |
+| `prd-projection/JEV_API_KEY` | secret | opaque | persistent |
+| `prd-projection/CLOUDFLARE_API_TOKEN` | secret | opaque | persistent |
+| `prd-projection/CLOUDFLARE_ACCOUNT_ID` | variable | cloudflare_account_id | persistent |
+
+There are no stg or prd authoring Environments.
+
 ## Dev Jev flow
 
 ```text
-public age recipient in contracts
-+ dev-authoring/SOURCE_JEV_API_KEY
+dev-authoring/SOPS_AGE_RECIPIENTS
++ dev-authoring/JEV_API_KEY
 → author-dev-jev-api
 → ciphertext PR
 → merge to exact proposals SHA
-→ remove one-shot source secret
+→ dev-authoring/JEV_API_KEY may then be deleted by the owner (one-shot ingress);
+  author stays RED until it is set again
 
 ciphertext
-+ dev-projection decrypt/effect authority
++ dev-projection/SOPS_AGE_KEY, CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID
 → project-dev-jev-api
 → provider effect + name-only readback
-→ non-secret handoff PR
+→ non-secret handoff PR (no account ID)
 ```
+
+`envs` never deletes an Environment input; deleting the one-shot source is a separate owner effect.
 
 Normal apps/ops execution uses only target-native auth. It does not start or wait for envs, use envctl as a parent, decrypt SOPS, or receive an age identity.
 

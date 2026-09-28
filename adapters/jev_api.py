@@ -22,7 +22,10 @@ RECEIPT_KIND = "envs.projectionReceipt.v1"
 
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
-AGE_RECIPIENT = re.compile(r"^age1[0-9a-z]+$")
+AGE_RECIPIENT = re.compile(r"^age1[02-9ac-hj-np-z]{58}$")
+AGE_IDENTITY = re.compile(r"^AGE-SECRET-KEY-1[02-9AC-HJ-NP-Z]{58}$")
+CLOUDFLARE_ACCOUNT_ID = re.compile(r"^[0-9a-f]{32}$")
+RECIPIENT_METADATA = re.compile(r"(?m)^[ \t]*-?[ \t]*recipient:[ \t]*(age1[0-9a-z]+)[ \t]*$")
 PRIVATE_MATERIAL = (
     re.compile(r"AGE-SECRET-KEY-1[0-9A-Z]{20,}"),
     re.compile(r"-----BEGIN (?:OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----"),
@@ -30,7 +33,11 @@ PRIVATE_MATERIAL = (
 )
 FORBIDDEN_RECEIPT_KEYS = {
     "secret", "secret_value", "plaintext", "private_key", "age_identity",
-    "decrypted_value", "secret_hash",
+    "decrypted_value", "secret_hash", "account_id",
+}
+SECRET_PLANE_KEYS = {
+    "id", "kind", "stage_id", "plane_id", "owner", "github_environment",
+    "active_github_environment", "migration_state", "source_kind", "target_kind", "desired_state",
 }
 
 
@@ -103,6 +110,58 @@ def expected_bindings() -> dict[str, dict[str, Any]]:
     }
 
 
+def expected_inputs() -> dict[str, dict[str, list[dict[str, str]]]]:
+    def entries(*values: tuple[str, str, str]) -> list[dict[str, str]]:
+        return [{"name": name, "type": kind, "lifecycle": lifecycle} for name, kind, lifecycle in values]
+
+    def stage_projection() -> dict[str, list[dict[str, str]]]:
+        return {
+            "required_secrets": entries(
+                ("JEV_API_KEY", "opaque", "persistent"),
+                ("CLOUDFLARE_API_TOKEN", "opaque", "persistent"),
+            ),
+            "required_variables": entries(("CLOUDFLARE_ACCOUNT_ID", "cloudflare_account_id", "persistent")),
+        }
+
+    return {
+        "dev.authoring": {
+            "required_secrets": entries(("JEV_API_KEY", "opaque", "one_shot_ingress")),
+            "required_variables": entries(("SOPS_AGE_RECIPIENTS", "age_recipient_list", "persistent")),
+        },
+        "dev.projection": {
+            "required_secrets": entries(
+                ("SOPS_AGE_KEY", "age_identity", "persistent"),
+                ("CLOUDFLARE_API_TOKEN", "opaque", "persistent"),
+            ),
+            "required_variables": entries(("CLOUDFLARE_ACCOUNT_ID", "cloudflare_account_id", "persistent")),
+        },
+        "stg.projection": stage_projection(),
+        "prd.projection": stage_projection(),
+    }
+
+
+def recipient_items(value: str) -> list[str] | None:
+    items = value.split(",")
+    if all(AGE_RECIPIENT.fullmatch(item) for item in items) and len(items) == len(set(items)):
+        return items
+    return None
+
+
+def is_age_identity(value: str) -> bool:
+    # Native age-keygen output: comment and blank lines plus exactly one X25519 identity.
+    lines = [line.strip() for line in value.splitlines()]
+    identities = [line for line in lines if line and not line.startswith("#")]
+    return len(identities) == 1 and AGE_IDENTITY.fullmatch(identities[0]) is not None
+
+
+INPUT_TYPES: dict[str, Callable[[str], bool]] = {
+    "opaque": lambda value: True,
+    "age_identity": is_age_identity,
+    "age_recipient_list": lambda value: recipient_items(value) is not None,
+    "cloudflare_account_id": lambda value: CLOUDFLARE_ACCOUNT_ID.fullmatch(value) is not None,
+}
+
+
 def validate_contracts(root: Path = ROOT) -> dict[str, dict[str, dict[str, Any]]]:
     envs = index(root / ENVIRONMENTS)
     bindings = index(root / BINDINGS)
@@ -114,14 +173,17 @@ def validate_contracts(root: Path = ROOT) -> dict[str, dict[str, dict[str, Any]]
         "voice-ui.dev", "voice-ui.stg", "voice-ui.prd",
     }, "environment set differs")
 
-    authoring = envs["dev.authoring"]
-    projection = envs["dev.projection"]
-    require(authoring["github_environment"] == "dev-authoring", "dev authoring Environment differs")
-    require(projection["github_environment"] == "dev-projection", "dev projection Environment differs")
-    recipients = authoring.get("age_recipients")
-    require(isinstance(recipients, list), "dev age recipients must be a list")
-    require(len(recipients) == len(set(recipients)), "duplicate age recipient")
-    require(all(isinstance(value, str) and AGE_RECIPIENT.fullmatch(value) for value in recipients), "invalid age recipient")
+    require(envs["dev.authoring"]["github_environment"] == "dev-authoring", "dev authoring Environment differs")
+    require(envs["dev.projection"]["github_environment"] == "dev-projection", "dev projection Environment differs")
+    inputs = expected_inputs()
+    for identity, row in envs.items():
+        if row["kind"] != "envs.secretPlane.v1":
+            continue
+        declared = inputs.get(identity, {})
+        require(set(row) == SECRET_PLANE_KEYS | set(declared), f"{identity} fields differ")
+        require((row["github_environment"] is not None) == bool(declared), f"{identity} required inputs differ")
+        for group, entries in declared.items():
+            require(row[group] == entries, f"{identity} {group} differ")
 
     for stage in ("dev", "stg", "prd"):
         runtime = envs[f"{stage}.runtime"]
@@ -140,12 +202,11 @@ def validate_contracts(root: Path = ROOT) -> dict[str, dict[str, dict[str, Any]]
 
     cipher = root / CIPHERTEXT
     if cipher.is_file():
-        require(bool(recipients), "configured ciphertext requires an age recipient")
         for identity, name in (("dev.authoring", "dev-authoring"), ("dev.projection", "dev-projection")):
             item = envs[identity]
             require(item["active_github_environment"] == name, f"{identity} active Environment differs")
             require(item["migration_state"] == "ACTIVE", f"{identity} must be ACTIVE")
-        validate_ciphertext(cipher.read_bytes(), None, recipients)
+        validate_ciphertext(cipher.read_bytes(), None, None)
     else:
         for identity in ("dev.authoring", "dev.projection"):
             item = envs[identity]
@@ -185,14 +246,60 @@ def run_checked(argv: Sequence[str], *, label: str, input_data: bytes | None = N
     return result
 
 
-def validate_ciphertext(data: bytes, secret: bytes | None, recipients: list[str]) -> None:
+def without_recipient_metadata(text: str) -> str:
+    return RECIPIENT_METADATA.sub("", text)
+
+
+def validate_ciphertext(data: bytes, secret: bytes | None, recipients: list[str] | None) -> None:
     text = data.decode("utf-8", errors="strict")
     require("JEV_API_KEY: ENC[AES256_GCM," in text and "\nsops:" in text, "invalid SOPS ciphertext")
     require(not any(pattern.search(text) for pattern in PRIVATE_MATERIAL), "private material found in ciphertext")
     if secret is not None:
         require(secret not in data, "plaintext survived encryption")
-    actual = sorted(re.findall(r"(?m)^\s*-?\s*recipient:\s*(age1[0-9a-z]+)\s*$", text))
-    require(actual == sorted(recipients), "ciphertext recipient set differs")
+    actual = RECIPIENT_METADATA.findall(text)
+    require(bool(actual) and len(actual) == len(set(actual)), "ciphertext recipient metadata is invalid")
+    require(all(AGE_RECIPIENT.fullmatch(value) for value in actual), "ciphertext recipient metadata is invalid")
+    if recipients is not None:
+        require(sorted(actual) == sorted(recipients), "ciphertext recipient set differs")
+    body = without_recipient_metadata(text)
+    require(not any(value in body for value in actual), "ciphertext recipient outside sops metadata")
+
+
+def repository_files(root: Path) -> list[Path]:
+    return sorted(
+        path
+        for path in root.rglob("*")
+        if path.is_file()
+        and ".git" not in path.relative_to(root).parts
+        and "__pycache__" not in path.relative_to(root).parts
+        and path.suffix != ".pyc"
+    )
+
+
+def reject_live_values(root: Path, name: str, values: list[str]) -> None:
+    for path in repository_files(root):
+        relative = path.relative_to(root).as_posix()
+        data = path.read_bytes()
+        if relative == CIPHERTEXT.as_posix():
+            data = without_recipient_metadata(data.decode("utf-8", errors="replace")).encode()
+        for value in values:
+            require(value.encode() not in data, f"{relative}: live {name} value is stored in Git")
+
+
+def gate(root: Path, contracts: dict[str, dict[str, dict[str, Any]]], plane: str) -> dict[str, str]:
+    row = contracts["environments"][plane]
+    values: dict[str, str] = {}
+    for entry in row["required_secrets"] + row["required_variables"]:
+        name, kind = entry["name"], entry["type"]
+        value = os.environ.get(name, "")
+        require(value != "", f"{plane}: {name} is missing")
+        require(INPUT_TYPES[kind](value), f"{plane}: {name} is not a valid {kind}")
+        values[name] = value
+    for entry in row["required_variables"]:
+        value = values[entry["name"]]
+        live = recipient_items(value) if entry["type"] == "age_recipient_list" else [value]
+        reject_live_values(root, entry["name"], live or [])
+    return values
 
 
 def set_dev_active(root: Path, active: bool) -> None:
@@ -212,10 +319,9 @@ def clean_env(extra: Mapping[str, str]) -> dict[str, str]:
 
 def author(root: Path = ROOT, runner: Runner = default_runner) -> dict[str, Any]:
     contracts = validate_contracts(root)
-    source = os.environ.get("SOURCE_JEV_API_KEY", "")
-    require(source != "", "SOURCE_JEV_API_KEY is missing")
-    recipients = contracts["environments"]["dev.authoring"]["age_recipients"]
-    require(bool(recipients), "dev age recipient is not configured")
+    inputs = gate(root, contracts, "dev.authoring")
+    source = inputs["JEV_API_KEY"]
+    recipients = recipient_items(inputs["SOPS_AGE_RECIPIENTS"]) or []
 
     payload = json.dumps({"JEV_API_KEY": source}, separators=(",", ":")).encode() + b"\n"
     result = run_checked(
@@ -261,9 +367,8 @@ def validate_receipt(receipt: dict[str, Any]) -> None:
     require(source.get("kind") == "public_sops" and source.get("ref") == CIPHERTEXT.as_posix(), "receipt source differs")
     require(isinstance(source.get("sha256"), str) and SHA256.fullmatch(source["sha256"]), "invalid ciphertext digest")
     require(receipt["target"] == {
-        "provider": "cloudflare-pages", "account_id": receipt["target"].get("account_id"),
-        "project": "voice-ui", "secret_name": "JEV_API_KEY",
-    } and bool(receipt["target"]["account_id"]), "receipt target differs")
+        "provider": "cloudflare-pages", "project": "voice-ui", "secret_name": "JEV_API_KEY",
+    }, "receipt target differs")
     require(receipt["projector"] == {
         "workflow": ".github/workflows/project-dev-jev-api.yml", "adapter": "adapters/jev_api.py",
     }, "projector identity differs")
@@ -282,13 +387,13 @@ def validate_receipt(receipt: dict[str, Any]) -> None:
     walk_receipt(receipt)
 
 
-def build_receipt(*, envs_sha: str, ciphertext_sha256: str, account_id: str,
+def build_receipt(*, envs_sha: str, ciphertext_sha256: str,
                   run_id: int, run_attempt: int, created_at: str) -> dict[str, Any]:
     receipt = {
         "kind": RECEIPT_KIND, "status": "PASS", "envs_sha": envs_sha,
         "environment": "dev", "capability": "jev-api",
         "source": {"kind": "public_sops", "ref": CIPHERTEXT.as_posix(), "sha256": "sha256:" + ciphertext_sha256},
-        "target": {"provider": "cloudflare-pages", "account_id": account_id, "project": "voice-ui", "secret_name": "JEV_API_KEY"},
+        "target": {"provider": "cloudflare-pages", "project": "voice-ui", "secret_name": "JEV_API_KEY"},
         "projector": {"workflow": ".github/workflows/project-dev-jev-api.yml", "adapter": "adapters/jev_api.py"},
         "effect": {"operation": "cloudflare_pages_secret_put", "status": "PASS"},
         "readback": {"kind": "secret_name_presence", "status": "PASS", "present": True},
@@ -301,14 +406,14 @@ def build_receipt(*, envs_sha: str, ciphertext_sha256: str, account_id: str,
 
 def project(*, envs_sha: str, run_id: int, run_attempt: int, created_at: str,
             output: Path, root: Path = ROOT, runner: Runner = default_runner) -> dict[str, Any]:
-    validate_contracts(root)
+    contracts = validate_contracts(root)
     require(SHA40.fullmatch(envs_sha) is not None, "expected exact envs SHA")
     cipher = root / CIPHERTEXT
     require(cipher.is_file(), "ciphertext is not configured")
-    age_key = os.environ.get("SOPS_AGE_KEY", "")
-    account = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
-    token = os.environ.get("CLOUDFLARE_API_TOKEN", "")
-    require(age_key != "" and account != "" and token != "", "projection inputs are missing")
+    inputs = gate(root, contracts, "dev.projection")
+    age_key = inputs["SOPS_AGE_KEY"]
+    account = inputs["CLOUDFLARE_ACCOUNT_ID"]
+    token = inputs["CLOUDFLARE_API_TOKEN"]
 
     decrypted = run_checked(
         [os.environ.get("SOPS_BIN", "sops"), "--decrypt", "--output-type", "json", str(cipher)],
@@ -337,7 +442,7 @@ def project(*, envs_sha: str, run_id: int, run_attempt: int, created_at: str,
 
     receipt = build_receipt(
         envs_sha=envs_sha, ciphertext_sha256=hashlib.sha256(cipher.read_bytes()).hexdigest(),
-        account_id=account, run_id=run_id, run_attempt=run_attempt, created_at=created_at,
+        run_id=run_id, run_attempt=run_attempt, created_at=created_at,
     )
     destination = root / output
     destination.parent.mkdir(parents=True, exist_ok=True)
