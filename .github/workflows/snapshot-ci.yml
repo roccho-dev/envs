@@ -28,6 +28,8 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/check-public-snapshot.py
+          python3 tests/test_projection_receipt.py
+          python3 scripts/provider_readiness.py
           bash scripts/runtime-secret-projection.sh check
           bash tests/runtime-secret-projection-destructive.sh
 
@@ -62,7 +64,7 @@ jobs:
 
   nix-contract:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
