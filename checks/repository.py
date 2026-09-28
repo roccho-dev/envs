@@ -82,6 +82,11 @@ SECRET_PATTERNS = {
     "basic-auth URL": re.compile(rb"https?://[^\s/:@]+:[^\s/@]+@[^\s]+"),
 }
 ACTION_USE = re.compile(r"(?m)^\s*(?:-\s*)?uses:\s*([^@\s]+)@([^\s#]+)")
+INPUT_REFERENCE = re.compile(r"\$\{\{\s*(secrets|vars)\.([A-Za-z0-9_]+)\s*\}\}")
+EFFECT_WORKFLOWS = {
+    "author-dev-jev-api.yml": "dev.authoring",
+    "project-dev-jev-api.yml": "dev.projection",
+}
 
 
 class RepositoryError(ValueError):
@@ -188,7 +193,13 @@ def check_jsonl(root: Path) -> None:
             ids.add(identity)
 
 
-def check_workflows(root: Path) -> None:
+def declared_inputs(row: dict[str, Any]) -> set[tuple[str, str]]:
+    return {("secrets", item["name"]) for item in row.get("required_secrets", [])} | {
+        ("vars", item["name"]) for item in row.get("required_variables", [])
+    }
+
+
+def check_workflows(root: Path, environments: dict[str, dict[str, Any]]) -> None:
     workflow_root = root / ".github/workflows"
     names = {path.name for path in workflow_root.iterdir() if path.is_file()}
     require(
@@ -212,33 +223,32 @@ def check_workflows(root: Path) -> None:
     require("checks/test_repository.py" in check, "check workflow must test repository oracle")
     require("checks/test_jev_api.py" in check, "check workflow must test Jev adapter")
 
-    author = texts["author-dev-jev-api.yml"]
-    project = texts["project-dev-jev-api.yml"]
-    for name, text, environment in (
-        ("author-dev-jev-api.yml", author, "dev-authoring"),
-        ("project-dev-jev-api.yml", project, "dev-projection"),
-    ):
+    for name, plane in EFFECT_WORKFLOWS.items():
+        text = texts[name]
+        row = environments[plane]
         require("workflow_dispatch:" in text, f"{name}: manual dispatch missing")
         require("\n  push:" not in text and "\n  pull_request:" not in text, f"{name}: automatic effect trigger")
-        require(f"environment: {environment}" in text, f"{name}: static Environment differs")
+        require(f"environment: {row['github_environment']}" in text, f"{name}: static Environment differs")
         require("github.repository == 'roccho-dev/envs'" in text, f"{name}: repository guard missing")
         require("github.ref_name == 'proposals'" in text, f"{name}: canonical ref guard missing")
         require("ref: ${{ github.sha }}" in text, f"{name}: exact checkout missing")
         require("main" not in text, f"{name}: main must not be an effect source")
+        declared = declared_inputs(row)
+        require(set(INPUT_REFERENCE.findall(text)) == declared, f"{name}: Environment inputs differ from contract")
+        for namespace, input_name in sorted(declared):
+            mapping = "^\\s+" + re.escape(f"{input_name}: ${{{{ {namespace}.{input_name} }}}}") + "$"
+            require(re.search(mapping, text, re.MULTILINE) is not None, f"{name}: {input_name} mapping differs")
 
-    require("secrets.SOURCE_JEV_API_KEY" in author, "author workflow source secret missing")
-    require("adapters/jev_api.py author" in author, "author workflow adapter call missing")
-    for marker in (
-        "secrets.SOPS_AGE_KEY",
-        "secrets.CLOUDFLARE_API_TOKEN",
-        "vars.CLOUDFLARE_ACCOUNT_ID",
-        "adapters/jev_api.py project",
-    ):
-        require(marker in project, f"project workflow missing {marker}")
+    require("adapters/jev_api.py author" in texts["author-dev-jev-api.yml"], "author workflow adapter call missing")
+    require("adapters/jev_api.py project" in texts["project-dev-jev-api.yml"], "project workflow adapter call missing")
 
 
-def check_readme(root: Path) -> None:
+def check_readme(root: Path, environments: dict[str, dict[str, Any]]) -> None:
     text = (root / "README.md").read_text(encoding="utf-8")
+    for row in environments.values():
+        for _, input_name in sorted(declared_inputs(row)):
+            marker = f"{row['github_environment']}/{input_name}"
+            require(marker in text, f"README missing {marker}")
     for marker in (
         "canonical branch: `proposals`",
         "retained compatibility mirror: `main`",
@@ -275,11 +285,11 @@ def inspect(root: Path = ROOT, *, verify_main_mirror: bool = False) -> dict[str,
     check_text(root)
     check_jsonl(root)
     adapter = load_adapter(root)
-    adapter.validate_contracts(root)
+    environments = adapter.validate_contracts(root)["environments"]
     if (root / adapter.HANDOFF).is_file():
         adapter.load_receipt(root / adapter.HANDOFF)
-    check_workflows(root)
-    check_readme(root)
+    check_workflows(root, environments)
+    check_readme(root, environments)
     if verify_main_mirror:
         check_main_mirror(root)
     readiness = adapter.readiness(root)

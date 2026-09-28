@@ -40,6 +40,28 @@ def append_branch_effect(root: Path) -> None:
     path.write_text("".join(json.dumps(row, separators=(",", ":")) + "\n" for row in rows))
 
 
+def mutate_plane(identity: str, change):
+    def mutate(root: Path) -> None:
+        path = root / "contracts/environments.jsonl"
+        rows = [json.loads(line) for line in path.read_text().splitlines() if line]
+        for row in rows:
+            if row["id"] == identity:
+                change(row)
+        path.write_text("".join(json.dumps(row, separators=(",", ":")) + "\n" for row in rows))
+
+    return mutate
+
+
+def replace_text(relative: str, old: str, new: str):
+    def mutate(root: Path) -> None:
+        path = root / relative
+        text = path.read_text(encoding="utf-8")
+        assert old in text, f"{relative} fixture anchor missing"
+        path.write_text(text.replace(old, new), encoding="utf-8")
+
+    return mutate
+
+
 def main() -> None:
     baseline = repository.inspect(ROOT)
     assert baseline["status"] == "PASS"
@@ -77,6 +99,29 @@ def main() -> None:
             stream.write("\nDelete `main` after migration.\n")
 
     expect_red(propose_main_deletion)
+
+    obsolete_field = "age_" + "recipients"
+    obsolete_source = "SOURCE_" + "JEV_API_KEY"
+    author = ".github/workflows/author-dev-jev-api.yml"
+    project = ".github/workflows/project-dev-jev-api.yml"
+    expect_red(mutate_plane("dev.authoring", lambda row: row.update({obsolete_field: []})))
+    expect_red(mutate_plane("dev.runtime", lambda row: row.update({"required_variables": []})))
+    expect_red(mutate_plane("stg.projection", lambda row: row["required_variables"].clear()))
+    expect_red(mutate_plane("prd.projection", lambda row: row["required_secrets"].pop()))
+    expect_red(mutate_plane("dev.projection", lambda row: row["required_variables"].append(
+        {"name": "EXTRA", "type": "cloudflare_account_id", "lifecycle": "persistent"})))
+    expect_red(mutate_plane("dev.authoring", lambda row: row["required_secrets"][0].update(
+        {"lifecycle": "persistent"})))
+    expect_red(replace_text(author, "          SOPS_AGE_RECIPIENTS: ${{ vars.SOPS_AGE_RECIPIENTS }}\n", ""))
+    expect_red(replace_text(author, "${{ vars.SOPS_AGE_RECIPIENTS }}", "${{ secrets.SOPS_AGE_RECIPIENTS }}"))
+    expect_red(replace_text(author, "JEV_API_KEY: ${{ secrets.JEV_API_KEY }}",
+                            f"{obsolete_source}: ${{{{ secrets.{obsolete_source} }}}}"))
+    expect_red(replace_text(author, "JEV_API_KEY: ${{ secrets.JEV_API_KEY }}", "JEV_API_KEY: fixture-literal"))
+    expect_red(replace_text(author, "SOPS_AGE_RECIPIENTS: ${{ vars", "AGE_RECIPIENTS: ${{ vars"))
+    expect_red(replace_text(project, "          WRANGLER_PACKAGE:",
+                            "          EXTRA: ${{ secrets.EXTRA }}\n          WRANGLER_PACKAGE:"))
+    expect_red(replace_text("README.md", "dev-projection/SOPS_AGE_KEY", "dev-projection/REMOVED"))
+    expect_red(replace_text("README.md", "prd-projection/CLOUDFLARE_ACCOUNT_ID", "prd-projection/REMOVED"))
     print("repository checker self-test: PASS")
 
 

@@ -32,7 +32,8 @@ jobs:
 
       - name: Author ciphertext
         env:
-          SOURCE_JEV_API_KEY: ${{ secrets.SOURCE_JEV_API_KEY }}
+          JEV_API_KEY: ${{ secrets.JEV_API_KEY }}
+          SOPS_AGE_RECIPIENTS: ${{ vars.SOPS_AGE_RECIPIENTS }}
         run: >-
           nix shell
           github:NixOS/nixpkgs/f9948418dc8628ac02b6d6337e191ade9429d59d#sops
