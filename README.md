@@ -10,6 +10,22 @@ Current migration authority is `roccho-dev/envs#2`. Exact snapshot lineage and t
 
 The private historical repository is evidence only. Building, reviewing, or extending current `envs` must not require access to it.
 
+## Provider / consumer boundary
+
+`envs` owns secret-source admission, target-native projection, provider readback, and a non-secret projection receipt. It does not own application runtime PASS or independent consumer PASS. Consumers do not require `cmd/envctl`; the provider may use the trusted thin workflow/script projector.
+
+Normal `apps` / `ops` execution must not use envs checkout or workflow, `envctl` as a parent process, `envctl auth exec`, auth bundles, SOPS, age identities, GitHub Environment source secrets, `envs-old`, or old private artifacts.
+
+`envs-old` is historical evidence only. The machine-readable boundary is `contracts/provider-consumer.jsonl`; the current provider state is derived with:
+
+```text
+python3 scripts/provider_readiness.py
+```
+
+A provider handoff requires an exact envs SHA and a validated `handoffs/dev/jev-api.json`. `main` and `proposals` are navigation refs, not sufficient trust anchors. A provider handoff does not replace apps real runtime acceptance or ops independent execution twice.
+
+See `docs/provider-consumer-boundary.md`.
+
 ## Package boundary
 
 A package binding contains only:

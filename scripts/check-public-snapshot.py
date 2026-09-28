@@ -4,6 +4,10 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from typing import Any
+
+from provider_readiness import evaluate as evaluate_provider_readiness
+from projection_receipt import ReceiptError
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -31,8 +35,8 @@ def fail(message: str) -> None:
     raise SystemExit(message)
 
 
-def jsonl(path: Path) -> list[dict]:
-    rows: list[dict] = []
+def jsonl(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
     for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         if not line.strip():
             continue
@@ -45,7 +49,12 @@ def jsonl(path: Path) -> list[dict]:
 
 def scan_tree() -> None:
     for path in ROOT.rglob("*"):
-        if not path.is_file() or ".git" in path.parts:
+        if (
+            not path.is_file()
+            or ".git" in path.parts
+            or "__pycache__" in path.parts
+            or path.suffix == ".pyc"
+        ):
             continue
         if path.name in FORBIDDEN_NAMES or path.suffix.lower() in FORBIDDEN_SUFFIXES:
             fail(f"forbidden private-material filename: {path.relative_to(ROOT)}")
@@ -57,8 +66,147 @@ def scan_tree() -> None:
             jsonl(path)
 
 
+def check_provider_consumer_boundary() -> None:
+    path = ROOT / "contracts/provider-consumer.jsonl"
+    rows = {row["id"]: row for row in jsonl(path)}
+    expected_ids = {
+        "dev.jev-api.provider",
+        "apps.voice-ui.consumer",
+        "ops.voice-ui.consumer",
+        "normal.consumer.path",
+    }
+    if set(rows) != expected_ids:
+        fail("provider/consumer boundary set differs")
+
+    provider = rows["dev.jev-api.provider"]
+    expected_provider = {
+        "id": "dev.jev-api.provider",
+        "kind": "envs.providerConsumerBoundary.v1",
+        "role": "provider",
+        "repository": "roccho-dev/envs",
+        "historical_repository": "roccho-dev/envs-old",
+        "historical_repository_mode": "evidence_only",
+        "stage": "dev",
+        "capability": "jev-api",
+        "source_kind": "public_sops",
+        "target_kind": "target_native_auth",
+        "owns": [
+            "contract",
+            "authoring",
+            "projection",
+            "provider_readback",
+            "projection_receipt",
+        ],
+        "does_not_own": [
+            "application_runtime_acceptance",
+            "consumer_independent_execution",
+        ],
+        "handoff_ref_kind": "exact_commit_sha",
+    }
+    if provider != expected_provider:
+        fail("provider boundary differs")
+
+    apps = rows["apps.voice-ui.consumer"]
+    if apps != {
+        "id": "apps.voice-ui.consumer",
+        "kind": "envs.providerConsumerBoundary.v1",
+        "role": "consumer",
+        "repository": "roccho-dev/apps",
+        "stage": "dev",
+        "capability": "jev-api",
+        "owns": [
+            "application_artifact",
+            "capability_declaration",
+            "application_runtime_acceptance",
+        ],
+        "requires": [
+            "target_native_auth",
+            "projection_receipt",
+            "real_provider_use",
+        ],
+    }:
+        fail("apps boundary differs")
+
+    ops = rows["ops.voice-ui.consumer"]
+    if ops != {
+        "id": "ops.voice-ui.consumer",
+        "kind": "envs.providerConsumerBoundary.v1",
+        "role": "consumer",
+        "repository": "roccho-dev/ops",
+        "stage": "dev",
+        "capability": "jev-api",
+        "owns": [
+            "exact_deploy",
+            "deployment_readback",
+            "apps_acceptance_invocation",
+            "independent_execution_twice",
+        ],
+        "requires": [
+            "target_native_auth",
+            "projection_receipt",
+            "apps_runtime_acceptance",
+        ],
+    }:
+        fail("ops boundary differs")
+
+    normal = rows["normal.consumer.path"]
+    if normal != {
+        "id": "normal.consumer.path",
+        "kind": "envs.consumerExecutionBoundary.v1",
+        "applies_to": ["roccho-dev/apps", "roccho-dev/ops"],
+        "forbids": [
+            "envs_checkout",
+            "envs_workflow_dispatch",
+            "envs_workflow_wait",
+            "envctl_parent",
+            "envctl_auth_exec",
+            "auth_bundle",
+            "sops",
+            "age_identity",
+            "github_environment_source_secret",
+            "envs_old_fallback",
+            "old_private_artifact_fallback",
+        ],
+    }:
+        fail("normal consumer path differs")
+
+
+def check_active_fallbacks() -> None:
+    historical_repository = "roccho-dev/" + "envs-old"
+    forbidden_runtime_terms = (
+        historical_repository,
+        "envctl auth exec",
+        "auth-bundle",
+    )
+    roots = (
+        ".github/workflows",
+        "scripts",
+        "cmd",
+        "internal",
+        "bindings",
+        "environments",
+        "lib",
+        "modules",
+    )
+    for root_name in roots:
+        root = ROOT / root_name
+        if not root.exists():
+            continue
+        for path in root.rglob("*"):
+            if not path.is_file() or path.resolve() == Path(__file__).resolve():
+                continue
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            for term in forbidden_runtime_terms:
+                if term in text:
+                    fail(
+                        f"{path.relative_to(ROOT)}: active path contains forbidden fallback {term}"
+                    )
+
+
 def check_planes() -> bool:
-    planes = {row["id"]: row for row in jsonl(ROOT / "environments/secret-planes.jsonl")}
+    planes = {
+        row["id"]: row for row in jsonl(ROOT / "environments/secret-planes.jsonl")
+    }
     expected_ids = {
         "dev.authoring",
         "dev.projection",
@@ -109,7 +257,9 @@ def check_planes() -> bool:
     secrets_dir = ROOT / "secrets"
     if configured:
         actual = sorted(
-            str(path.relative_to(ROOT)) for path in secrets_dir.rglob("*") if path.is_file()
+            str(path.relative_to(ROOT))
+            for path in secrets_dir.rglob("*")
+            if path.is_file()
         )
         if actual != ["secrets/jev-api-key.sops.yaml"]:
             fail(f"unexpected secret files: {actual}")
@@ -160,6 +310,8 @@ def check_workflows() -> None:
         "github.repository == 'roccho-dev/envs'",
         "github.ref_name == 'proposals'",
         "environment: dev-projection",
+        "scripts/projection_receipt.py build",
+        "handoffs/dev/jev-api.json",
     ):
         if marker not in projection:
             fail(f"projection workflow missing {marker}")
@@ -167,13 +319,31 @@ def check_workflows() -> None:
         fail("projection effect must be manual-only")
 
 
+def check_readiness() -> dict[str, Any]:
+    try:
+        value = evaluate_provider_readiness()
+    except (ReceiptError, ValueError, KeyError, json.JSONDecodeError, OSError) as exc:
+        fail(f"provider readiness invalid: {exc}")
+    if value["consumer_runtime_readiness"] != "OUT_OF_SCOPE":
+        fail("envs must not claim consumer runtime readiness")
+    if value["provider_handoff_ready"] and value["provider_handoff_receipt"] != "PASS":
+        fail("provider handoff readiness is inconsistent")
+    return value
+
+
 def main() -> None:
     scan_tree()
+    check_provider_consumer_boundary()
+    check_active_fallbacks()
     configured = check_planes()
     check_workflows()
+    readiness = check_readiness()
     print("SNAPSHOT_SAFETY=PASS")
+    print("PROVIDER_CONSUMER_BOUNDARY=PASS")
     print("SECRET_PLANES=PASS")
     print("SOPS_STATE=" + ("ACTIVE" if configured else "NOT_CONFIGURED"))
+    print("PROVIDER_HANDOFF=" + readiness["provider_handoff_receipt"])
+    print("CONSUMER_RUNTIME_READINESS=OUT_OF_SCOPE")
 
 
 if __name__ == "__main__":
