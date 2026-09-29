@@ -46,7 +46,10 @@ PROBE_PORT = 2222
 PROBE_TIMEOUT = 60.0
 PROBE_SETTLE = 20.0
 PROBE_LOCATED = ("tunnels", "dns_records", "access_applications", "service_tokens")
-PROBE_CREATED = ("tunnel", "dns_record", "access_application", "access_policy", "service_token")
+# Every managed resource in the probe declaration (six, including the tunnel configuration).
+PROBE_ADDRESSES = tuple(f"cloudflare_{kind}.probe[0]" for kind in (
+    "zero_trust_tunnel_cloudflared", "zero_trust_tunnel_cloudflared_config", "dns_record",
+    "zero_trust_access_service_token", "zero_trust_access_policy", "zero_trust_access_application"))
 PROBE_CREDENTIALS = ("tunnel_token", "service_token_id", "service_token_value")
 
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
@@ -796,12 +799,22 @@ def access_probe(root: Path = ROOT, *, locate_only: bool = False, runner: Runner
                 result["status"] = "UNKNOWN"
             return result
         work = tofu_workdir(root, scratch, "probe", tools, env, runner)
-        result.update({"stage": "create", "status": "UNKNOWN", "created": None, "probe": None})
+        result.update({"stage": "create", "status": "UNKNOWN", "observed_state_ids": None, "probe": None,
+                       "id_claim": "IDs are as recorded in this run's OpenTofu state; provider existence or "
+                                   "absence is not asserted"})
+        observed: dict[str, str] | None = None
         try:
-            tofu(tools, work, env, runner, "apply", "-input=false", "-auto-approve", "-no-color", "-var", "create=true")
-            created = output(tools, work, env, runner, "created", PROBE_CREATED)
-            require(all(isinstance(value, str) and value for value in created.values()), "created IDs differ")
-            result.update({"stage": "probe", "created": created})
+            try:
+                tofu(tools, work, env, runner, "apply", "-input=false", "-auto-approve", "-no-color",
+                     "-var", "create=true")
+            finally:
+                # Whatever apply managed to create, its exact IDs are taken from the state before anything else.
+                observed = state_ids(tools, work, env, runner)
+                result["observed_state_ids"] = observed if observed is not None else "STATE_UNREADABLE"
+                print(json.dumps({"kind": "envs.rentAccessProbeStateIds.v1", "observed_state_ids":
+                                  result["observed_state_ids"]}, sort_keys=True), file=sys.stderr, flush=True)
+            require(observed is not None and set(observed) == set(PROBE_ADDRESSES), "created resource set differs")
+            result["stage"] = "probe"
             credentials = output(tools, work, env, runner, "credentials", PROBE_CREDENTIALS)
             require(all(isinstance(value, str) and value for value in credentials.values()), "credentials differ")
             probe = run_probe(tools, credentials, scratch, runner, bounded, spawn, sleep)
@@ -809,19 +822,56 @@ def access_probe(root: Path = ROOT, *, locate_only: bool = False, runner: Runner
         except EnvsError as exc:
             result["error"] = str(exc)
         finally:
-            # Cleanup removes only what this state created, then reads back absence from a fresh lookup state.
+            # Cleanup destroys only this state, then re-reads the state and looks up absence in a fresh lookup state.
+            destroyed = True
             try:
                 tofu(tools, work, env, runner, "destroy", "-input=false", "-auto-approve", "-no-color",
                      "-var", "create=true")
-                after = locate(root, scratch, "after", tools, env, runner)
-                result["cleanup"] = "ABSENT" if not any(after.values()) else "CLEANUP_UNKNOWN"
-                result["located_after"] = after
             except EnvsError:
+                destroyed = False
+            remaining = state_ids(tools, work, env, runner)
+            after = None
+            if destroyed and remaining == {}:
+                try:
+                    after = locate(root, scratch, "after", tools, env, runner)
+                except EnvsError:
+                    after = None
+            result["located_after"] = after
+            if destroyed and remaining == {} and after is not None and not any(after.values()):
+                result["cleanup"] = "ABSENT"
+            else:
                 result["cleanup"] = "CLEANUP_UNKNOWN"
+                # Still in state: destroy did not remove them. Unverified: state says removed (or state unreadable),
+                # but absence was not read back. Either way only these exact IDs may be cleaned up; a name match may not.
+                known = observed or {}
+                result["remaining_in_state"] = remaining if remaining is not None else "STATE_UNREADABLE"
+                result["unverified_after_destroy"] = {
+                    address: value for address, value in known.items() if remaining is None or address not in remaining}
+                result["owner_cleanup"] = "exact IDs above only; name-matched deletion needs its own contract"
     if result["cleanup"] != "ABSENT":
         # The current state is what matters: resources may remain, so no probe outcome stands as the status.
         result["status"] = "CLEANUP_UNKNOWN"
     return result
+
+
+def state_ids(tools: Mapping[str, str], work: Path, env: Mapping[str, str], runner: Runner) -> dict[str, str] | None:
+    # The state JSON can hold secrets in plain text: it is parsed in memory and only managed addresses and IDs leave.
+    try:
+        state = json.loads(tofu(tools, work, env, runner, "show", "-json", "-no-color") or b"{}")
+    except (EnvsError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    resources = (state.get("values") or {}).get("root_module", {}).get("resources", []) if isinstance(state, dict) else None
+    if not isinstance(resources, list):
+        return None
+    found: dict[str, str] = {}
+    for item in resources:
+        if not isinstance(item, dict) or item.get("mode") != "managed":
+            continue
+        address, value = item.get("address"), (item.get("values") or {}).get("id")
+        if address not in PROBE_ADDRESSES or not isinstance(value, str) or not value or address in found:
+            return None
+        found[address] = value
+    return found
 
 
 def walk_receipt(value: Any) -> None:

@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import secrets
@@ -30,7 +32,7 @@ TUNNEL_TOKEN = secrets.token_urlsafe(120)
 SERVICE_ID = secrets.token_hex(16) + ".access"
 SERVICE_VALUE = secrets.token_hex(32)
 SECRETS = (API_TOKEN, TUNNEL_TOKEN, SERVICE_VALUE)
-CREATED = {name: secrets.token_hex(16) for name in jev.PROBE_CREATED}
+OBSERVED = {address: secrets.token_hex(16) for address in jev.PROBE_ADDRESSES}
 EMPTY = {name: [] for name in jev.PROBE_LOCATED}
 PROXY = f'ProxyCommand="{TOOLS["cloudflared"]}" access ssh --hostname %h'
 
@@ -61,10 +63,14 @@ class Process:
 class Cloud:
     """A fake provider/client world: tofu, ssh-keygen, the long-running processes and the bounded ssh cases."""
 
-    def __init__(self, *, before=None, after=None, fail=(), outcomes=None) -> None:
+    def __init__(self, *, before=None, after=None, fail=(), outcomes=None, partial=2) -> None:
         self.located = {"before": before or EMPTY, "after": after or EMPTY}
         self.fail = set(fail)
         self.outcomes = outcomes or {}
+        self.partial = partial
+        self.state: dict[str, str] = {}
+        self.shows = 0
+        self.stderr = io.StringIO()
         self.calls: list[tuple[list[str], dict[str, str]]] = []
         self.processes: list[Process] = []
         self.cases: list[tuple[list[str], dict[str, str]]] = []
@@ -80,14 +86,37 @@ class Cloud:
             return subprocess.CompletedProcess(argv, 0, stdout=b"", stderr=b"")
         assert argv[0] == TOOLS["tofu"], argv
         phase, command = Path(argv[1].split("=", 1)[1]).name, argv[2]
+        failed = subprocess.CompletedProcess(argv, 1, stdout=f"noise {API_TOKEN}".encode(), stderr=b"")
+        if phase == "probe" and command == "apply":
+            # A failed apply may still have created some resources, and they are in the state.
+            addresses = jev.PROBE_ADDRESSES[:self.partial] if (phase, command) in self.fail else jev.PROBE_ADDRESSES
+            self.state = {address: OBSERVED[address] for address in addresses}
+        if phase == "probe" and command == "destroy" and (phase, command) not in self.fail:
+            self.state = {}
         if (phase, command) in self.fail:
-            return subprocess.CompletedProcess(argv, 1, stdout=f"noise {API_TOKEN}".encode(), stderr=b"")
+            return failed
+        if command == "show":
+            # "show#1" is the read right after apply, "show#2" the read after destroy.
+            self.shows += 1
+            if f"show#{self.shows}" in self.fail:
+                return failed
+            return subprocess.CompletedProcess(argv, 0, stdout=self.show_json(), stderr=b"")
         stdout = b""
         if command == "output":
-            stdout = json.dumps({"located": self.located.get(phase), "created": CREATED, "credentials": {
+            stdout = json.dumps({"located": self.located.get(phase), "credentials": {
                 "tunnel_token": TUNNEL_TOKEN, "service_token_id": SERVICE_ID, "service_token_value": SERVICE_VALUE,
             }}[argv[4]]).encode()
         return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr=b"")
+
+    def show_json(self) -> bytes:
+        # Real state JSON carries secrets in plain text: the token data source and the service token secret.
+        resources = [{"address": address, "mode": "managed", "type": address.split(".")[0],
+                      "values": {"id": value, "client_secret": SERVICE_VALUE, "tunnel_secret": TUNNEL_TOKEN}}
+                     for address, value in self.state.items()]
+        if self.state:
+            resources.append({"address": "data.cloudflare_zero_trust_tunnel_cloudflared_token.probe[0]", "mode": "data",
+                              "values": {"id": "x", "token": TUNNEL_TOKEN}})
+        return json.dumps({"format_version": "1.0", "values": {"root_module": {"resources": resources}}}).encode()
 
     def spawn(self, argv, env):
         process = Process(argv, env)
@@ -114,15 +143,17 @@ class Cloud:
         return outcome if outcome != "nonce" else ("exit", 0, nonce + b"\n")
 
     def probe(self, root: Path, **kwargs):
-        return jev.access_probe(root, runner=self.run, bounded=self.bounded, spawn=self.spawn,
-                                sleep=self.slept.append, **kwargs)
+        with contextlib.redirect_stderr(self.stderr):
+            return jev.access_probe(root, runner=self.run, bounded=self.bounded, spawn=self.spawn,
+                                    sleep=self.slept.append, **kwargs)
 
     def tofu_calls(self) -> list[tuple[str, list[str]]]:
         return [(Path(argv[1].split("=", 1)[1]).name, argv[2:]) for argv, _ in self.calls if argv[0] == TOOLS["tofu"]]
 
 
 def no_secret_escapes(cloud: Cloud, result: dict) -> None:
-    text = json.dumps(result)
+    # Neither the result nor the early ID line carries a secret, though the state JSON the adapter parsed does.
+    text = json.dumps(result) + cloud.stderr.getvalue()
     for value in SECRETS:
         assert value not in text, "a secret reached the result"
         for argv, _ in cloud.calls + cloud.cases:
@@ -165,7 +196,9 @@ def test_probe_pass(root: Path) -> None:
     cloud = Cloud()
     result = cloud.probe(root)
     assert result["status"] == "TOKEN_REACHED_NEGATIVES_REFUSED" and result["cleanup"] == "ABSENT", result
-    assert result["created"] == CREATED and result["probe"]["cases"] == {
+    assert result["observed_state_ids"] == OBSERVED and len(OBSERVED) == 6 and "not asserted" in result["id_claim"]
+    assert json.loads(cloud.stderr.getvalue())["observed_state_ids"] == OBSERVED
+    assert result["probe"]["cases"] == {
         "service_token": "REACHED", "no_token": "REFUSED", "wrong_token": "REFUSED", "service_token_again": "REACHED"}
     # A refused negative is never reported as an Access denial.
     assert result["probe"]["access_denial_evidence"] == "NOT_OBSERVED" and result["probe"]["cause"] == "UNKNOWN"
@@ -174,8 +207,8 @@ def test_probe_pass(root: Path) -> None:
     assert len(set(homes)) == 6 and os.environ.get("HOME", "\0") not in homes
     assert [(phase, args[0]) for phase, args in cloud.tofu_calls()] == [
         ("before", "init"), ("before", "apply"), ("before", "output"),
-        ("probe", "init"), ("probe", "apply"), ("probe", "output"), ("probe", "output"),
-        ("probe", "destroy"), ("after", "init"), ("after", "apply"), ("after", "output")]
+        ("probe", "init"), ("probe", "apply"), ("probe", "show"), ("probe", "output"),
+        ("probe", "destroy"), ("probe", "show"), ("after", "init"), ("after", "apply"), ("after", "output")]
     assert [process.argv[0] for process in cloud.processes] == [TOOLS["sshd"], TOOLS["cloudflared"]]
     assert cloud.processes[1].argv == [TOOLS["cloudflared"], "tunnel", "--no-autoupdate", "run"]
     assert cloud.processes[1].env["TUNNEL_TOKEN"] == TUNNEL_TOKEN
@@ -248,18 +281,33 @@ def test_probe_outcomes(root: Path) -> None:
 @with_root
 def test_failures_fail_closed(root: Path) -> None:
     # A failed create still destroys exactly this state; any cleanup doubt is CLEANUP_UNKNOWN, never retried.
-    cloud = Cloud(fail={("probe", "apply")})
+    # Partial apply: the two resources it did create are recorded from the state, not lost with the outputs.
+    cloud = Cloud(fail={("probe", "apply")}, partial=2)
     result = cloud.probe(root)
     assert result["status"] == "UNKNOWN" and result["cleanup"] == "ABSENT" and not cloud.processes
-    assert [args[0] for phase, args in cloud.tofu_calls() if phase == "probe"] == ["init", "apply", "destroy"]
+    assert result["observed_state_ids"] == {address: OBSERVED[address] for address in jev.PROBE_ADDRESSES[:2]}
+    assert [args[0] for phase, args in cloud.tofu_calls() if phase == "probe"] == ["init", "apply", "show", "destroy", "show"]
     assert API_TOKEN not in result["error"]
     no_secret_escapes(cloud, result)
-    for world in (Cloud(fail={("probe", "destroy")}), Cloud(after={**EMPTY, "tunnels": ["t"]}),
-                  Cloud(fail={("after", "apply")})):
+    # State unreadable right after apply: nothing is probed, destroy still runs, and the gap is explicit.
+    cloud = Cloud(fail={"show#1"})
+    result = cloud.probe(root)
+    assert result["observed_state_ids"] == "STATE_UNREADABLE" and result["status"] == "UNKNOWN" and not cloud.processes
+    assert result["cleanup"] == "ABSENT"
+    no_secret_escapes(cloud, result)
+    everything = dict(OBSERVED)
+    for world, in_state, unverified in (
+        (Cloud(fail={("probe", "destroy")}), everything, {}),                  # destroy failed: still in state
+        (Cloud(after={**EMPTY, "tunnels": ["t"]}), {}, everything),            # a name is still found
+        (Cloud(fail={("after", "apply")}), {}, everything),                    # absence lookup failed
+        (Cloud(fail={"show#2"}), "STATE_UNREADABLE", everything),               # state unreadable after destroy
+    ):
         result = world.probe(root)
         # A reached probe never stands as the status while resources may remain.
         assert result["status"] == "CLEANUP_UNKNOWN" and result["cleanup"] == "CLEANUP_UNKNOWN", result
         assert result["probe"]["status"] == "TOKEN_REACHED_NEGATIVES_REFUSED"
+        assert result["remaining_in_state"] == in_state and result["unverified_after_destroy"] == unverified, result
+        assert "exact IDs" in result["owner_cleanup"] and result["observed_state_ids"] == OBSERVED
         assert sum(1 for _, args in world.tofu_calls() if args[0] == "destroy") == 1
         no_secret_escapes(world, result)
         lookups_never_mutate(world)
