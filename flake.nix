@@ -23,22 +23,31 @@
         inherit tools;
       });
 
-      # Sole authoring/projection entry: run from the exact checkout root, with no ambient PATH.
+      # Sole authoring/projection entry: the adapter from this exact source, with no ambient PATH.
       entry = pkgs.writeShellScriptBin "envs-effect" ''
         set -euo pipefail
         export PATH=${nixpkgs.lib.makeBinPath packages}
         export ENVS_EFFECT_TOOLCHAIN=${manifest}
-        exec ${tools.python3} -I adapters/jev_api.py "$@"
+        exec ${tools.python3} -I ${self}/adapters/jev_api.py "$@"
       '';
 
       effect-toolchain = pkgs.buildEnv {
         name = "envs-effect-toolchain";
         paths = [ entry ] ++ packages;
       };
+
+      # Provided artifact: the complete store closure plus ENTRY, deterministic so CI can hand it off by digest.
+      effect-artifact = pkgs.runCommand "envs-effect.tar" {
+        closure = pkgs.closureInfo { rootPaths = [ effect-toolchain ]; };
+      } ''
+        echo ${effect-toolchain}/bin/envs-effect > ENTRY
+        tar --create --file "$out" --sort=name --mtime=@1 --owner=0 --group=0 --numeric-owner \
+          ENTRY $(cat "$closure/store-paths")
+      '';
     in
     {
       packages.${system} = {
-        inherit effect-toolchain;
+        inherit effect-toolchain effect-artifact;
         default = effect-toolchain;
       };
     };

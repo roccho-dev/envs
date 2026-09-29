@@ -85,14 +85,17 @@ ciphertext
 
 ## Effect toolchain
 
-`flake.nix` and `flake.lock` define the only toolchain for authoring and projection: Python, SOPS, Wrangler, Git, and GitHub CLI from the locked nixpkgs input, plus the `envs-effect` entry.
+`flake.nix` and `flake.lock` define the only toolchain for authoring and projection: Python, SOPS, Wrangler, Git, and GitHub CLI from the locked nixpkgs input, plus the `envs-effect` entry running this source's adapter. `.#effect-artifact` is that entry's complete store closure as one tar with an `ENTRY` pointer.
 
 ```text
-nix build .#effect-toolchain --no-update-lock-file   # before any secret is injected
-envs-effect author | project                         # store paths only; no ambient PATH
+check (secret-free)   nix build .#effect-artifact → upload envs-effect-<source sha>  # provided artifact
+clean-start / effect  obtain by source SHA → verify digest → extract to /nix/store     # no checkout build, no Nix
+                      envs-effect --root <checkout> toolchain | author | project        # store paths only
 ```
 
-The effect workflows realize the closure and record its tool-emitted identity (`envs-effect toolchain`) before the secret-bearing step, then run only its store paths. No Nix, npm, or other package resolution runs after secret injection, and the repository check rejects any other executable, absolute path, command chaining, or substitution on those steps. The entry carries a manifest of its exact tools and nixpkgs lock; before SOPS or Wrangler starts, the adapter turns RED when that manifest is absent, outside the Nix store, differs from the checked-out `flake.lock`, lacks a tool, or is not running on its own Python. The secret-free `check` workflow proves Nix regenerates the committed `flake.lock` byte-for-byte, reconstructs the same flake output, executes `envs-effect toolchain` and each closure tool (including Wrangler's `pages secret put|list --help`), and proves the missing and mismatched cases RED.
+`check` provides the artifact for its source SHA; GitHub records its artifact id (locator) and `sha256` digest. The consumer step, identical in `check`'s clean-start job and both effect workflows, resolves the one unexpired `envs-effect-<sha>` artifact, requires its producing run to be `check.yml` for that SHA and branch, verifies the downloaded bytes against GitHub's digest, and extracts it without installing Nix. Effect workflows resolve by the dispatched `github.sha`, so each `proposals` commit consumes the artifact its own post-merge `check` push run provided; no SHA is copied by hand. They record `envs-effect toolchain` before the secret-bearing step and then run only provided store paths; the repository check rejects any rebuild, Nix, other executable, absolute path, command chaining, or substitution there. The runner image (recorded as `ImageOS`/`ImageVersion`), its shell/curl/jq/coreutils/tar/unzip/sudo, and SHA-pinned Actions are the platform boundary; Nix is installed only by the producer.
+
+The entry carries a manifest of its exact tools and nixpkgs lock; before SOPS or Wrangler starts, the adapter turns RED when that manifest is absent, outside the Nix store, differs from the data root's `flake.lock` or adapter, lacks a tool, or is not running on its own Python. `check` also proves Nix regenerates the committed `flake.lock` byte-for-byte, executes each closure tool (including Wrangler's `pages secret put|list --help`), and proves missing, altered, and mismatched artifacts RED in the clean-start job.
 
 This is source and CI evidence only. It does not claim a real authoring or projection effect.
 
@@ -104,7 +107,7 @@ Normal apps/ops execution uses only target-native auth. It does not start or wai
 python3 checks/repository.py
 python3 checks/test_repository.py
 python3 checks/test_jev_api.py
-nix build .#effect-toolchain --no-update-lock-file   # check workflow, toolchain job
+nix build .#effect-toolchain .#effect-artifact --no-update-lock-file   # check workflow, toolchain job
 ```
 
 The repository oracle calculates accepted structure and state. Its tests deliberately create invalid states and require RED rather than repeating only happy-path execution.

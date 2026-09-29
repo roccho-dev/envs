@@ -349,6 +349,11 @@ def toolchain(root: Path, environ: Mapping[str, str] | None = None, executable: 
     require(isinstance(value, dict) and set(value) == {"kind", "nixpkgs", "tools"}
             and value["kind"] == TOOLCHAIN_KIND, "effect toolchain manifest differs")
     require(value["nixpkgs"] == locked_nixpkgs(root), "effect toolchain differs from flake.lock")
+    try:
+        same_adapter = (root / "adapters/jev_api.py").read_bytes() == Path(__file__).read_bytes()
+    except OSError as exc:
+        raise EnvsError("checkout adapter is unreadable") from exc
+    require(same_adapter, "checkout adapter differs from the effect toolchain")
     tools = value["tools"]
     require(isinstance(tools, dict) and set(tools) == set(TOOLCHAIN_TOOLS), "effect toolchain tool set differs")
     for name in TOOLCHAIN_TOOLS:
@@ -538,6 +543,8 @@ def utc_now() -> str:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
+    # Data root (contracts, ciphertext, handoff); defaults to the source carrying this adapter.
+    parser.add_argument("--root", type=Path, default=ROOT)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("check")
     sub.add_parser("readiness")
@@ -550,26 +557,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     project_parser.add_argument("--created-at")
     project_parser.add_argument("--output", type=Path, default=HANDOFF)
     args = parser.parse_args(argv)
+    root = args.root.resolve()
     try:
         if args.command == "check":
-            validate_contracts(ROOT)
-            if (ROOT / HANDOFF).is_file():
-                load_receipt(ROOT / HANDOFF)
+            validate_contracts(root)
+            if (root / HANDOFF).is_file():
+                load_receipt(root / HANDOFF)
             print("JEV_API_CONTRACT=PASS")
         elif args.command == "readiness":
-            print(json.dumps(readiness(ROOT), indent=2, sort_keys=True))
+            print(json.dumps(readiness(root), indent=2, sort_keys=True))
         elif args.command == "toolchain":
-            tools = toolchain(ROOT)
+            tools = toolchain(root)
             print(json.dumps({
-                "kind": "envs.effectToolchainCheck.v1", "status": "PASS",
-                "manifest": os.environ["ENVS_EFFECT_TOOLCHAIN"], "nixpkgs": locked_nixpkgs(ROOT), "tools": tools,
+                "kind": "envs.effectToolchainCheck.v1", "status": "PASS", "root": str(root),
+                "manifest": os.environ["ENVS_EFFECT_TOOLCHAIN"], "nixpkgs": locked_nixpkgs(root), "tools": tools,
             }, indent=2, sort_keys=True))
         elif args.command == "author":
-            print(json.dumps(author(ROOT), indent=2, sort_keys=True))
+            print(json.dumps(author(root), indent=2, sort_keys=True))
         else:
             receipt = project(
                 envs_sha=args.envs_sha, run_id=args.run_id, run_attempt=args.run_attempt,
-                created_at=args.created_at or utc_now(), output=args.output, root=ROOT,
+                created_at=args.created_at or utc_now(), output=args.output, root=root,
             )
             print(json.dumps({"kind": receipt["kind"], "status": "PASS", "output": str(args.output)}, sort_keys=True))
     except (EnvsError, OSError) as exc:

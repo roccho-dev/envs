@@ -11,6 +11,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -104,7 +105,155 @@ jobs:
           mkdir "$copy"
           "$tool/git" archive HEAD | tar -x -C "$copy"
           "$tool/python3" -I -c 'import json, sys; p = sys.argv[1]; v = json.load(open(p)); v["nodes"]["nixpkgs"]["locked"]["narHash"] = "sha256-" + "A" * 43 + "="; json.dump(v, open(p, "w"))' "$copy/flake.lock"
-          if (cd "$copy" && "$tool/envs-effect" toolchain); then
+          if "$tool/envs-effect" --root "$copy" toolchain; then
             echo "toolchain differing from flake.lock was accepted" >&2
             exit 1
           fi
+
+      - name: Build provided effect artifact
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/provide"
+          nix build .#effect-artifact --no-update-lock-file --print-build-logs --out-link "$RUNNER_TEMP/provide/envs-effect.tar"
+          sha256sum "$RUNNER_TEMP/provide/envs-effect.tar"
+
+      - name: Provide effect artifact
+        id: provide
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: envs-effect-${{ github.event.pull_request.head.sha || github.sha }}
+          path: ${{ runner.temp }}/provide/envs-effect.tar
+          if-no-files-found: error
+          compression-level: 1
+
+      - name: Record provided artifact identity
+        env:
+          ARTIFACT_ID: ${{ steps.provide.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.provide.outputs.artifact-digest }}
+          ARTIFACT_URL: ${{ steps.provide.outputs.artifact-url }}
+        run: echo "provided artifact id=$ARTIFACT_ID digest=$ARTIFACT_DIGEST url=$ARTIFACT_URL"
+
+  # Fresh consumer: no checkout, no Nix; obtains the provided artifact exactly as the effect workflows do.
+  clean-start:
+    needs: toolchain
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Obtain provided effect artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ENVS_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          echo "platform: $ImageOS $ImageVersion"
+          api="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions"
+          auth="Authorization: Bearer $GH_TOKEN"
+          art="$(mktemp -d)"
+          curl -fsSL -H "$auth" -o "$art/list.json" "$api/artifacts?name=envs-effect-$ENVS_SOURCE_SHA&per_page=100"
+          jq -e '[.artifacts[] | select(.expired | not)] | length == 1 and (.[0].digest | test("^sha256:[0-9a-f]{64}$"))' "$art/list.json" >/dev/null
+          jq '[.artifacts[] | select(.expired | not)][0]' "$art/list.json" >"$art/artifact.json"
+          id="$(jq -r '.id' "$art/artifact.json")"
+          digest="$(jq -r '.digest' "$art/artifact.json")"
+          run_id="$(jq -r '.workflow_run.id' "$art/artifact.json")"
+          curl -fsSL -H "$auth" -o "$art/run.json" "$api/runs/$run_id"
+          jq -e --arg sha "$ENVS_SOURCE_SHA" --arg branch "${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}" --arg current "$GITHUB_RUN_ID" \
+            '.path == ".github/workflows/check.yml" and .head_sha == $sha and .head_branch == $branch and (.conclusion == "success" or (.id | tostring) == $current)' \
+            "$art/run.json" >/dev/null
+          curl -fsSL -H "$auth" -o "$art/envs-effect.zip" "$api/artifacts/$id/zip"
+          echo "${digest#sha256:}  $art/envs-effect.zip" | sha256sum -c -
+          unzip -q "$art/envs-effect.zip" -d "$art/content"
+          test "$(ls -A "$art/content")" = envs-effect.tar
+          entry="$(tar -xOf "$art/content/envs-effect.tar" ENTRY)"
+          [[ "$entry" =~ ^/nix/store/[0-9a-z]{32}-envs-effect-toolchain/bin/envs-effect$ ]]
+          sudo mkdir -p /nix/store
+          sudo tar -x -C / -f "$art/content/envs-effect.tar" nix/store
+          test -x "$entry"
+          echo "artifact: run=$run_id id=$id digest=$digest entry=$entry"
+          echo "ENVS_EFFECT_BIN=${entry%/envs-effect}" >>"$GITHUB_ENV"
+          echo "ENVS_EFFECT_DIGEST=$digest" >>"$GITHUB_ENV"
+          echo "ENVS_EFFECT_ZIP=$art/envs-effect.zip" >>"$GITHUB_ENV"
+
+      - name: Clean start has no source checkout or Nix
+        run: |
+          set -euo pipefail
+          test -z "$(ls -A "$GITHUB_WORKSPACE")"
+          if command -v nix; then
+            echo "Nix is present on the clean-start runner" >&2
+            exit 1
+          fi
+
+      - name: Run provided entry and tools without credentials
+        env:
+          WRANGLER_SEND_METRICS: "false"
+        run: |
+          set -euo pipefail
+          "$ENVS_EFFECT_BIN/envs-effect" toolchain
+          "$ENVS_EFFECT_BIN/envs-effect" check
+          for tool in python3 sops git gh wrangler; do
+            "$ENVS_EFFECT_BIN/$tool" --version
+          done
+
+      - name: Missing artifact is RED
+        id: missing
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ENVS_SOURCE_SHA: "0000000000000000000000000000000000000000"
+        run: |
+          set -euo pipefail
+          echo "platform: $ImageOS $ImageVersion"
+          api="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions"
+          auth="Authorization: Bearer $GH_TOKEN"
+          art="$(mktemp -d)"
+          curl -fsSL -H "$auth" -o "$art/list.json" "$api/artifacts?name=envs-effect-$ENVS_SOURCE_SHA&per_page=100"
+          jq -e '[.artifacts[] | select(.expired | not)] | length == 1 and (.[0].digest | test("^sha256:[0-9a-f]{64}$"))' "$art/list.json" >/dev/null
+          jq '[.artifacts[] | select(.expired | not)][0]' "$art/list.json" >"$art/artifact.json"
+          id="$(jq -r '.id' "$art/artifact.json")"
+          digest="$(jq -r '.digest' "$art/artifact.json")"
+          run_id="$(jq -r '.workflow_run.id' "$art/artifact.json")"
+          curl -fsSL -H "$auth" -o "$art/run.json" "$api/runs/$run_id"
+          jq -e --arg sha "$ENVS_SOURCE_SHA" --arg branch "${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}" --arg current "$GITHUB_RUN_ID" \
+            '.path == ".github/workflows/check.yml" and .head_sha == $sha and .head_branch == $branch and (.conclusion == "success" or (.id | tostring) == $current)' \
+            "$art/run.json" >/dev/null
+          curl -fsSL -H "$auth" -o "$art/envs-effect.zip" "$api/artifacts/$id/zip"
+          echo "${digest#sha256:}  $art/envs-effect.zip" | sha256sum -c -
+          unzip -q "$art/envs-effect.zip" -d "$art/content"
+          test "$(ls -A "$art/content")" = envs-effect.tar
+          entry="$(tar -xOf "$art/content/envs-effect.tar" ENTRY)"
+          [[ "$entry" =~ ^/nix/store/[0-9a-z]{32}-envs-effect-toolchain/bin/envs-effect$ ]]
+          sudo mkdir -p /nix/store
+          sudo tar -x -C / -f "$art/content/envs-effect.tar" nix/store
+          test -x "$entry"
+          echo "artifact: run=$run_id id=$id digest=$digest entry=$entry"
+          echo "ENVS_EFFECT_BIN=${entry%/envs-effect}" >>"$GITHUB_ENV"
+          echo "ENVS_EFFECT_DIGEST=$digest" >>"$GITHUB_ENV"
+          echo "ENVS_EFFECT_ZIP=$art/envs-effect.zip" >>"$GITHUB_ENV"
+
+      - name: Missing, altered, or mismatched artifact is RED before tools run
+        env:
+          MISSING: ${{ steps.missing.outcome }}
+        run: |
+          set -euo pipefail
+          test "$MISSING" = failure
+          altered="$RUNNER_TEMP/altered.zip"
+          cp "$ENVS_EFFECT_ZIP" "$altered"
+          printf 'x' | dd of="$altered" bs=1 seek=4096 conv=notrunc status=none
+          if echo "${ENVS_EFFECT_DIGEST#sha256:}  $altered" | sha256sum -c -; then
+            echo "altered artifact was accepted" >&2
+            exit 1
+          fi
+          source="$("$ENVS_EFFECT_BIN/envs-effect" toolchain | jq -r .root)"
+          for case in lock adapter; do
+            copy="$RUNNER_TEMP/mismatched-$case"
+            cp -R "$source" "$copy"
+            chmod -R u+w "$copy"
+            if [ "$case" = lock ]; then
+              jq '.nodes.nixpkgs.locked.narHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="' "$source/flake.lock" >"$copy/flake.lock"
+            else
+              echo "# altered" >>"$copy/adapters/jev_api.py"
+            fi
+            if "$ENVS_EFFECT_BIN/envs-effect" --root "$copy" toolchain; then
+              echo "mismatched $case was accepted" >&2
+              exit 1
+            fi
+          done

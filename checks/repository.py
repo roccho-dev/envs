@@ -91,20 +91,25 @@ EFFECT_WORKFLOWS = {
     "project-dev-jev-api.yml": "dev.projection",
 }
 TOOLCHAIN_BUILD = 'nix build .#effect-toolchain --no-update-lock-file'
+ARTIFACT_BUILD = 'nix build .#effect-artifact --no-update-lock-file'
+ARTIFACT_NAME = "name: envs-effect-${{ github.event.pull_request.head.sha || github.sha }}"
 TOOLCHAIN_BIN = '"$RUNNER_TEMP/envs-effect/bin/'
-# Effect jobs may start only Nix (before secrets) and store paths from the repo-owned closure.
+# The one step that obtains the provided artifact; check's clean-start job holds the canonical text.
+CONSUMER_STEP = "- name: Obtain provided effect artifact\n"
+CONSUMER_RUN = "        run: |\n"
+EFFECT_ENTRY = '"$ENVS_EFFECT_BIN/envs-effect" --root "$GITHUB_WORKSPACE"'
+# After the consumer step, effect jobs run only store paths from the provided artifact.
 AMBIENT_TOOL = re.compile(r"(?m)(?:^|[\s>|;&(])(?:python3?|git|gh|sops|wrangler|node|npx|npm|pip3?|curl|wget)\s")
-RUNTIME_ACQUISITION = ("npx", "npm ", "pip ", "--yes", "nix shell", "nix run", "nix profile", "github:", "--impure")
-TOOLCHAIN_IDENTITY = f'{TOOLCHAIN_BIN}envs-effect" toolchain'
-EFFECT_ACTIONS = {"actions/checkout", "cachix/install-nix-action"}
+RUNTIME_ACQUISITION = ("npx", "npm ", "pip ", "--yes", "nix ", "install-nix", "github:", "--impure")
+TOOLCHAIN_IDENTITY = f"{EFFECT_ENTRY} toolchain"
+EFFECT_ACTIONS = {"actions/checkout"}
 RUN_START = re.compile(r"^(\s*)run:\s*(.*)$")
-# Every effect-step command is a closure store path, the one Nix realization, or a fixed assignment.
+# Every other effect-step command is a provided store path or a fixed assignment.
 ALLOWED_COMMAND = re.compile(
     r'^(?:set -euo pipefail'
-    r'|tool="\$RUNNER_TEMP/envs-effect/bin"'
+    r'|tool="\$ENVS_EFFECT_BIN"'
     r'|branch="[a-z/-]+(?:\$\{GITHUB_RUN_(?:ID|ATTEMPT)\}-?)+"'
-    r'|nix build \.#effect-toolchain --no-update-lock-file --out-link "\$RUNNER_TEMP/envs-effect"'
-    r'|(?:"\$RUNNER_TEMP/envs-effect/bin/|"\$tool/)[a-z0-9-]+"(?: .*)?)$'
+    r'|"\$(?:ENVS_EFFECT_BIN|tool)/[a-z0-9-]+"(?: .*)?)$'
 )
 COMMAND_CONTROL = re.compile(r"[;&|<>`\n]|\$\(")
 FLAKE_NIXPKGS = re.compile(r'(?m)^\s*inputs\.nixpkgs\.url = "github:NixOS/nixpkgs/([0-9a-f]{40})";$')
@@ -255,6 +260,15 @@ def run_commands(text: str) -> list[str]:
     return commands
 
 
+def consumer_run(text: str, name: str) -> str:
+    start = text.find(CONSUMER_STEP)
+    require(start != -1, f"{name}: provided artifact is not obtained")
+    body = text.find(CONSUMER_RUN, start)
+    require(body != -1 and "- name:" not in text[start + len(CONSUMER_STEP):body], f"{name}: consumer step differs")
+    end = text.find("\n\n", body)
+    return text[body:] if end == -1 else text[body:end + 1]
+
+
 def check_workflows(root: Path, environments: dict[str, dict[str, Any]]) -> None:
     workflow_root = root / ".github/workflows"
     names = {path.name for path in workflow_root.iterdir() if path.is_file()}
@@ -288,23 +302,38 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]]) -> None
         require(f'"$tool/{tool}" --version' in check, f"check workflow must execute closure {tool}")
     require('"$tool/wrangler" pages secret "$command" --help' in check,
             "check workflow must execute the Wrangler argv shape")
+    require(ARTIFACT_BUILD in check and ARTIFACT_NAME in check and "actions/upload-artifact@" in check,
+            "check workflow must provide the effect artifact")
+    clean_start = check[check.find("\n  clean-start:\n"):] if "\n  clean-start:\n" in check else ""
+    require("    needs: toolchain\n" in clean_start, "check workflow must clean-start from the provided artifact")
+    for token in ("actions/checkout", "nix ", "install-nix"):
+        require(token not in clean_start, f"clean-start must not use {token.strip()}")
+    canonical = consumer_run(clean_start, "check.yml clean-start")
+    require(clean_start.count(canonical) == 2, "clean-start must run the canonical consumer and its missing case")
+    for marker in (
+        'test "$MISSING" = failure',
+        'if echo "${ENVS_EFFECT_DIGEST#sha256:}  $altered" | sha256sum -c -; then',
+        "for case in lock adapter; do",
+        '"$ENVS_EFFECT_BIN/envs-effect" --root "$copy" toolchain',
+    ):
+        require(marker in clean_start, f"clean-start destructive case missing: {marker}")
 
     for name, plane in EFFECT_WORKFLOWS.items():
         text = texts[name]
         row = environments[plane]
         for token in RUNTIME_ACQUISITION:
-            require(token not in text, f"{name}: runtime acquisition {token.strip()}")
-        require(AMBIENT_TOOL.search(text) is None, f"{name}: ambient tool on the effect path")
-        build = text.find(TOOLCHAIN_BUILD)
-        require(build != -1, f"{name}: repo-owned toolchain is not realized")
-        require(build < text.find("${{ secrets."), f"{name}: toolchain must be realized before secrets")
+            require(token not in text, f"{name}: runtime acquisition or rebuild {token.strip()}")
+        require(consumer_run(text, name) == canonical, f"{name}: consumer differs from the clean-start consumer")
+        require("          ENVS_SOURCE_SHA: ${{ github.sha }}\n" in text, f"{name}: artifact must resolve by the dispatched SHA")
+        rest = text.replace(canonical, "")
+        require(AMBIENT_TOOL.search(rest) is None, f"{name}: ambient tool on the effect path")
+        consume = text.find(CONSUMER_STEP)
         identity = text.find(TOOLCHAIN_IDENTITY)
-        require(build < identity < text.find("${{ secrets."),
-                f"{name}: toolchain identity must be recorded after realization and before secrets")
-        require(text.count("nix ") == 1, f"{name}: Nix may run only to realize the toolchain")
+        require(-1 < consume < identity < text.find("${{ secrets."),
+                f"{name}: artifact must be obtained and its identity recorded before secrets")
         require("shell:" not in text, f"{name}: custom step shell is forbidden")
         require({action for action, _ in ACTION_USE.findall(text)} == EFFECT_ACTIONS, f"{name}: effect Action set differs")
-        for command in run_commands(text):
+        for command in run_commands(rest):
             require(COMMAND_CONTROL.search(command) is None, f"{name}: command chaining or substitution: {command}")
             require(ALLOWED_COMMAND.fullmatch(command) is not None, f"{name}: non-closure executable: {command}")
         require("workflow_dispatch:" in text, f"{name}: manual dispatch missing")
@@ -320,8 +349,8 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]]) -> None
             mapping = "^\\s+" + re.escape(f"{input_name}: ${{{{ {namespace}.{input_name} }}}}") + "$"
             require(re.search(mapping, text, re.MULTILINE) is not None, f"{name}: {input_name} mapping differs")
 
-    require(f'{TOOLCHAIN_BIN}envs-effect" author' in texts["author-dev-jev-api.yml"], "author workflow entry call missing")
-    require(f'{TOOLCHAIN_BIN}envs-effect" project' in texts["project-dev-jev-api.yml"], "project workflow entry call missing")
+    require(f"{EFFECT_ENTRY} author" in texts["author-dev-jev-api.yml"], "author workflow entry call missing")
+    require(f"{EFFECT_ENTRY} project" in texts["project-dev-jev-api.yml"], "project workflow entry call missing")
 
 
 def check_toolchain(root: Path, adapter) -> None:
@@ -331,7 +360,9 @@ def check_toolchain(root: Path, adapter) -> None:
     require(adapter.locked_nixpkgs(root)["rev"] == pinned[0], "flake.lock differs from flake.nix")
     for tool in adapter.TOOLCHAIN_TOOLS:
         require(f'{tool} = "${{pkgs.' in flake, f"flake does not provide {tool}")
-    require('exec ${tools.python3} -I adapters/jev_api.py "$@"' in flake, "flake entry must run only the adapter")
+    require('exec ${tools.python3} -I ${self}/adapters/jev_api.py "$@"' in flake, "flake entry must run only the adapter")
+    require("closureInfo { rootPaths = [ effect-toolchain ]; }" in flake and "echo ${effect-toolchain}/bin/envs-effect > ENTRY" in flake,
+            "flake artifact must carry the whole entry closure and its ENTRY")
     source = (root / "adapters/jev_api.py").read_text(encoding="utf-8")
     for token in ("npx", "--yes", "SOPS_BIN", "NPX_BIN", "WRANGLER_PACKAGE"):
         require(token not in source, f"adapter selects an ambient or runtime tool: {token}")

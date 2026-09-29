@@ -294,6 +294,7 @@ def toolchain_red_cases(outside: Path) -> list[tuple[dict[str, str], object]]:
         ({"ENVS_EFFECT_TOOLCHAIN": str(STORE / "absent.json")}, None),
         ({}, mismatch_lock),
         ({}, lambda root: (root / jev.FLAKE_LOCK).unlink()),
+        ({}, lambda root: append(root / "adapters/jev_api.py", "\n# checkout differs from the artifact\n")),
         ({"ENVS_EFFECT_TOOLCHAIN": manifest("stale-lock.json", nixpkgs=lock)}, None),
         ({"ENVS_EFFECT_TOOLCHAIN": manifest("kind.json", kind="envs.effectToolchain.v0")}, None),
         ({"ENVS_EFFECT_TOOLCHAIN": manifest("missing-tool.json", tools={**TOOLS, "sops": str(STORE / "absent")})}, None),
