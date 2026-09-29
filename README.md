@@ -26,7 +26,7 @@ checks     = executable repository and adapter specifications
 .github/workflows/
 flake.nix, flake.lock
 contracts/
-ciphertexts/       # absent while dev is NOT_CONFIGURED
+ciphertexts/       # absent while dev (Jev, rent tunnel) is NOT_CONFIGURED
 adapters/jev_api.py
 handoffs/          # absent until real projection/readback PASS
 checks/
@@ -45,7 +45,7 @@ THIRD_PARTY_NOTICES.md
 
 ## Environment inputs
 
-`contracts/environments.jsonl` declares each GitHub Environment's `required_secrets` and `required_variables` by name, type, and lifecycle. The actual values live only in the GitHub Environment; the owner sets them there without a commit. Git never stores a value body: before any provider effect the adapter turns a missing or invalid required input RED, and turns RED when a live Variable value appears anywhere in the repository. The only exception is the recipient metadata that sops writes into `ciphertexts/dev-jev-api.sops.yaml`.
+`contracts/environments.jsonl` declares each GitHub Environment's `required_secrets` and `required_variables` by name, type, and lifecycle. The actual values live only in the GitHub Environment; the owner sets them there without a commit. Git never stores a value body: before any provider effect the adapter turns a missing or invalid required input RED, and turns RED when a live Variable value appears anywhere in the repository. The only exception is the recipient metadata that sops writes into `ciphertexts/dev-jev-api.sops.yaml` and `ciphertexts/dev-rent-tunnel.sops.yaml`.
 
 | Environment input | Kind | Type | Lifecycle |
 |---|---|---|---|
@@ -54,6 +54,10 @@ THIRD_PARTY_NOTICES.md
 | `dev-projection/SOPS_AGE_KEY` | secret | age_identity | persistent |
 | `dev-projection/CLOUDFLARE_API_TOKEN` | secret | opaque | persistent |
 | `dev-projection/CLOUDFLARE_ACCOUNT_ID` | variable | cloudflare_account_id | persistent |
+| `dev-rent-tunnel/CLOUDFLARE_API_TOKEN` | secret | opaque | persistent |
+| `dev-rent-tunnel/CLOUDFLARE_ACCOUNT_ID` | variable | cloudflare_account_id | persistent |
+| `dev-rent-tunnel/RENT_TUNNEL_ID` | variable | cloudflare_tunnel_id | persistent |
+| `dev-rent-tunnel/RENT_AGE_RECIPIENT` | variable | age_recipient | persistent |
 | `stg-projection/JEV_API_KEY` | secret | opaque | persistent |
 | `stg-projection/CLOUDFLARE_API_TOKEN` | secret | opaque | persistent |
 | `stg-projection/CLOUDFLARE_ACCOUNT_ID` | variable | cloudflare_account_id | persistent |
@@ -83,6 +87,25 @@ ciphertext
 
 `envs` never deletes an Environment input; deleting the one-shot source is a separate owner effect.
 
+## Dev rent tunnel flow (windows #14)
+
+The rent OCI host runs `cloudflared` from a token file. envs owns only the step from the provider-issued Named Tunnel token to a ciphertext that exactly one target can open:
+
+```text
+dev-rent-tunnel/CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, RENT_TUNNEL_ID, RENT_AGE_RECIPIENT
+→ project-dev-rent-tunnel (manual dispatch on proposals only)
+→ one bounded GET of the tunnel token (30 s, 64 KiB, no redirect, entry-owned CA bundle)
+→ token in memory → sops stdin, SOPS_AGE_RECIPIENTS = the one target recipient
+→ ciphertexts/dev-rent-tunnel.sops.yaml + dev.rent-tunnel ACTIVE
+→ ciphertext handoff PR → merge to exact proposals SHA
+```
+
+- Inputs are declared, not valued: until the owner configures `dev-rent-tunnel`, the plane is `NOT_CONFIGURED` and every missing or malformed input is RED before any provider call. `RENT_AGE_RECIPIENT` is a single age recipient; a list is RED, and the ciphertext must name exactly that recipient and carry only `RENT_TUNNEL_TOKEN`.
+- The token and the API token never enter argv, a log line, an error message, or the result JSON, and the adapter writes neither to Git. If either is already in a tracked file, the run is RED: the API token before the provider call, the tunnel token before SOPS or any write. The ciphertext is public and permanent in history; recovering from a leaked target identity means rotating the tunnel token, not deleting the file.
+- `checks/test_rent_tunnel.py` proves the gates and failure cases with a fake provider and fake sops, and in `check` it runs the real locked sops with check-only `age-keygen` identities: the target identity decrypts, another identity and a tampered ciphertext are RED. `age` is a separate `check-age` output, and `check` proves it is absent from the provided artifact.
+
+Not proven here, and not owned by envs: a real provider retrieval or dispatch of this workflow, the Cloudflare API token scope it needs, whether Actions may open the handoff PR (a PR opened with the workflow token does not trigger `check`), the target's age identity, applying the ciphertext on the target, the client credential, and unattended SSH.
+
 ## Effect toolchain
 
 `flake.nix` and `flake.lock` define the only toolchain for authoring and projection: Python, SOPS, Wrangler, Git, and GitHub CLI from the locked nixpkgs input, plus the `envs-effect` entry running this source's adapter. `.#effect-artifact` is that entry's complete store closure as one tar with an `ENTRY` pointer.
@@ -107,7 +130,9 @@ Normal apps/ops execution uses only target-native auth. It does not start or wai
 python3 checks/repository.py
 python3 checks/test_repository.py
 python3 checks/test_jev_api.py
+python3 checks/test_rent_tunnel.py
 nix build .#effect-toolchain .#effect-artifact --no-update-lock-file   # check workflow, toolchain job
+nix build .#check-age --no-update-lock-file                             # check-only, real SOPS roundtrip
 ```
 
 The repository oracle calculates accepted structure and state. Its tests deliberately create invalid states and require RED rather than repeating only happy-path execution.

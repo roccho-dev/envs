@@ -31,6 +31,7 @@
         set -euo pipefail
         export PATH=${nixpkgs.lib.makeBinPath packages}
         export ENVS_EFFECT_TOOLCHAIN=${manifest}
+        export SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
         exec ${tools.python3} -I ${self}/adapters/jev_api.py "$@"
       '';
 
@@ -53,6 +54,8 @@
       packages.${system} = {
         inherit effect-toolchain effect-artifact;
         default = effect-toolchain;
+        # Check-only: a throwaway identity for the real SOPS roundtrip; never in the effect toolchain or artifact.
+        check-age = pkgs.age;
       };
     };
 }

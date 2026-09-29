@@ -231,6 +231,35 @@ def main() -> None:
                             '          tool="$ENVS_EFFECT_BIN"\n          "$tool/git" config core.hooksPath >>"$GITHUB_PATH"\n'))
     expect_red(replace_text("README.md", "dev-projection/SOPS_AGE_KEY", "dev-projection/REMOVED"))
     expect_red(replace_text("README.md", "prd-projection/CLOUDFLARE_ACCOUNT_ID", "prd-projection/REMOVED"))
+
+    # The rent tunnel path is a manual effect workflow under the same rules, for exactly one target recipient.
+    rent = ".github/workflows/project-dev-rent-tunnel.yml"
+    expect_red(replace_text(rent, "on:\n  workflow_dispatch:\n", "on:\n  workflow_dispatch:\n  push:\n"))
+    expect_red(replace_text(rent, "environment: dev-rent-tunnel", "environment: dev-projection"))
+    expect_red(replace_text(rent, "${{ vars.RENT_AGE_RECIPIENT }}", "${{ secrets.RENT_AGE_RECIPIENT }}"))
+    expect_red(replace_text(rent, "          RENT_TUNNEL_ID: ${{ vars.RENT_TUNNEL_ID }}\n", ""))
+    expect_red(replace_text(rent, f"{entry} rent-tunnel", "python3 adapters/jev_api.py rent-tunnel"))
+    expect_red(replace_text(rent, "contracts/environments.jsonl\n", "contracts/environments.jsonl README.md\n"))
+    expect_red(mutate_plane("dev.rent-tunnel", lambda row: row["required_variables"].pop()))
+    expect_red(mutate_plane("dev.rent-tunnel", lambda row: row["required_variables"][2].update({"type": "age_recipient_list"})))
+    expect_red(mutate_plane("dev.rent-tunnel", lambda row: row.update({"source_kind": "public_sops"})))
+    expect_red(replace_text("contracts/provider-consumer.jsonl", '"does_not_own":["target_apply",', '"does_not_own":['))
+    expect_red(replace_text("README.md", "dev-rent-tunnel/RENT_AGE_RECIPIENT", "dev-rent-tunnel/REMOVED"))
+
+    def extra_ciphertext(root: Path) -> None:
+        (root / "ciphertexts").mkdir(exist_ok=True)
+        (root / "ciphertexts/dev-other.sops.yaml").write_text("x: 1\n")
+
+    expect_red(extra_ciphertext)
+
+    # check runs the real locked SOPS roundtrip; age is check-only and proven outside the provided artifact.
+    expect_red(replace_text(check, ' --age-keygen "$RUNNER_TEMP/check-age/bin/age-keygen"', ""))
+    expect_red(replace_text(check, "run: python3 checks/test_rent_tunnel.py\n", "run: 'true'\n"))
+    expect_red(replace_text(check, 'if grep -qxF "$age" "$RUNNER_TEMP/provided.list"; then', "if false; then"))
+    expect_red(replace_text(check, '          grep -qxF "$sops" "$RUNNER_TEMP/provided.list"\n', ""))
+    expect_red(replace_text("flake.nix", "[ python3 sops wrangler git gh ]", "[ python3 sops wrangler git gh age ]"))
+    expect_red(replace_text("flake.nix", "        check-age = pkgs.age;\n", ""))
+    expect_red(replace_text("flake.nix", "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt", "/etc/ssl/certs/ca-certificates.crt"))
     print("repository checker self-test: PASS")
 
 

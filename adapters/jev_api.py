@@ -6,8 +6,11 @@ import hashlib
 import json
 import os
 import re
+import ssl
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -23,12 +26,23 @@ RECEIPT_KIND = "envs.projectionReceipt.v1"
 TOOLCHAIN_KIND = "envs.effectToolchain.v1"
 TOOLCHAIN_TOOLS = ("python3", "sops", "wrangler", "git", "gh")
 STORE = Path("/nix/store")
+# Rent tunnel (windows #14): a provider-issued Named Tunnel token, encrypted to exactly one target age recipient.
+RENT_PLANE = "dev.rent-tunnel"
+RENT_CIPHERTEXT = Path("ciphertexts/dev-rent-tunnel.sops.yaml")
+RENT_KEY = "RENT_TUNNEL_TOKEN"
+CLOUDFLARE_API = "https://api.cloudflare.com/client/v4"
+RETRIEVAL_TIMEOUT = 30.0
+RESPONSE_LIMIT = 65536
 
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 AGE_RECIPIENT = re.compile(r"^age1[02-9ac-hj-np-z]{58}$")
 AGE_IDENTITY = re.compile(r"^AGE-SECRET-KEY-1[02-9AC-HJ-NP-Z]{58}$")
 CLOUDFLARE_ACCOUNT_ID = re.compile(r"^[0-9a-f]{32}$")
+CLOUDFLARE_TUNNEL_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+# The target's token file gate accepts 1-4096 non-blank bytes; the provider returns base64 text.
+TUNNEL_TOKEN = re.compile(r"^[A-Za-z0-9+/=_-]{1,4096}$")
+BEARER = re.compile(r"^[\x21-\x7e]+$")
 RECIPIENT_METADATA = re.compile(r"(?m)^[ \t]*-?[ \t]*recipient:[ \t]*(age1[0-9a-z]+)[ \t]*$")
 PRIVATE_MATERIAL = (
     re.compile(r"AGE-SECRET-KEY-1[0-9A-Z]{20,}"),
@@ -111,6 +125,32 @@ def expected_bindings() -> dict[str, dict[str, Any]]:
                 "secret_name": "JEV_API_KEY",
             },
         },
+        "rent-tunnel": {
+            "id": "rent-tunnel",
+            "kind": "envs.authCapability.v1",
+            "capability": "rent-tunnel",
+            "ciphertext": RENT_CIPHERTEXT.as_posix(),
+            "source_key": RENT_KEY,
+            "source": {"provider": "cloudflare", "operation": "cfd_tunnel_token"},
+            "target": {"repository": "roccho-dev/windows", "host": "rent", "kind": "cloudflared_token_file"},
+        },
+    }
+
+
+def expected_rent_boundary() -> dict[str, Any]:
+    # envs ends at the target-bound ciphertext PR; apply, client access and SSH acceptance are other owners' effects.
+    return {
+        "id": "dev.rent-tunnel.provider",
+        "kind": "envs.providerConsumerBoundary.v1",
+        "role": "provider",
+        "repository": "roccho-dev/envs",
+        "stage": "dev",
+        "capability": "rent-tunnel",
+        "source_kind": "provider_issued",
+        "target_kind": "public_sops",
+        "owns": ["contract", "bounded_retrieval", "single_recipient_encryption", "ciphertext_handoff_pr"],
+        "does_not_own": ["target_apply", "target_age_identity", "client_access_credential", "unattended_ssh_acceptance"],
+        "handoff_ref_kind": "exact_commit_sha",
     }
 
 
@@ -141,6 +181,14 @@ def expected_inputs() -> dict[str, dict[str, list[dict[str, str]]]]:
         },
         "stg.projection": stage_projection(),
         "prd.projection": stage_projection(),
+        RENT_PLANE: {
+            "required_secrets": entries(("CLOUDFLARE_API_TOKEN", "opaque", "persistent")),
+            "required_variables": entries(
+                ("CLOUDFLARE_ACCOUNT_ID", "cloudflare_account_id", "persistent"),
+                ("RENT_TUNNEL_ID", "cloudflare_tunnel_id", "persistent"),
+                ("RENT_AGE_RECIPIENT", "age_recipient", "persistent"),
+            ),
+        },
     }
 
 
@@ -162,7 +210,9 @@ INPUT_TYPES: dict[str, Callable[[str], bool]] = {
     "opaque": lambda value: True,
     "age_identity": is_age_identity,
     "age_recipient_list": lambda value: recipient_items(value) is not None,
+    "age_recipient": lambda value: AGE_RECIPIENT.fullmatch(value) is not None,
     "cloudflare_account_id": lambda value: CLOUDFLARE_ACCOUNT_ID.fullmatch(value) is not None,
+    "cloudflare_tunnel_id": lambda value: CLOUDFLARE_TUNNEL_ID.fullmatch(value) is not None,
 }
 
 
@@ -172,12 +222,16 @@ def validate_contracts(root: Path = ROOT) -> dict[str, dict[str, dict[str, Any]]
     boundary = index(root / BOUNDARY)
 
     require(set(envs) == {
-        "dev.authoring", "dev.projection", "dev.runtime",
+        "dev.authoring", "dev.projection", "dev.runtime", RENT_PLANE,
         "stg.projection", "stg.runtime", "prd.projection", "prd.runtime",
         "voice-ui.dev", "voice-ui.stg", "voice-ui.prd",
     }, "environment set differs")
 
     require(envs["dev.authoring"]["github_environment"] == "dev-authoring", "dev authoring Environment differs")
+    rent = envs[RENT_PLANE]
+    require(rent["github_environment"] == "dev-rent-tunnel" and rent["owner"] == "envs"
+            and rent["source_kind"] == "provider_issued" and rent["target_kind"] == "public_sops",
+            "dev rent tunnel plane differs")
     require(envs["dev.projection"]["github_environment"] == "dev-projection", "dev projection Environment differs")
     inputs = expected_inputs()
     for identity, row in envs.items():
@@ -217,11 +271,21 @@ def validate_contracts(root: Path = ROOT) -> dict[str, dict[str, dict[str, Any]]
             require(item["active_github_environment"] is None, f"{identity} must not be active")
             require(item["migration_state"] == "NOT_CONFIGURED", f"{identity} must be NOT_CONFIGURED")
 
+    rent_cipher = root / RENT_CIPHERTEXT
+    if rent_cipher.is_file():
+        require(rent["active_github_environment"] == "dev-rent-tunnel" and rent["migration_state"] == "ACTIVE",
+                f"{RENT_PLANE} must be ACTIVE with its ciphertext")
+        validate_rent_ciphertext(rent_cipher.read_bytes(), None, None)
+    else:
+        require(rent["active_github_environment"] is None and rent["migration_state"] == "NOT_CONFIGURED",
+                f"{RENT_PLANE} must be NOT_CONFIGURED without its ciphertext")
+
     require(bindings == expected_bindings(), "binding set differs")
     require(set(boundary) == {
-        "repository.branch-policy", "dev.jev-api.provider",
+        "repository.branch-policy", "dev.jev-api.provider", "dev.rent-tunnel.provider",
         "apps.voice-ui.consumer", "ops.voice-ui.consumer", "normal.consumer.path",
     }, "provider-consumer boundary set differs")
+    require(boundary["dev.rent-tunnel.provider"] == expected_rent_boundary(), "rent tunnel provider boundary differs")
     require(boundary["repository.branch-policy"] == {
         "id": "repository.branch-policy", "kind": "envs.branchPolicy.v1",
         "canonical_branch": "proposals", "default_branch": "proposals",
@@ -254,9 +318,9 @@ def without_recipient_metadata(text: str) -> str:
     return RECIPIENT_METADATA.sub("", text)
 
 
-def validate_ciphertext(data: bytes, secret: bytes | None, recipients: list[str] | None) -> None:
+def validate_ciphertext(data: bytes, secret: bytes | None, recipients: list[str] | None, key: str = "JEV_API_KEY") -> None:
     text = data.decode("utf-8", errors="strict")
-    require("JEV_API_KEY: ENC[AES256_GCM," in text and "\nsops:" in text, "invalid SOPS ciphertext")
+    require(f"{key}: ENC[AES256_GCM," in text and "\nsops:" in text, "invalid SOPS ciphertext")
     require(not any(pattern.search(text) for pattern in PRIVATE_MATERIAL), "private material found in ciphertext")
     if secret is not None:
         require(secret not in data, "plaintext survived encryption")
@@ -267,6 +331,13 @@ def validate_ciphertext(data: bytes, secret: bytes | None, recipients: list[str]
         require(sorted(actual) == sorted(recipients), "ciphertext recipient set differs")
     body = without_recipient_metadata(text)
     require(not any(value in body for value in actual), "ciphertext recipient outside sops metadata")
+
+
+def validate_rent_ciphertext(data: bytes, token: bytes | None, recipient: str | None) -> None:
+    validate_ciphertext(data, token, None if recipient is None else [recipient], key=RENT_KEY)
+    text = data.decode("utf-8", errors="strict")
+    require(len(RECIPIENT_METADATA.findall(text)) == 1, "rent tunnel ciphertext must have exactly one recipient")
+    require(set(re.findall(r"(?m)^([^\s#][^:]*):", text)) == {RENT_KEY, "sops"}, "rent tunnel ciphertext fields differ")
 
 
 def repository_files(root: Path) -> list[Path]:
@@ -284,7 +355,7 @@ def reject_live_values(root: Path, name: str, values: list[str]) -> None:
     for path in repository_files(root):
         relative = path.relative_to(root).as_posix()
         data = path.read_bytes()
-        if relative == CIPHERTEXT.as_posix():
+        if relative in {CIPHERTEXT.as_posix(), RENT_CIPHERTEXT.as_posix()}:
             data = without_recipient_metadata(data.decode("utf-8", errors="replace")).encode()
         for value in values:
             require(value.encode() not in data, f"{relative}: live {name} value is stored in Git")
@@ -306,10 +377,11 @@ def gate(root: Path, contracts: dict[str, dict[str, dict[str, Any]]], plane: str
     return values
 
 
-def set_dev_active(root: Path, active: bool) -> None:
+def set_dev_active(root: Path, active: bool, planes: Iterable[str] = ("dev.authoring", "dev.projection")) -> None:
     rows = load_jsonl(root / ENVIRONMENTS)
+    selected = set(planes)
     for row in rows:
-        if row.get("id") in {"dev.authoring", "dev.projection"}:
+        if row.get("id") in selected:
             row["active_github_environment"] = row["github_environment"] if active else None
             row["migration_state"] = "ACTIVE" if active else "NOT_CONFIGURED"
     write_jsonl(root / ENVIRONMENTS, rows)
@@ -398,6 +470,88 @@ def author(root: Path = ROOT, runner: Runner = default_runner) -> dict[str, Any]
         stale.unlink()
     validate_contracts(root)
     return {"kind": "envs.authoringResult.v1", "status": "PASS", "ciphertext": CIPHERTEXT.as_posix()}
+
+
+Fetch = Callable[[urllib.request.Request, float], bytes]
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    # A redirect is RED; the bearer token is never re-sent to another location.
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
+def default_fetch(request: urllib.request.Request, timeout: float) -> bytes:
+    # The entry exports the repo-owned CA bundle; errors never carry the response or the request headers.
+    bundle = os.environ.get("SSL_CERT_FILE", "")
+    require(in_store(bundle) and os.path.isfile(bundle), "repo-owned CA bundle is missing")
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=ssl.create_default_context(cafile=bundle)), NoRedirect)
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            body = response.read(RESPONSE_LIMIT + 1)
+    except (urllib.error.URLError, OSError, ValueError):
+        raise EnvsError("Cloudflare tunnel token retrieval failed") from None
+    require(len(body) <= RESPONSE_LIMIT, "Cloudflare response exceeds its bound")
+    return body
+
+
+def retrieve_tunnel_token(account: str, tunnel: str, api_token: str, fetch: Fetch = default_fetch) -> str:
+    # One GET, bounded in time and size; the token is returned in memory only.
+    require(CLOUDFLARE_ACCOUNT_ID.fullmatch(account) is not None, "invalid Cloudflare account ID")
+    require(CLOUDFLARE_TUNNEL_ID.fullmatch(tunnel) is not None, "invalid Cloudflare tunnel ID")
+    require(BEARER.fullmatch(api_token) is not None, "invalid Cloudflare API token shape")
+    request = urllib.request.Request(
+        f"{CLOUDFLARE_API}/accounts/{account}/cfd_tunnel/{tunnel}/token",
+        headers={"Authorization": f"Bearer {api_token}", "Accept": "application/json"},
+        method="GET",
+    )
+    body = fetch(request, RETRIEVAL_TIMEOUT)
+    try:
+        value = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise EnvsError("Cloudflare response is not JSON") from None
+    require(isinstance(value, dict) and value.get("success") is True, "Cloudflare did not return success")
+    token = value.get("result")
+    require(isinstance(token, str) and TUNNEL_TOKEN.fullmatch(token) is not None, "Cloudflare returned no valid tunnel token")
+    return token
+
+
+def encrypt_rent_token(token: str, recipient: str, tools: Mapping[str, str], runner: Runner = default_runner) -> bytes:
+    # The token reaches SOPS on stdin only; the ciphertext must name exactly this one recipient.
+    require(AGE_RECIPIENT.fullmatch(recipient) is not None, "rent tunnel needs exactly one age recipient")
+    require(TUNNEL_TOKEN.fullmatch(token) is not None, "invalid tunnel token")
+    payload = json.dumps({RENT_KEY: token}, separators=(",", ":")).encode() + b"\n"
+    result = run_checked(
+        [tools["sops"], "--encrypt", "--input-type", "json", "--output-type", "yaml", "/dev/stdin"],
+        input_data=payload,
+        env=clean_env(tools, {"SOPS_AGE_RECIPIENTS": recipient}),
+        runner=runner,
+        label="SOPS encryption",
+    )
+    validate_rent_ciphertext(result.stdout, token.encode(), recipient)
+    return result.stdout
+
+
+def rent_author(root: Path = ROOT, runner: Runner = default_runner, fetch: Fetch = default_fetch) -> dict[str, Any]:
+    contracts = validate_contracts(root)
+    tools = toolchain(root)
+    inputs = gate(root, contracts, RENT_PLANE)
+    # Secrets as well as Variables: a value already in Git is RED before the provider call, the token before SOPS.
+    reject_live_values(root, "CLOUDFLARE_API_TOKEN", [inputs["CLOUDFLARE_API_TOKEN"]])
+    token = retrieve_tunnel_token(
+        inputs["CLOUDFLARE_ACCOUNT_ID"], inputs["RENT_TUNNEL_ID"], inputs["CLOUDFLARE_API_TOKEN"], fetch)
+    reject_live_values(root, RENT_KEY, [token])
+    data = encrypt_rent_token(token, inputs["RENT_AGE_RECIPIENT"], tools, runner)
+    target = root / RENT_CIPHERTEXT
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(data)
+    set_dev_active(root, True, (RENT_PLANE,))
+    validate_contracts(root)
+    return {
+        "kind": "envs.rentTunnelAuthoringResult.v1", "status": "PASS", "ciphertext": RENT_CIPHERTEXT.as_posix(),
+        "recipient_count": 1, "target_apply": "NOT_RUN", "client_access": "UNPROVED",
+    }
 
 
 def walk_receipt(value: Any) -> None:
@@ -552,6 +706,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     sub.add_parser("readiness")
     sub.add_parser("toolchain")
     sub.add_parser("author")
+    sub.add_parser("rent-tunnel")
     project_parser = sub.add_parser("project")
     project_parser.add_argument("--envs-sha", required=True)
     project_parser.add_argument("--run-id", type=int, required=True)
@@ -577,6 +732,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             }, indent=2, sort_keys=True))
         elif args.command == "author":
             print(json.dumps(author(root), indent=2, sort_keys=True))
+        elif args.command == "rent-tunnel":
+            print(json.dumps(rent_author(root), indent=2, sort_keys=True))
         else:
             receipt = project(
                 envs_sha=args.envs_sha, run_id=args.run_id, run_attempt=args.run_attempt,
@@ -584,7 +741,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             print(json.dumps({"kind": receipt["kind"], "status": "PASS", "output": str(args.output)}, sort_keys=True))
     except (EnvsError, OSError) as exc:
-        print(f"JEV_API=RED: {exc}", file=sys.stderr)
+        label = "RENT_TUNNEL" if args.command == "rent-tunnel" else "JEV_API"
+        print(f"{label}=RED: {exc}", file=sys.stderr)
         return 1
     return 0
 
