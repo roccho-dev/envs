@@ -17,6 +17,7 @@ REQUIRED_FILES = {
     ".github/workflows/check.yml",
     ".github/workflows/author-dev-jev-api.yml",
     ".github/workflows/project-dev-jev-api.yml",
+    ".github/workflows/project-dev-rent-tunnel.yml",
     ".gitignore",
     "LICENSE_POLICY.md",
     "LICENSES/README.md",
@@ -25,6 +26,7 @@ REQUIRED_FILES = {
     "adapters/jev_api.py",
     "checks/repository.py",
     "checks/test_jev_api.py",
+    "checks/test_rent_tunnel.py",
     "checks/test_repository.py",
     "contracts/bindings.jsonl",
     "contracts/environments.jsonl",
@@ -89,7 +91,14 @@ INPUT_REFERENCE = re.compile(r"\$\{\{\s*(secrets|vars)\.([A-Za-z0-9_]+)\s*\}\}")
 EFFECT_WORKFLOWS = {
     "author-dev-jev-api.yml": "dev.authoring",
     "project-dev-jev-api.yml": "dev.projection",
+    "project-dev-rent-tunnel.yml": "dev.rent-tunnel",
 }
+CIPHERTEXTS = {"ciphertexts/dev-jev-api.sops.yaml", "ciphertexts/dev-rent-tunnel.sops.yaml"}
+# The real SOPS roundtrip runs the locked sops with a check-only age that never enters the effect toolchain.
+CHECK_AGE_BUILD = 'nix build .#check-age --no-update-lock-file --out-link "$RUNNER_TEMP/check-age"'
+REAL_ROUNDTRIP = ('"$tool/python3" -I checks/test_rent_tunnel.py --sops "$tool/sops"'
+                  ' --age-keygen "$RUNNER_TEMP/check-age/bin/age-keygen"')
+EFFECT_PACKAGES = "packages = with pkgs; [ python3 sops wrangler git gh ];"
 TOOLCHAIN_BUILD = 'nix build .#effect-toolchain --no-update-lock-file'
 ARTIFACT_BUILD = 'nix build .#effect-artifact --no-update-lock-file'
 SOURCE_SHA = "${{ github.event.pull_request.head.sha || github.sha }}"
@@ -183,7 +192,7 @@ def check_shape(root: Path) -> None:
     ciphertext_dir = root / "ciphertexts"
     if ciphertext_dir.exists():
         ciphertexts = sorted(path.relative_to(root).as_posix() for path in ciphertext_dir.rglob("*") if path.is_file())
-        require(ciphertexts == ["ciphertexts/dev-jev-api.sops.yaml"], f"unexpected ciphertexts: {ciphertexts}")
+        require(bool(ciphertexts) and set(ciphertexts) <= CIPHERTEXTS, f"unexpected ciphertexts: {ciphertexts}")
 
     handoff_dir = root / "handoffs"
     if handoff_dir.exists():
@@ -283,7 +292,7 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]]) -> None
     workflow_root = root / ".github/workflows"
     names = {path.name for path in workflow_root.iterdir() if path.is_file()}
     require(
-        names == {"check.yml", "author-dev-jev-api.yml", "project-dev-jev-api.yml"},
+        names == {"check.yml", *EFFECT_WORKFLOWS},
         f"workflow set differs: {sorted(names)}",
     )
     texts = {path.name: path.read_text(encoding="utf-8") for path in workflow_root.iterdir() if path.is_file()}
@@ -302,6 +311,7 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]]) -> None
     require("checks/repository.py" in check, "check workflow must execute repository oracle")
     require("checks/test_repository.py" in check, "check workflow must test repository oracle")
     require("checks/test_jev_api.py" in check, "check workflow must test Jev adapter")
+    require("run: python3 checks/test_rent_tunnel.py\n" in check, "check workflow must test the rent tunnel adapter")
     require(TOOLCHAIN_BUILD in check, "check workflow must reconstruct the effect toolchain")
     require(f'{TOOLCHAIN_BIN}envs-effect" toolchain' in check, "check workflow must execute the effect entry")
     require(f'{TOOLCHAIN_BIN}python3" -I checks/test_jev_api.py' in check,
@@ -331,6 +341,15 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]]) -> None
         'test "$(tar -xOf "$RUNNER_TEMP/provide/envs-effect.tar" SOURCE)" = "$ENVS_SOURCE_SHA"',
     ):
         require(marker in toolchain, f"artifact must be built from and bound to the named commit: {marker.strip()}")
+    for marker in (
+        CHECK_AGE_BUILD,
+        REAL_ROUNDTRIP,
+        'grep -qxF "$sops" "$RUNNER_TEMP/provided.list"',
+        'if grep -qxF "$age" "$RUNNER_TEMP/provided.list"; then',
+    ):
+        require(marker in toolchain, f"check must run the real SOPS roundtrip with check-only age: {marker}")
+    require(toolchain.find(REAL_ROUNDTRIP) < toolchain.find('if grep -qxF "$age"') and toolchain.find(ARTIFACT_BUILD)
+            < toolchain.find('if grep -qxF "$age"'), "check-only age must be proven outside the built artifact")
     effect_shape = job("effect-shape", "clean-start")
     clean_start = job("clean-start", None)
     require("    needs: toolchain\n" in clean_start, "check workflow must clean-start from the provided artifact")
@@ -409,6 +428,10 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]]) -> None
 
     require(f"{EFFECT_ENTRY} author" in texts["author-dev-jev-api.yml"], "author workflow entry call missing")
     require(f"{EFFECT_ENTRY} project" in texts["project-dev-jev-api.yml"], "project workflow entry call missing")
+    rent = texts["project-dev-rent-tunnel.yml"]
+    require(f"run: '{EFFECT_ENTRY} rent-tunnel'" in rent, "rent tunnel workflow entry call missing")
+    require('"$tool/git" add ciphertexts/dev-rent-tunnel.sops.yaml contracts/environments.jsonl\n' in rent,
+            "rent tunnel handoff must stage only its ciphertext and plane state")
 
 
 def check_toolchain(root: Path, adapter) -> None:
@@ -418,6 +441,11 @@ def check_toolchain(root: Path, adapter) -> None:
     require(adapter.locked_nixpkgs(root)["rev"] == pinned[0], "flake.lock differs from flake.nix")
     for tool in adapter.TOOLCHAIN_TOOLS:
         require(f'{tool} = "${{pkgs.' in flake, f"flake does not provide {tool}")
+    require(flake.count("packages = with pkgs; [") == 1 and EFFECT_PACKAGES in flake,
+            "effect toolchain packages differ; check-only age must stay outside them")
+    require(flake.count("pkgs.age") == 1 and "        check-age = pkgs.age;\n" in flake, "check-age must be a separate check-only output")
+    require("export SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt" in flake,
+            "the entry must carry its own CA bundle for provider retrieval")
     require('exec ${tools.python3} -I ${self}/adapters/jev_api.py "$@"' in flake, "flake entry must run only the adapter")
     require("closureInfo { rootPaths = [ effect-toolchain ]; }" in flake and "echo ${effect-toolchain}/bin/envs-effect > ENTRY" in flake,
             "flake artifact must carry the whole entry closure and its ENTRY")
@@ -440,6 +468,8 @@ def check_readme(root: Path, environments: dict[str, dict[str, Any]]) -> None:
         "contracts/",
         "adapters/jev_api.py",
         "handoffs/dev-jev-api.json",
+        "ciphertexts/dev-rent-tunnel.sops.yaml",
+        "checks/test_rent_tunnel.py",
     ):
         require(marker in text, f"README missing {marker}")
     require("delete `main`" not in text.lower(), "README proposes deleting main")

@@ -1,2 +1,3 @@
 {"id":"voice-ui","kind":"envs.applicationBinding.v1","application":"roccho-dev/apps/packages/voice-ui"}
 {"id":"jev-api","kind":"envs.authCapability.v1","capability":"jev-api","ciphertext":"ciphertexts/dev-jev-api.sops.yaml","source_key":"JEV_API_KEY","target":{"provider":"cloudflare-pages","project":"voice-ui","secret_name":"JEV_API_KEY"}}
+{"id":"rent-tunnel","kind":"envs.authCapability.v1","capability":"rent-tunnel","ciphertext":"ciphertexts/dev-rent-tunnel.sops.yaml","source_key":"RENT_TUNNEL_TOKEN","source":{"provider":"cloudflare","operation":"cfd_tunnel_token"},"target":{"repository":"roccho-dev/windows","host":"rent","kind":"cloudflared_token_file"}}

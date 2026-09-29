@@ -39,6 +39,9 @@ jobs:
       - name: Test Jev adapter
         run: python3 checks/test_jev_api.py
 
+      - name: Test rent tunnel adapter
+        run: python3 checks/test_rent_tunnel.py
+
       - name: Verify explicit main compatibility refresh
         if: github.ref_name == 'main'
         run: python3 checks/repository.py --verify-main-compatibility-refresh
@@ -105,6 +108,14 @@ jobs:
       - name: Test Jev adapter on the toolchain interpreter
         run: '"$RUNNER_TEMP/envs-effect/bin/python3" -I checks/test_jev_api.py'
 
+      # The locked closure sops encrypts and decrypts for real; check-only age makes throwaway identities in a temp dir.
+      - name: Real locked SOPS roundtrip for the rent tunnel token
+        run: |
+          set -euo pipefail
+          nix build .#check-age --no-update-lock-file --out-link "$RUNNER_TEMP/check-age"
+          tool="$RUNNER_TEMP/envs-effect/bin"
+          "$tool/python3" -I checks/test_rent_tunnel.py --sops "$tool/sops" --age-keygen "$RUNNER_TEMP/check-age/bin/age-keygen"
+
       - name: Missing or mismatched toolchain is RED
         run: |
           set -euo pipefail
@@ -129,6 +140,22 @@ jobs:
           nix build .#effect-artifact --no-update-lock-file --print-build-logs --out-link "$RUNNER_TEMP/provide/envs-effect.tar"
           test "$(tar -xOf "$RUNNER_TEMP/provide/envs-effect.tar" SOURCE)" = "$ENVS_SOURCE_SHA"
           sha256sum "$RUNNER_TEMP/provide/envs-effect.tar"
+
+      # Positive control: the listing does contain the closure sops, so an age binary there would be found too.
+      - name: Check-only age is outside the provided artifact
+        run: |
+          set -euo pipefail
+          tar -tf "$RUNNER_TEMP/provide/envs-effect.tar" >"$RUNNER_TEMP/provided.list"
+          sops="$(readlink -f "$RUNNER_TEMP/envs-effect/bin/sops")"
+          sops="${sops#/}"
+          age="$(readlink -f "$RUNNER_TEMP/check-age/bin/age-keygen")"
+          age="${age#/}"
+          grep -qxF "$sops" "$RUNNER_TEMP/provided.list"
+          if grep -qxF "$age" "$RUNNER_TEMP/provided.list"; then
+            echo "check-only age is in the provided artifact" >&2
+            exit 1
+          fi
+          echo "provided artifact: sops present, age absent"
 
       - name: Provide effect artifact
         id: provide
