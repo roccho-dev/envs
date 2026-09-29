@@ -95,6 +95,18 @@ TOOLCHAIN_BIN = '"$RUNNER_TEMP/envs-effect/bin/'
 # Effect jobs may start only Nix (before secrets) and store paths from the repo-owned closure.
 AMBIENT_TOOL = re.compile(r"(?m)(?:^|[\s>|;&(])(?:python3?|git|gh|sops|wrangler|node|npx|npm|pip3?|curl|wget)\s")
 RUNTIME_ACQUISITION = ("npx", "npm ", "pip ", "--yes", "nix shell", "nix run", "nix profile", "github:", "--impure")
+TOOLCHAIN_IDENTITY = f'{TOOLCHAIN_BIN}envs-effect" toolchain'
+EFFECT_ACTIONS = {"actions/checkout", "cachix/install-nix-action"}
+RUN_START = re.compile(r"^(\s*)run:\s*(.*)$")
+# Every effect-step command is a closure store path, the one Nix realization, or a fixed assignment.
+ALLOWED_COMMAND = re.compile(
+    r'^(?:set -euo pipefail'
+    r'|tool="\$RUNNER_TEMP/envs-effect/bin"'
+    r'|branch="[a-z/-]+(?:\$\{GITHUB_RUN_(?:ID|ATTEMPT)\}-?)+"'
+    r'|nix build \.#effect-toolchain --no-update-lock-file --out-link "\$RUNNER_TEMP/envs-effect"'
+    r'|(?:"\$RUNNER_TEMP/envs-effect/bin/|"\$tool/)[a-z0-9-]+"(?: .*)?)$'
+)
+COMMAND_CONTROL = re.compile(r"[;&|<>`\n]|\$\(")
 FLAKE_NIXPKGS = re.compile(r'(?m)^\s*inputs\.nixpkgs\.url = "github:NixOS/nixpkgs/([0-9a-f]{40})";$')
 
 
@@ -208,6 +220,41 @@ def declared_inputs(row: dict[str, Any]) -> set[tuple[str, str]]:
     }
 
 
+def run_commands(text: str) -> list[str]:
+    lines = text.splitlines()
+    commands: list[str] = []
+    index = 0
+    while index < len(lines):
+        match = RUN_START.match(lines[index])
+        index += 1
+        if match is None:
+            continue
+        indent, inline = len(match.group(1)), match.group(2).strip()
+        if inline not in {"|", ">-"}:
+            quoted = len(inline) > 1 and inline[0] == inline[-1] == "'"
+            commands.append(inline[1:-1] if quoted else inline)
+            continue
+        block: list[str] = []
+        while index < len(lines) and (not lines[index].strip() or len(lines[index]) - len(lines[index].lstrip()) > indent):
+            if lines[index].strip():
+                block.append(lines[index].strip())
+            index += 1
+        if inline == ">-":
+            commands.append(" ".join(block))
+            continue
+        current = ""
+        for line in block:
+            current = f"{current} {line}" if current else line
+            if current.endswith("\\"):
+                current = current[:-1].rstrip()
+                continue
+            commands.append(current)
+            current = ""
+        if current:
+            commands.append(current)
+    return commands
+
+
 def check_workflows(root: Path, environments: dict[str, dict[str, Any]]) -> None:
     workflow_root = root / ".github/workflows"
     names = {path.name for path in workflow_root.iterdir() if path.is_file()}
@@ -235,6 +282,12 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]]) -> None
     require(f'{TOOLCHAIN_BIN}envs-effect" toolchain' in check, "check workflow must execute the effect entry")
     require(f'{TOOLCHAIN_BIN}python3" -I checks/test_jev_api.py' in check,
             "check workflow must test the adapter on the toolchain interpreter")
+    require('nix flake lock "$relock"' in check and 'cmp flake.lock "$relock/flake.lock"' in check,
+            "check workflow must prove Nix regenerates the committed lock")
+    for tool in ("python3", "sops", "git", "gh", "wrangler"):
+        require(f'"$tool/{tool}" --version' in check, f"check workflow must execute closure {tool}")
+    require('"$tool/wrangler" pages secret "$command" --help' in check,
+            "check workflow must execute the Wrangler argv shape")
 
     for name, plane in EFFECT_WORKFLOWS.items():
         text = texts[name]
@@ -245,7 +298,15 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]]) -> None
         build = text.find(TOOLCHAIN_BUILD)
         require(build != -1, f"{name}: repo-owned toolchain is not realized")
         require(build < text.find("${{ secrets."), f"{name}: toolchain must be realized before secrets")
+        identity = text.find(TOOLCHAIN_IDENTITY)
+        require(build < identity < text.find("${{ secrets."),
+                f"{name}: toolchain identity must be recorded after realization and before secrets")
         require(text.count("nix ") == 1, f"{name}: Nix may run only to realize the toolchain")
+        require("shell:" not in text, f"{name}: custom step shell is forbidden")
+        require({action for action, _ in ACTION_USE.findall(text)} == EFFECT_ACTIONS, f"{name}: effect Action set differs")
+        for command in run_commands(text):
+            require(COMMAND_CONTROL.search(command) is None, f"{name}: command chaining or substitution: {command}")
+            require(ALLOWED_COMMAND.fullmatch(command) is not None, f"{name}: non-closure executable: {command}")
         require("workflow_dispatch:" in text, f"{name}: manual dispatch missing")
         require("\n  push:" not in text and "\n  pull_request:" not in text, f"{name}: automatic effect trigger")
         require(f"environment: {row['github_environment']}" in text, f"{name}: static Environment differs")

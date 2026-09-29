@@ -59,8 +59,35 @@ jobs:
       - name: Reconstruct repo-owned effect toolchain
         run: nix build .#effect-toolchain --no-update-lock-file --print-build-logs --out-link "$RUNNER_TEMP/envs-effect"
 
+      - name: Nix regenerates the committed lock from flake.nix
+        run: |
+          set -euo pipefail
+          relock="$RUNNER_TEMP/relock"
+          mkdir "$relock"
+          git archive HEAD -- . ':!flake.lock' | tar -x -C "$relock"
+          nix flake lock "$relock"
+          cmp flake.lock "$relock/flake.lock"
+
       - name: Execute exact effect entry
         run: '"$RUNNER_TEMP/envs-effect/bin/envs-effect" toolchain'
+
+      - name: Execute closure tools without credentials
+        env:
+          WRANGLER_SEND_METRICS: "false"
+        run: |
+          set -euo pipefail
+          tool="$RUNNER_TEMP/envs-effect/bin"
+          "$tool/python3" --version
+          "$tool/sops" --version
+          "$tool/git" --version
+          "$tool/gh" --version
+          "$tool/wrangler" --version
+          for command in put list; do
+            help="$("$tool/wrangler" pages secret "$command" --help 2>&1)"
+            printf '%s\n' "$help"
+            grep -F -- '--project-name' <<<"$help" >/dev/null
+          done
+          "$tool/wrangler" pages secret put --help 2>&1 | grep -Ei 'pages secret put <key>' >/dev/null
 
       - name: Test Jev adapter on the toolchain interpreter
         run: '"$RUNNER_TEMP/envs-effect/bin/python3" -I checks/test_jev_api.py'

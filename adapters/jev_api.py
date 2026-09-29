@@ -562,7 +562,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             tools = toolchain(ROOT)
             print(json.dumps({
                 "kind": "envs.effectToolchainCheck.v1", "status": "PASS",
-                "nixpkgs": locked_nixpkgs(ROOT), "tools": tools,
+                "manifest": os.environ["ENVS_EFFECT_TOOLCHAIN"], "nixpkgs": locked_nixpkgs(ROOT), "tools": tools,
             }, indent=2, sort_keys=True))
         elif args.command == "author":
             print(json.dumps(author(ROOT), indent=2, sort_keys=True))

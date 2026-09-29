@@ -34,6 +34,9 @@ jobs:
       - name: Realize repo-owned effect toolchain
         run: nix build .#effect-toolchain --no-update-lock-file --out-link "$RUNNER_TEMP/envs-effect"
 
+      - name: Record effect toolchain identity
+        run: '"$RUNNER_TEMP/envs-effect/bin/envs-effect" toolchain'
+
       - name: Project and read back target-native auth
         env:
           SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
