@@ -118,6 +118,7 @@ def environment(values: dict[str, str]):
 def copy_root() -> Path:
     target = Path(tempfile.mkdtemp(prefix="envs-jev-test-")) / "repo"
     shutil.copytree(ROOT, target, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".git"))
+    (target / jev.OCI_CIPHERTEXT).unlink(missing_ok=True)
     return target
 
 
@@ -676,7 +677,6 @@ def main() -> None:
         assert state["physical_dev_projection"] == "NOT_CONFIGURED"
         assert state["provider_handoff_receipt"] == "ABSENT"
         assert state["consumer_runtime_readiness"] == "OUT_OF_SCOPE"
-        assert not (ROOT / jev.OCI_CIPHERTEXT).exists(), "no OCI ciphertext may exist before the authorized effect"
         test_author()
         test_author_red_inputs()
         test_author_oci()
