@@ -24,6 +24,7 @@ checks     = executable repository and adapter specifications
 
 ```text
 .github/workflows/
+flake.nix, flake.lock
 contracts/
 ciphertexts/       # absent while dev is NOT_CONFIGURED
 adapters/jev_api.py
@@ -82,6 +83,22 @@ ciphertext
 
 `envs` never deletes an Environment input; deleting the one-shot source is a separate owner effect.
 
+## Effect toolchain
+
+`flake.nix` and `flake.lock` define the only toolchain for authoring and projection: Python, SOPS, Wrangler, Git, and GitHub CLI from the locked nixpkgs input, plus the `envs-effect` entry running this source's adapter. `.#effect-artifact` is that entry's complete store closure as one tar with an `ENTRY` pointer.
+
+```text
+check (secret-free)   nix build .#effect-artifact → upload envs-effect-<source sha>  # provided artifact
+clean-start / effect  obtain by source SHA → verify digest → extract to /nix/store     # no checkout build, no Nix
+                      envs-effect --root <checkout> toolchain | author | project        # store paths only
+```
+
+`check` checks out, builds, and names the artifact after the exact source commit (the PR head, never a merge ref), and Nix records that commit (`self.rev`) as the artifact's `SOURCE` and manifest `source`; GitHub records its artifact id (locator) and `sha256` digest. The consumer step, identical in `check`'s effect-shape and clean-start jobs and both effect workflows, resolves the one unexpired `envs-effect-<sha>` artifact, requires its producing run to be this repository's `check.yml` for that SHA and branch and either a successful `push` run or the current run, verifies the downloaded bytes against GitHub's digest, requires `SOURCE` to equal the SHA, and only then extracts it without installing Nix. The effect-shape job runs the provided entry over a checkout of the same commit with `--root`, exactly as the effect workflows do before secrets. Effect workflows resolve by the dispatched `github.sha`, so each `proposals` commit consumes the artifact its own post-merge `check` push run provided; no SHA is copied by hand. They record `envs-effect toolchain` before the secret-bearing step and then run only provided store paths; the repository check rejects any rebuild, Nix, other executable, absolute path, command chaining, or substitution there. The runner image (recorded as `ImageOS`/`ImageVersion`), its shell/curl/jq/coreutils/tar/unzip/sudo, and SHA-pinned Actions are the platform boundary; Nix is installed only by the producer.
+
+The entry carries a manifest of its exact tools and nixpkgs lock; before SOPS or Wrangler starts, the adapter turns RED when that manifest is absent, outside the Nix store, differs from the data root's `flake.lock` or adapter, lacks a tool, or is not running on its own Python. `check` also proves Nix regenerates the committed `flake.lock` byte-for-byte, executes each closure tool (including Wrangler's `pages secret put|list --help`), and proves missing, altered, and mismatched artifacts RED in the clean-start job.
+
+This is source and CI evidence only. It does not claim a real authoring or projection effect.
+
 Normal apps/ops execution uses only target-native auth. It does not start or wait for envs, use envctl as a parent, decrypt SOPS, or receive an age identity.
 
 ## Checks
@@ -90,6 +107,7 @@ Normal apps/ops execution uses only target-native auth. It does not start or wai
 python3 checks/repository.py
 python3 checks/test_repository.py
 python3 checks/test_jev_api.py
+nix build .#effect-toolchain .#effect-artifact --no-update-lock-file   # check workflow, toolchain job
 ```
 
 The repository oracle calculates accepted structure and state. Its tests deliberately create invalid states and require RED rather than repeating only happy-path execution.

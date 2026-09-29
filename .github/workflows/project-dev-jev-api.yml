@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: read
   contents: write
   pull-requests: write
 
@@ -24,44 +25,74 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
 
-      - name: Install pinned Nix
-        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
-        with:
-          extra_nix_config: |
-            extra-experimental-features = nix-command flakes
+      # Consumes the artifact that check provided for this exact SHA; nothing is built or installed here.
+      - name: Obtain provided effect artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ENVS_SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          echo "platform: $ImageOS $ImageVersion"
+          api="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions"
+          auth="Authorization: Bearer $GH_TOKEN"
+          art="$(mktemp -d)"
+          curl -fsSL -H "$auth" -o "$art/list.json" "$api/artifacts?name=envs-effect-$ENVS_SOURCE_SHA&per_page=100"
+          jq -e '[.artifacts[] | select(.expired | not)] | length == 1 and (.[0].digest | test("^sha256:[0-9a-f]{64}$"))' "$art/list.json" >/dev/null
+          jq '[.artifacts[] | select(.expired | not)][0]' "$art/list.json" >"$art/artifact.json"
+          id="$(jq -r '.id' "$art/artifact.json")"
+          digest="$(jq -r '.digest' "$art/artifact.json")"
+          run_id="$(jq -r '.workflow_run.id' "$art/artifact.json")"
+          curl -fsSL -H "$auth" -o "$art/run.json" "$api/runs/$run_id"
+          jq -e --arg sha "$ENVS_SOURCE_SHA" --arg branch "${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}" --arg repo "$GITHUB_REPOSITORY" --arg current "$GITHUB_RUN_ID" \
+            '.path == ".github/workflows/check.yml" and .head_sha == $sha and .head_branch == $branch and .repository.full_name == $repo and .head_repository.full_name == $repo and ((.id | tostring) == $current or (.event == "push" and .conclusion == "success"))' \
+            "$art/run.json" >/dev/null
+          curl -fsSL -H "$auth" -o "$art/envs-effect.zip" "$api/artifacts/$id/zip"
+          echo "${digest#sha256:}  $art/envs-effect.zip" | sha256sum -c -
+          unzip -q "$art/envs-effect.zip" -d "$art/content"
+          test "$(ls -A "$art/content")" = envs-effect.tar
+          test "$(tar -xOf "$art/content/envs-effect.tar" SOURCE)" = "$ENVS_SOURCE_SHA"
+          entry="$(tar -xOf "$art/content/envs-effect.tar" ENTRY)"
+          [[ "$entry" =~ ^/nix/store/[0-9a-z]{32}-envs-effect-toolchain/bin/envs-effect$ ]]
+          sudo mkdir -p /nix/store
+          sudo tar -x -C / -f "$art/content/envs-effect.tar" nix/store
+          test -x "$entry"
+          echo "artifact: run=$run_id id=$id digest=$digest entry=$entry"
+          echo "ENVS_EFFECT_BIN=${entry%/envs-effect}" >>"$GITHUB_ENV"
+          echo "ENVS_EFFECT_DIGEST=$digest" >>"$GITHUB_ENV"
+          echo "ENVS_EFFECT_ZIP=$art/envs-effect.zip" >>"$GITHUB_ENV"
+
+      - name: Record effect toolchain identity
+        run: '"$ENVS_EFFECT_BIN/envs-effect" --root "$GITHUB_WORKSPACE" toolchain'
 
       - name: Project and read back target-native auth
         env:
           SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
-          WRANGLER_PACKAGE: wrangler@4.112.0
         run: >-
-          nix shell
-          github:NixOS/nixpkgs/f9948418dc8628ac02b6d6337e191ade9429d59d#sops
-          github:NixOS/nixpkgs/f9948418dc8628ac02b6d6337e191ade9429d59d#nodejs_22
-          -c python3 adapters/jev_api.py project
+          "$ENVS_EFFECT_BIN/envs-effect" --root "$GITHUB_WORKSPACE" project
           --envs-sha "${GITHUB_SHA}"
           --run-id "${GITHUB_RUN_ID}"
           --run-attempt "${GITHUB_RUN_ATTEMPT}"
 
       - name: Verify candidate handoff
-        run: python3 checks/repository.py
+        run: '"$ENVS_EFFECT_BIN/python3" -I checks/repository.py'
 
       - name: Open non-secret handoff PR
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          tool="$ENVS_EFFECT_BIN"
           branch="handoff/dev-jev-api-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          git switch -c "$branch"
-          git add handoffs/dev-jev-api.json
-          git diff --cached --check
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "chore: record dev Jev projection handoff"
-          git push origin "HEAD:refs/heads/$branch"
-          gh pr create \
+          "$tool/git" switch -c "$branch"
+          "$tool/git" add handoffs/dev-jev-api.json
+          "$tool/git" diff --cached --check
+          "$tool/git" config user.name "github-actions[bot]"
+          "$tool/git" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          "$tool/git" commit -m "chore: record dev Jev projection handoff"
+          "$tool/git" push origin "HEAD:refs/heads/$branch"
+          "$tool/gh" pr create \
             --base proposals \
             --head "$branch" \
             --title "chore: record dev Jev projection handoff" \

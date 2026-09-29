@@ -30,6 +30,8 @@ REQUIRED_FILES = {
     "contracts/environments.jsonl",
     "contracts/provider-consumer.jsonl",
     "contracts/targets.jsonl",
+    "flake.lock",
+    "flake.nix",
 }
 ALLOWED_ROOTS = {
     ".github",
@@ -45,6 +47,8 @@ ALLOWED_ROOT_FILES = {
     "LICENSE_POLICY.md",
     "README.md",
     "THIRD_PARTY_NOTICES.md",
+    "flake.lock",
+    "flake.nix",
 }
 FORBIDDEN_ROOTS = {
     "appearance",
@@ -63,7 +67,6 @@ FORBIDDEN_ROOTS = {
 FORBIDDEN_FILENAMES = {
     ".env",
     ".mise.toml",
-    "flake.nix",
     "go.mod",
     "go.sum",
     "id_ed25519",
@@ -87,6 +90,39 @@ EFFECT_WORKFLOWS = {
     "author-dev-jev-api.yml": "dev.authoring",
     "project-dev-jev-api.yml": "dev.projection",
 }
+TOOLCHAIN_BUILD = 'nix build .#effect-toolchain --no-update-lock-file'
+ARTIFACT_BUILD = 'nix build .#effect-artifact --no-update-lock-file'
+SOURCE_SHA = "${{ github.event.pull_request.head.sha || github.sha }}"
+ARTIFACT_NAME = "name: envs-effect-${{ env.ENVS_SOURCE_SHA }}"
+# The consumer binds the named commit to the producing run and to the artifact's own SOURCE.
+CONSUMER_BINDING = (
+    '.head_sha == $sha',
+    '.repository.full_name == $repo and .head_repository.full_name == $repo',
+    '((.id | tostring) == $current or (.event == "push" and .conclusion == "success"))',
+    'test "$(tar -xOf "$art/content/envs-effect.tar" SOURCE)" = "$ENVS_SOURCE_SHA"',
+)
+EFFECT_ENV = re.compile(r"(?m)^ {10}([A-Za-z_][A-Za-z0-9_-]*):")
+EFFECT_STEP_KEYS = {"ref", "fetch-depth", "GH_TOKEN", "ENVS_SOURCE_SHA"}
+TOOLCHAIN_BIN = '"$RUNNER_TEMP/envs-effect/bin/'
+# The one step that obtains the provided artifact; check's clean-start job holds the canonical text.
+CONSUMER_STEP = "- name: Obtain provided effect artifact\n"
+CONSUMER_RUN = "        run: |\n"
+EFFECT_ENTRY = '"$ENVS_EFFECT_BIN/envs-effect" --root "$GITHUB_WORKSPACE"'
+# After the consumer step, effect jobs run only store paths from the provided artifact.
+AMBIENT_TOOL = re.compile(r"(?m)(?:^|[\s>|;&(])(?:python3?|git|gh|sops|wrangler|node|npx|npm|pip3?|curl|wget)\s")
+RUNTIME_ACQUISITION = ("npx", "npm ", "pip ", "--yes", "nix ", "install-nix", "github:", "--impure")
+TOOLCHAIN_IDENTITY = f"{EFFECT_ENTRY} toolchain"
+EFFECT_ACTIONS = {"actions/checkout"}
+RUN_START = re.compile(r"^(\s*)run:\s*(.*)$")
+# Every other effect-step command is a provided store path or a fixed assignment.
+ALLOWED_COMMAND = re.compile(
+    r'^(?:set -euo pipefail'
+    r'|tool="\$ENVS_EFFECT_BIN"'
+    r'|branch="[a-z/-]+(?:\$\{GITHUB_RUN_(?:ID|ATTEMPT)\}-?)+"'
+    r'|"\$(?:ENVS_EFFECT_BIN|tool)/[a-z0-9-]+"(?: .*)?)$'
+)
+COMMAND_CONTROL = re.compile(r"[;&|<>`\n]|\$\(")
+FLAKE_NIXPKGS = re.compile(r'(?m)^\s*inputs\.nixpkgs\.url = "github:NixOS/nixpkgs/([0-9a-f]{40})";$')
 
 
 class RepositoryError(ValueError):
@@ -199,6 +235,50 @@ def declared_inputs(row: dict[str, Any]) -> set[tuple[str, str]]:
     }
 
 
+def run_commands(text: str) -> list[str]:
+    lines = text.splitlines()
+    commands: list[str] = []
+    index = 0
+    while index < len(lines):
+        match = RUN_START.match(lines[index])
+        index += 1
+        if match is None:
+            continue
+        indent, inline = len(match.group(1)), match.group(2).strip()
+        if inline not in {"|", ">-"}:
+            quoted = len(inline) > 1 and inline[0] == inline[-1] == "'"
+            commands.append(inline[1:-1] if quoted else inline)
+            continue
+        block: list[str] = []
+        while index < len(lines) and (not lines[index].strip() or len(lines[index]) - len(lines[index].lstrip()) > indent):
+            if lines[index].strip():
+                block.append(lines[index].strip())
+            index += 1
+        if inline == ">-":
+            commands.append(" ".join(block))
+            continue
+        current = ""
+        for line in block:
+            current = f"{current} {line}" if current else line
+            if current.endswith("\\"):
+                current = current[:-1].rstrip()
+                continue
+            commands.append(current)
+            current = ""
+        if current:
+            commands.append(current)
+    return commands
+
+
+def consumer_run(text: str, name: str) -> str:
+    start = text.find(CONSUMER_STEP)
+    require(start != -1, f"{name}: provided artifact is not obtained")
+    body = text.find(CONSUMER_RUN, start)
+    require(body != -1 and "- name:" not in text[start + len(CONSUMER_STEP):body], f"{name}: consumer step differs")
+    end = text.find("\n\n", body)
+    return text[body:] if end == -1 else text[body:end + 1]
+
+
 def check_workflows(root: Path, environments: dict[str, dict[str, Any]]) -> None:
     workflow_root = root / ".github/workflows"
     names = {path.name for path in workflow_root.iterdir() if path.is_file()}
@@ -222,10 +302,98 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]]) -> None
     require("checks/repository.py" in check, "check workflow must execute repository oracle")
     require("checks/test_repository.py" in check, "check workflow must test repository oracle")
     require("checks/test_jev_api.py" in check, "check workflow must test Jev adapter")
+    require(TOOLCHAIN_BUILD in check, "check workflow must reconstruct the effect toolchain")
+    require(f'{TOOLCHAIN_BIN}envs-effect" toolchain' in check, "check workflow must execute the effect entry")
+    require(f'{TOOLCHAIN_BIN}python3" -I checks/test_jev_api.py' in check,
+            "check workflow must test the adapter on the toolchain interpreter")
+    require('nix flake lock "$relock"' in check and 'cmp flake.lock "$relock/flake.lock"' in check,
+            "check workflow must prove Nix regenerates the committed lock")
+    for tool in ("python3", "sops", "git", "gh", "wrangler"):
+        require(f'"$tool/{tool}" --version' in check, f"check workflow must execute closure {tool}")
+    require('"$tool/wrangler" pages secret "$command" --help' in check,
+            "check workflow must execute the Wrangler argv shape")
+    require(ARTIFACT_BUILD in check and ARTIFACT_NAME in check and "actions/upload-artifact@" in check,
+            "check workflow must provide the effect artifact")
+    require("cancel-in-progress: ${{ github.event_name == 'pull_request' }}" in check,
+            "check must not cancel the proposals run that provides an artifact")
+
+    def job(name: str, following: str | None) -> str:
+        start = check.find(f"\n  {name}:\n")
+        require(start != -1, f"check workflow job missing: {name}")
+        end = check.find(f"\n  {following}:\n", start) if following else -1
+        return check[start:] if end == -1 else check[start:end]
+
+    toolchain = job("toolchain", "effect-shape")
+    for marker in (
+        f"      ENVS_SOURCE_SHA: {SOURCE_SHA}\n",
+        f"          ref: {SOURCE_SHA}\n",
+        'test "$(git rev-parse HEAD)" = "$ENVS_SOURCE_SHA"',
+        'test "$(tar -xOf "$RUNNER_TEMP/provide/envs-effect.tar" SOURCE)" = "$ENVS_SOURCE_SHA"',
+    ):
+        require(marker in toolchain, f"artifact must be built from and bound to the named commit: {marker.strip()}")
+    effect_shape = job("effect-shape", "clean-start")
+    clean_start = job("clean-start", None)
+    require("    needs: toolchain\n" in clean_start, "check workflow must clean-start from the provided artifact")
+    for token in ("actions/checkout", "nix ", "install-nix"):
+        require(token not in clean_start, f"clean-start must not use {token.strip()}")
+    canonical = consumer_run(clean_start, "check.yml clean-start")
+    require(clean_start.count(canonical) == 2, "clean-start must run the canonical consumer and its missing case")
+    for marker in CONSUMER_BINDING:
+        require(marker in canonical, f"consumer must bind the named commit: {marker}")
+    program = next(line.strip() for line in canonical.splitlines() if line.strip().startswith("'.path =="))
+    source_check = CONSUMER_BINDING[-1]
+    require(clean_start.count(program) == 3 and clean_start.count(source_check) == 3,
+            "clean-start must run the canonical producer and SOURCE checks against mismatches")
+    for marker in (
+        'test "$MISSING" = failure',
+        'if echo "${ENVS_EFFECT_DIGEST#sha256:}  $altered" | sha256sum -c -; then',
+        "for case in lock adapter; do",
+        '"$ENVS_EFFECT_BIN/envs-effect" --root "$copy" toolchain',
+        "for change in . \\\n",
+        "'.head_sha = \"0000000000000000000000000000000000000000\"'",
+        "'.id = 1 | .event = \"pull_request\"'",
+        "'.repository.full_name = \"fork/envs\"'",
+        "'.head_repository.full_name = \"fork/envs\"'",
+        'test "$accepted" = "$expected"',
+        "artifact built from another commit was accepted",
+    ):
+        require(marker in clean_start, f"clean-start destructive case missing: {marker}")
+
+    require(consumer_run(effect_shape, "check.yml effect-shape") == canonical, "effect-shape must run the canonical consumer")
+    for token in ("nix ", "install-nix"):
+        require(token not in effect_shape, f"effect-shape must not use {token.strip()}")
+    for marker in (
+        f"          ref: {SOURCE_SHA}\n",
+        'test "$("$ENVS_EFFECT_BIN/git" -C "$GITHUB_WORKSPACE" rev-parse HEAD)" = "$ENVS_SOURCE_SHA"',
+        f"{TOOLCHAIN_IDENTITY} | tee",
+        ".status == \"PASS\" and .source == $sha and .root == $root",
+        f"{EFFECT_ENTRY} check",
+    ):
+        require(marker in effect_shape, f"effect-shape must run the effect data-root shape: {marker.strip()}")
 
     for name, plane in EFFECT_WORKFLOWS.items():
         text = texts[name]
         row = environments[plane]
+        for token in RUNTIME_ACQUISITION:
+            require(token not in text, f"{name}: runtime acquisition or rebuild {token.strip()}")
+        require(consumer_run(text, name) == canonical, f"{name}: consumer differs from the clean-start consumer")
+        require("          ENVS_SOURCE_SHA: ${{ github.sha }}\n" in text, f"{name}: artifact must resolve by the dispatched SHA")
+        rest = text.replace(canonical, "")
+        require(AMBIENT_TOOL.search(rest) is None, f"{name}: ambient tool on the effect path")
+        require(re.search(r"(?m)^ {0,4}env:", text) is None, f"{name}: workflow or job env is forbidden")
+        keys = set(EFFECT_ENV.findall(rest))
+        allowed = EFFECT_STEP_KEYS | {input_name for _, input_name in declared_inputs(row)}
+        require(keys <= allowed, f"{name}: step env or input not allowed: {sorted(keys - allowed)}")
+        require("GITHUB_ENV" not in rest and "GITHUB_PATH" not in rest, f"{name}: only the consumer may set step environment")
+        consume = text.find(CONSUMER_STEP)
+        identity = text.find(TOOLCHAIN_IDENTITY)
+        require(-1 < consume < identity < text.find("${{ secrets."),
+                f"{name}: artifact must be obtained and its identity recorded before secrets")
+        require("shell:" not in text, f"{name}: custom step shell is forbidden")
+        require({action for action, _ in ACTION_USE.findall(text)} == EFFECT_ACTIONS, f"{name}: effect Action set differs")
+        for command in run_commands(rest):
+            require(COMMAND_CONTROL.search(command) is None, f"{name}: command chaining or substitution: {command}")
+            require(ALLOWED_COMMAND.fullmatch(command) is not None, f"{name}: non-closure executable: {command}")
         require("workflow_dispatch:" in text, f"{name}: manual dispatch missing")
         require("\n  push:" not in text and "\n  pull_request:" not in text, f"{name}: automatic effect trigger")
         require(f"environment: {row['github_environment']}" in text, f"{name}: static Environment differs")
@@ -239,8 +407,25 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]]) -> None
             mapping = "^\\s+" + re.escape(f"{input_name}: ${{{{ {namespace}.{input_name} }}}}") + "$"
             require(re.search(mapping, text, re.MULTILINE) is not None, f"{name}: {input_name} mapping differs")
 
-    require("adapters/jev_api.py author" in texts["author-dev-jev-api.yml"], "author workflow adapter call missing")
-    require("adapters/jev_api.py project" in texts["project-dev-jev-api.yml"], "project workflow adapter call missing")
+    require(f"{EFFECT_ENTRY} author" in texts["author-dev-jev-api.yml"], "author workflow entry call missing")
+    require(f"{EFFECT_ENTRY} project" in texts["project-dev-jev-api.yml"], "project workflow entry call missing")
+
+
+def check_toolchain(root: Path, adapter) -> None:
+    flake = (root / "flake.nix").read_text(encoding="utf-8")
+    pinned = FLAKE_NIXPKGS.findall(flake)
+    require(len(pinned) == 1 and "inputs." not in FLAKE_NIXPKGS.sub("", flake), "flake must have exactly one pinned nixpkgs input")
+    require(adapter.locked_nixpkgs(root)["rev"] == pinned[0], "flake.lock differs from flake.nix")
+    for tool in adapter.TOOLCHAIN_TOOLS:
+        require(f'{tool} = "${{pkgs.' in flake, f"flake does not provide {tool}")
+    require('exec ${tools.python3} -I ${self}/adapters/jev_api.py "$@"' in flake, "flake entry must run only the adapter")
+    require("closureInfo { rootPaths = [ effect-toolchain ]; }" in flake and "echo ${effect-toolchain}/bin/envs-effect > ENTRY" in flake,
+            "flake artifact must carry the whole entry closure and its ENTRY")
+    require('rev = self.rev or (throw "' in flake and "echo ${rev} > SOURCE" in flake and "ENTRY SOURCE $(cat" in flake
+            and "source = rev;" in flake, "flake artifact must record the exact committed source it was built from")
+    source = (root / "adapters/jev_api.py").read_text(encoding="utf-8")
+    for token in ("npx", "--yes", "SOPS_BIN", "NPX_BIN", "WRANGLER_PACKAGE"):
+        require(token not in source, f"adapter selects an ambient or runtime tool: {token}")
 
 
 def check_readme(root: Path, environments: dict[str, dict[str, Any]]) -> None:
@@ -289,6 +474,7 @@ def inspect(root: Path = ROOT, *, verify_main_compatibility_refresh: bool = Fals
     if (root / adapter.HANDOFF).is_file():
         adapter.load_receipt(root / adapter.HANDOFF)
     check_workflows(root, environments)
+    check_toolchain(root, adapter)
     check_readme(root, environments)
     if verify_main_compatibility_refresh:
         check_main_compatibility_refresh(root)

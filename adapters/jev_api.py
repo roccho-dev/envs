@@ -18,7 +18,11 @@ BINDINGS = Path("contracts/bindings.jsonl")
 BOUNDARY = Path("contracts/provider-consumer.jsonl")
 CIPHERTEXT = Path("ciphertexts/dev-jev-api.sops.yaml")
 HANDOFF = Path("handoffs/dev-jev-api.json")
+FLAKE_LOCK = Path("flake.lock")
 RECEIPT_KIND = "envs.projectionReceipt.v1"
+TOOLCHAIN_KIND = "envs.effectToolchain.v1"
+TOOLCHAIN_TOOLS = ("python3", "sops", "wrangler", "git", "gh")
+STORE = Path("/nix/store")
 
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -311,23 +315,76 @@ def set_dev_active(root: Path, active: bool) -> None:
     write_jsonl(root / ENVIRONMENTS, rows)
 
 
-def clean_env(extra: Mapping[str, str]) -> dict[str, str]:
-    result = {key: value for key, value in os.environ.items() if key in {"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "CI"}}
+def locked_nixpkgs(root: Path) -> dict[str, str]:
+    try:
+        lock = json.loads((root / FLAKE_LOCK).read_text(encoding="utf-8"))
+        nodes = lock["nodes"]
+        locked = nodes[nodes[lock["root"]]["inputs"]["nixpkgs"]]["locked"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise EnvsError("flake.lock does not lock nixpkgs") from exc
+    require(isinstance(locked, dict) and {key: locked.get(key) for key in ("type", "owner", "repo")} == {
+        "type": "github", "owner": "NixOS", "repo": "nixpkgs",
+    }, "flake.lock nixpkgs source differs")
+    rev, nar_hash = locked.get("rev"), locked.get("narHash")
+    require(isinstance(rev, str) and SHA40.fullmatch(rev) is not None, "flake.lock nixpkgs revision is not exact")
+    require(isinstance(nar_hash, str) and nar_hash.startswith("sha256-"), "flake.lock nixpkgs narHash is not exact")
+    return {"rev": rev, "narHash": nar_hash}
+
+
+def in_store(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    path = Path(value)
+    return path.is_absolute() and len(path.parts) > len(STORE.parts) and path.parts[:len(STORE.parts)] == STORE.parts
+
+
+def toolchain(root: Path, environ: Mapping[str, str] | None = None, executable: str | None = None) -> dict[str, str]:
+    # The flake entry exports this manifest; without it, or on any mismatch, no tool runs.
+    manifest = (os.environ if environ is None else environ).get("ENVS_EFFECT_TOOLCHAIN", "")
+    require(in_store(manifest), "repo-owned effect toolchain is missing")
+    try:
+        value = json.loads(Path(manifest).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise EnvsError("repo-owned effect toolchain manifest is unreadable") from exc
+    require(isinstance(value, dict) and set(value) == {"kind", "nixpkgs", "source", "tools"}
+            and value["kind"] == TOOLCHAIN_KIND, "effect toolchain manifest differs")
+    require(isinstance(value["source"], str) and SHA40.fullmatch(value["source"]) is not None,
+            "effect toolchain source is not an exact commit")
+    require(value["nixpkgs"] == locked_nixpkgs(root), "effect toolchain differs from flake.lock")
+    try:
+        same_adapter = (root / "adapters/jev_api.py").read_bytes() == Path(__file__).read_bytes()
+    except OSError as exc:
+        raise EnvsError("checkout adapter is unreadable") from exc
+    require(same_adapter, "checkout adapter differs from the effect toolchain")
+    tools = value["tools"]
+    require(isinstance(tools, dict) and set(tools) == set(TOOLCHAIN_TOOLS), "effect toolchain tool set differs")
+    for name in TOOLCHAIN_TOOLS:
+        path = tools[name]
+        require(in_store(path) and os.path.isfile(path) and os.access(path, os.X_OK), f"effect toolchain {name} is missing")
+    current = os.path.realpath(sys.executable if executable is None else executable)
+    require(current == os.path.realpath(tools["python3"]), "adapter interpreter is not the repo-owned python3")
+    return dict(tools)
+
+
+def clean_env(tools: Mapping[str, str], extra: Mapping[str, str]) -> dict[str, str]:
+    result = {key: value for key, value in os.environ.items() if key in {"HOME", "TMPDIR", "LANG", "LC_ALL", "CI"}}
+    result["PATH"] = os.pathsep.join(sorted({os.path.dirname(path) for path in tools.values()}))
     result.update(extra)
     return result
 
 
 def author(root: Path = ROOT, runner: Runner = default_runner) -> dict[str, Any]:
     contracts = validate_contracts(root)
+    tools = toolchain(root)
     inputs = gate(root, contracts, "dev.authoring")
     source = inputs["JEV_API_KEY"]
     recipients = recipient_items(inputs["SOPS_AGE_RECIPIENTS"]) or []
 
     payload = json.dumps({"JEV_API_KEY": source}, separators=(",", ":")).encode() + b"\n"
     result = run_checked(
-        [os.environ.get("SOPS_BIN", "sops"), "--encrypt", "--input-type", "json", "--output-type", "yaml", "/dev/stdin"],
+        [tools["sops"], "--encrypt", "--input-type", "json", "--output-type", "yaml", "/dev/stdin"],
         input_data=payload,
-        env=clean_env({"SOPS_AGE_RECIPIENTS": ",".join(recipients)}),
+        env=clean_env(tools, {"SOPS_AGE_RECIPIENTS": ",".join(recipients)}),
         runner=runner,
         label="SOPS encryption",
     )
@@ -410,14 +467,15 @@ def project(*, envs_sha: str, run_id: int, run_attempt: int, created_at: str,
     require(SHA40.fullmatch(envs_sha) is not None, "expected exact envs SHA")
     cipher = root / CIPHERTEXT
     require(cipher.is_file(), "ciphertext is not configured")
+    tools = toolchain(root)
     inputs = gate(root, contracts, "dev.projection")
     age_key = inputs["SOPS_AGE_KEY"]
     account = inputs["CLOUDFLARE_ACCOUNT_ID"]
     token = inputs["CLOUDFLARE_API_TOKEN"]
 
     decrypted = run_checked(
-        [os.environ.get("SOPS_BIN", "sops"), "--decrypt", "--output-type", "json", str(cipher)],
-        env=clean_env({"SOPS_AGE_KEY": age_key}), runner=runner, label="SOPS decryption",
+        [tools["sops"], "--decrypt", "--output-type", "json", str(cipher)],
+        env=clean_env(tools, {"SOPS_AGE_KEY": age_key}), runner=runner, label="SOPS decryption",
     ).stdout
     try:
         payload = json.loads(decrypted)
@@ -427,15 +485,14 @@ def project(*, envs_sha: str, run_id: int, run_attempt: int, created_at: str,
     secret = payload["JEV_API_KEY"]
     require(isinstance(secret, str) and secret, "decrypted JEV_API_KEY is empty")
 
-    provider_env = clean_env({"CLOUDFLARE_ACCOUNT_ID": account, "CLOUDFLARE_API_TOKEN": token})
-    npx = os.environ.get("NPX_BIN", "npx")
-    wrangler = os.environ.get("WRANGLER_PACKAGE", "wrangler@4.112.0")
+    provider_env = clean_env(tools, {"CLOUDFLARE_ACCOUNT_ID": account, "CLOUDFLARE_API_TOKEN": token})
+    wrangler = tools["wrangler"]
     run_checked(
-        [npx, "--yes", wrangler, "pages", "secret", "put", "JEV_API_KEY", "--project-name", "voice-ui"],
+        [wrangler, "pages", "secret", "put", "JEV_API_KEY", "--project-name", "voice-ui"],
         input_data=secret.encode(), env=provider_env, runner=runner, label="Cloudflare secret projection",
     )
     readback = run_checked(
-        [npx, "--yes", wrangler, "pages", "secret", "list", "--project-name", "voice-ui"],
+        [wrangler, "pages", "secret", "list", "--project-name", "voice-ui"],
         env=provider_env, runner=runner, label="Cloudflare secret readback",
     )
     require(b"JEV_API_KEY" in readback.stdout + readback.stderr, "provider readback did not contain JEV_API_KEY")
@@ -488,9 +545,12 @@ def utc_now() -> str:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
+    # Data root (contracts, ciphertext, handoff); defaults to the source carrying this adapter.
+    parser.add_argument("--root", type=Path, default=ROOT)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("check")
     sub.add_parser("readiness")
+    sub.add_parser("toolchain")
     sub.add_parser("author")
     project_parser = sub.add_parser("project")
     project_parser.add_argument("--envs-sha", required=True)
@@ -499,20 +559,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     project_parser.add_argument("--created-at")
     project_parser.add_argument("--output", type=Path, default=HANDOFF)
     args = parser.parse_args(argv)
+    root = args.root.resolve()
     try:
         if args.command == "check":
-            validate_contracts(ROOT)
-            if (ROOT / HANDOFF).is_file():
-                load_receipt(ROOT / HANDOFF)
+            validate_contracts(root)
+            if (root / HANDOFF).is_file():
+                load_receipt(root / HANDOFF)
             print("JEV_API_CONTRACT=PASS")
         elif args.command == "readiness":
-            print(json.dumps(readiness(ROOT), indent=2, sort_keys=True))
+            print(json.dumps(readiness(root), indent=2, sort_keys=True))
+        elif args.command == "toolchain":
+            tools = toolchain(root)
+            print(json.dumps({
+                "kind": "envs.effectToolchainCheck.v1", "status": "PASS", "root": str(root),
+                "manifest": os.environ["ENVS_EFFECT_TOOLCHAIN"], "nixpkgs": locked_nixpkgs(root), "tools": tools,
+                "source": json.loads(Path(os.environ["ENVS_EFFECT_TOOLCHAIN"]).read_text(encoding="utf-8"))["source"],
+            }, indent=2, sort_keys=True))
         elif args.command == "author":
-            print(json.dumps(author(ROOT), indent=2, sort_keys=True))
+            print(json.dumps(author(root), indent=2, sort_keys=True))
         else:
             receipt = project(
                 envs_sha=args.envs_sha, run_id=args.run_id, run_attempt=args.run_attempt,
-                created_at=args.created_at or utc_now(), output=args.output, root=ROOT,
+                created_at=args.created_at or utc_now(), output=args.output, root=root,
             )
             print(json.dumps({"kind": receipt["kind"], "status": "PASS", "output": str(args.output)}, sort_keys=True))
     except (EnvsError, OSError) as exc:
