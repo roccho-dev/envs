@@ -98,13 +98,18 @@ class Cloud:
         argv = list(argv)
         self.cases.append((argv, dict(env)))
         nonce = (Path(argv[argv.index("-i") + 1]).parent / "nonce").read_text().strip().encode()
+        # Each case starts from its own empty HOME, never the runner's (no cached Access login can leak in).
+        home = Path(env["HOME"])
+        assert home.is_dir() and not any(home.iterdir()) and home.name.startswith("home-"), env["HOME"]
+        (home / ".cloudflared").mkdir()
         if env.get("TUNNEL_SERVICE_TOKEN_SECRET") == SERVICE_VALUE:
-            case = "service_token"
+            case = "service_token_again" if any(e.get("TUNNEL_SERVICE_TOKEN_SECRET") == SERVICE_VALUE
+                                                for _, e in self.cases[:-1]) else "service_token"
         elif "TUNNEL_SERVICE_TOKEN_SECRET" in env:
             case = "wrong_token"
         else:
             case = "no_token"
-        default = ("exit", 0, nonce + b"\n") if case == "service_token" else ("exit", 255, b"")
+        default = ("exit", 0, nonce + b"\n") if case.startswith("service_token") else ("exit", 255, b"")
         outcome = self.outcomes.get(case, default)
         return outcome if outcome != "nonce" else ("exit", 0, nonce + b"\n")
 
@@ -159,9 +164,14 @@ def with_root(test):
 def test_probe_pass(root: Path) -> None:
     cloud = Cloud()
     result = cloud.probe(root)
-    assert result["status"] == "PASS" and result["cleanup"] == "ABSENT", result
+    assert result["status"] == "TOKEN_REACHED_NEGATIVES_REFUSED" and result["cleanup"] == "ABSENT", result
     assert result["created"] == CREATED and result["probe"]["cases"] == {
-        "service_token": "REACHED", "no_token": "DENIED", "wrong_token": "DENIED"}
+        "service_token": "REACHED", "no_token": "REFUSED", "wrong_token": "REFUSED", "service_token_again": "REACHED"}
+    # A refused negative is never reported as an Access denial.
+    assert result["probe"]["access_denial_evidence"] == "NOT_OBSERVED" and result["probe"]["cause"] == "UNKNOWN"
+    assert "PASS" not in json.dumps(result) and "DENIED" not in json.dumps(result)
+    homes = [env["HOME"] for _, env in cloud.cases] + [process.env["HOME"] for process in cloud.processes]
+    assert len(set(homes)) == 6 and os.environ.get("HOME", "\0") not in homes
     assert [(phase, args[0]) for phase, args in cloud.tofu_calls()] == [
         ("before", "init"), ("before", "apply"), ("before", "output"),
         ("probe", "init"), ("probe", "apply"), ("probe", "output"), ("probe", "output"),
@@ -170,12 +180,12 @@ def test_probe_pass(root: Path) -> None:
     assert cloud.processes[1].argv == [TOOLS["cloudflared"], "tunnel", "--no-autoupdate", "run"]
     assert cloud.processes[1].env["TUNNEL_TOKEN"] == TUNNEL_TOKEN
     assert all(process.stopped for process in cloud.processes)
-    assert cloud.slept == [jev.PROBE_SETTLE] and len(cloud.cases) == 3
+    assert cloud.slept == [jev.PROBE_SETTLE] and len(cloud.cases) == 4
     for argv, env in cloud.cases:
         assert PROXY in argv and "BatchMode=yes" in argv and argv[-1] == jev.PROBE_HOSTNAME
-    assert [set(env) & {"TUNNEL_SERVICE_TOKEN_ID", "TUNNEL_SERVICE_TOKEN_SECRET"} for _, env in cloud.cases] == [
-        {"TUNNEL_SERVICE_TOKEN_ID", "TUNNEL_SERVICE_TOKEN_SECRET"}, set(),
-        {"TUNNEL_SERVICE_TOKEN_ID", "TUNNEL_SERVICE_TOKEN_SECRET"}]
+    pair = {"TUNNEL_SERVICE_TOKEN_ID", "TUNNEL_SERVICE_TOKEN_SECRET"}
+    assert [set(env) & pair for _, env in cloud.cases] == [pair, set(), pair, pair]
+    assert cloud.cases[3][1]["TUNNEL_SERVICE_TOKEN_SECRET"] == SERVICE_VALUE
     assert cloud.cases[2][1]["TUNNEL_SERVICE_TOKEN_SECRET"] != SERVICE_VALUE
     no_secret_escapes(cloud, result)
     lookups_never_mutate(cloud)
@@ -214,8 +224,12 @@ def test_probe_outcomes(root: Path) -> None:
     timeout = ("timeout", -1, b"")
     for outcomes, status in (
         ({"service_token": timeout}, "UNKNOWN"),
-        ({"service_token": ("exit", 255, b"")}, "UNATTENDED_PATH_FAILED"),
-        ({"service_token": ("exit", 0, b"login page")}, "UNATTENDED_PATH_FAILED"),
+        ({"service_token": ("exit", 255, b""), "service_token_again": ("exit", 255, b"")}, "UNATTENDED_PATH_FAILED"),
+        ({"service_token": ("exit", 0, b"login page"), "service_token_again": ("exit", 1, b"")},
+         "UNATTENDED_PATH_FAILED"),
+        # The path was not up on both sides of the negatives: their refusal says nothing, so UNKNOWN.
+        ({"service_token_again": ("exit", 255, b"")}, "UNKNOWN"),
+        ({"service_token": ("exit", 255, b"")}, "UNKNOWN"),
         ({"no_token": "nonce"}, "ACCESS_NOT_ENFORCED"),
         ({"wrong_token": "nonce"}, "ACCESS_NOT_ENFORCED"),
         ({"wrong_token": timeout}, "UNKNOWN"),
@@ -225,7 +239,8 @@ def test_probe_outcomes(root: Path) -> None:
         result = cloud.probe(root)
         assert result["status"] == status, (outcomes, result)
         assert result["probe"]["cause"] == "UNKNOWN" and result["cleanup"] == "ABSENT"
-        assert all(process.stopped for process in cloud.processes) and len(cloud.cases) == 3
+        assert result["probe"]["access_denial_evidence"] == "NOT_OBSERVED"
+        assert all(process.stopped for process in cloud.processes) and len(cloud.cases) == 4
         no_secret_escapes(cloud, result)
         lookups_never_mutate(cloud)
 
@@ -242,7 +257,9 @@ def test_failures_fail_closed(root: Path) -> None:
     for world in (Cloud(fail={("probe", "destroy")}), Cloud(after={**EMPTY, "tunnels": ["t"]}),
                   Cloud(fail={("after", "apply")})):
         result = world.probe(root)
-        assert result["status"] == "PASS" and result["cleanup"] == "CLEANUP_UNKNOWN", result
+        # A reached probe never stands as the status while resources may remain.
+        assert result["status"] == "CLEANUP_UNKNOWN" and result["cleanup"] == "CLEANUP_UNKNOWN", result
+        assert result["probe"]["status"] == "TOKEN_REACHED_NEGATIVES_REFUSED"
         assert sum(1 for _, args in world.tofu_calls() if args[0] == "destroy") == 1
         no_secret_escapes(world, result)
         lookups_never_mutate(world)
@@ -304,8 +321,9 @@ def real_ssh(bin_dir: str) -> None:
                     time.sleep(0.2)
             argv = jev.ssh_argv(tools, fixture, "127.0.0.1", proxy=False)
             outcome = jev.default_bounded(argv, env, 30)
-            assert jev.classify({"service_token": outcome, "no_token": ("exit", 255, b""),
-                                 "wrong_token": ("exit", 255, b"")}, fixture["nonce"])["status"] == "PASS", outcome[:2]
+            assert jev.classify({"service_token": outcome, "no_token": ("exit", 255, b""), "wrong_token": ("exit", 255, b""),
+                                 "service_token_again": outcome}, fixture["nonce"])["cases"]["service_token"] == "REACHED", \
+                outcome[:2]
             other = list(argv)
             other[other.index("-i") + 1] = str(fixture["directory"] / "host")
             refused = jev.default_bounded(other, env, 30)

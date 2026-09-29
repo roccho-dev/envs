@@ -120,12 +120,15 @@ dev-rent-access-probe/CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_ZO
 → create: tunnel windows-rent-access-probe → ssh://localhost:2222, CNAME rent-access-probe.roccho.com,
    Access app with one Service Auth policy for exactly one 1h service token
 → localhost sshd answering a run-scoped nonce; cloudflared tunnel run with TUNNEL_TOKEN from the environment
-→ ssh -o BatchMode=yes with the PR #21 ProxyCommand shape, once per case:
-   service token → nonce; no token and wrong secret → denied
+→ ssh -o BatchMode=yes with the PR #21 ProxyCommand shape, once per case and in this order, each case and
+   process with its own empty HOME (no runner or cross-case Access login cache):
+   service token, no token, wrong secret, service token again
 → destroy exactly this state, then read back absence from a fresh lookup state
 ```
 
-- Outcomes: `PASS` only when the token case returns the nonce and both negative cases are denied; an admitted negative is `ACCESS_NOT_ENFORCED`; a failed token case is `UNATTENDED_PATH_FAILED` with cause `UNKNOWN`; any timeout is `UNKNOWN`. There is no retry, and no failure is attributed to a guessed cause.
+- Outcomes: `TOKEN_REACHED_NEGATIVES_REFUSED` only when both token cases return the nonce and both negative cases fail; an admitted negative is `ACCESS_NOT_ENFORCED`; both token cases failing is `UNATTENDED_PATH_FAILED`; any timeout, or a path not up on both sides of the negatives, is `UNKNOWN`. There is no retry, and cause is always `UNKNOWN`.
+- A refused negative is not an Access denial: the client cannot tell Access from DNS, edge, tunnel or sshd failures. The bracketing token cases show only that the path was up around the negatives, so `access_denial_evidence` stays `NOT_OBSERVED` until a provider-side Access decision record is read for each negative attempt.
+- If cleanup or its absence readback is not proven, the status is `CLEANUP_UNKNOWN` whatever the probe reached; the probe outcome stays under `probe`.
 - Credentials (API token, tunnel token, service-token secret) reach only the process that needs them, by environment; never argv, the result JSON, a log line or Git. OpenTofu state stays in the runner's temporary directory and is never committed, cached, uploaded or printed.
 - Cleanup deletes only what this run's state created. If the runner loses that state, name lookup locates candidates and never proves ownership: `rent-access-locate` reports them as `UNKNOWN`/`NEEDS_AUTHORITY` and has no delete path. A deletion of name-located resources needs its own contract.
 - `checks/test_rent_access_probe.py` proves the order, isolation, redaction, outcome classes and cleanup model against a fake provider and client. In `check` it also runs a real localhost sshd/ssh exchange from the closure, and `check` asserts the exact `cloudflared` version and its `--service-token-id`/`--service-token-secret` flags and initializes and validates the provider declaration with network access closed.

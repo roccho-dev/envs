@@ -701,49 +701,68 @@ def ssh_argv(tools: Mapping[str, str], fixture: Mapping[str, Any], target: str, 
     return argv + [target]
 
 
+PROBE_CASES = ("service_token", "no_token", "wrong_token", "service_token_again")
+
+
 def classify(outcomes: Mapping[str, tuple[str, int, bytes]], nonce: str) -> dict[str, Any]:
-    # Timeout is UNKNOWN; a failed positive path is a failure of unknown cause; an admitted negative is a policy failure.
+    # The client sees only its own exit and output, so a refused negative is not evidence that Access denied it: DNS,
+    # edge, tunnel or sshd failures look the same. The negatives are bracketed by two token cases; only when both
+    # reach the nonce was the path up around them, and even then the refusal cause stays unattributed.
     def reached(outcome: tuple[str, int, bytes]) -> bool:
         return outcome[0] == "exit" and outcome[1] == 0 and outcome[2].strip() == nonce.encode()
 
+    require(set(outcomes) == set(PROBE_CASES), "probe cases differ")
     labels: dict[str, str] = {}
     for case, outcome in outcomes.items():
         if outcome[0] == "timeout":
             labels[case] = "UNKNOWN"
-        elif case == "service_token":
+        elif case.startswith("service_token"):
             labels[case] = "REACHED" if reached(outcome) else "FAILED"
         else:
-            labels[case] = "ADMITTED" if outcome[1] == 0 or nonce.encode() in outcome[2] else "DENIED"
+            labels[case] = "ADMITTED" if outcome[1] == 0 or nonce.encode() in outcome[2] else "REFUSED"
     if any(labels[case] == "ADMITTED" for case in ("no_token", "wrong_token")):
         status = "ACCESS_NOT_ENFORCED"
     elif "UNKNOWN" in labels.values():
         status = "UNKNOWN"
-    elif labels["service_token"] == "REACHED":
-        status = "PASS"
-    else:
+    elif labels["service_token"] == labels["service_token_again"] == "REACHED":
+        status = "TOKEN_REACHED_NEGATIVES_REFUSED"
+    elif labels["service_token"] == labels["service_token_again"] == "FAILED":
         status = "UNATTENDED_PATH_FAILED"
-    return {"status": status, "cases": labels, "cause": None if status == "PASS" else "UNKNOWN"}
+    else:
+        status = "UNKNOWN"
+    return {"status": status, "cases": labels, "cause": "UNKNOWN",
+            "access_denial_evidence": "NOT_OBSERVED",
+            "needed_for_denial_claim": "a provider-side Access decision record for each negative attempt"}
 
 
 def run_probe(tools: Mapping[str, str], credentials: Mapping[str, str], scratch: Path, runner: Runner,
               bounded: Bounded, spawn: Spawn, sleep: Callable[[float], None]) -> dict[str, Any]:
     fixture = ssh_fixture(tools, scratch / "ssh", runner)
-    base = clean_env(tools, {})
-    processes = [spawn([tools["sshd"], "-D", "-e", "-f", str(fixture["directory"] / "sshd_config")], base)]
+
+    def isolated(name: str, extra: Mapping[str, str]) -> dict[str, str]:
+        # Every process and case gets its own fresh, empty HOME: no runner login cache (~/.cloudflared) and no
+        # token cached by one case can reach another.
+        home = scratch / f"home-{name}"
+        home.mkdir(mode=0o700)
+        return {**clean_env(tools, {}), "HOME": str(home), **extra}
+
+    processes = [spawn([tools["sshd"], "-D", "-e", "-f", str(fixture["directory"] / "sshd_config")], isolated("sshd", {}))]
     try:
         processes.append(spawn([tools["cloudflared"], "tunnel", "--no-autoupdate", "run"],
-                               {**base, "TUNNEL_TOKEN": credentials["tunnel_token"]}))
+                               isolated("tunnel", {"TUNNEL_TOKEN": credentials["tunnel_token"]})))
         sleep(PROBE_SETTLE)
         argv = ssh_argv(tools, fixture, PROBE_HOSTNAME, proxy=True)
+        token = {"TUNNEL_SERVICE_TOKEN_ID": credentials["service_token_id"],
+                 "TUNNEL_SERVICE_TOKEN_SECRET": credentials["service_token_value"]}
         cases = {
-            "service_token": {"TUNNEL_SERVICE_TOKEN_ID": credentials["service_token_id"],
-                              "TUNNEL_SERVICE_TOKEN_SECRET": credentials["service_token_value"]},
+            "service_token": token,
             "no_token": {},
             "wrong_token": {"TUNNEL_SERVICE_TOKEN_ID": credentials["service_token_id"],
                             "TUNNEL_SERVICE_TOKEN_SECRET": secrets.token_hex(32)},
+            "service_token_again": token,
         }
-        # Each case runs once; there is no retry.
-        outcomes = {case: bounded(argv, {**base, **extra}, PROBE_TIMEOUT) for case, extra in cases.items()}
+        # Each case runs once, in this order, with no retry.
+        outcomes = {case: bounded(argv, isolated(case, extra), PROBE_TIMEOUT) for case, extra in cases.items()}
     finally:
         for process in reversed(processes):
             stop(process)
@@ -799,6 +818,9 @@ def access_probe(root: Path = ROOT, *, locate_only: bool = False, runner: Runner
                 result["located_after"] = after
             except EnvsError:
                 result["cleanup"] = "CLEANUP_UNKNOWN"
+    if result["cleanup"] != "ABSENT":
+        # The current state is what matters: resources may remain, so no probe outcome stands as the status.
+        result["status"] = "CLEANUP_UNKNOWN"
     return result
 
 
@@ -988,7 +1010,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = access_probe(root, locate_only=args.command == "rent-access-locate")
             print(json.dumps(result, indent=2, sort_keys=True))
             passed = result["status"] == "NONE_LOCATED" if args.command == "rent-access-locate" else (
-                result["status"] == "PASS" and result.get("cleanup") == "ABSENT")
+                result["status"] == "TOKEN_REACHED_NEGATIVES_REFUSED" and result.get("cleanup") == "ABSENT")
             return 0 if passed else 1
         else:
             receipt = project(
