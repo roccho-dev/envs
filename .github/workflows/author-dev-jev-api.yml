@@ -2,6 +2,14 @@ name: author-dev-jev-api
 
 on:
   workflow_dispatch:
+    inputs:
+      target:
+        description: Declared authoring binding
+        required: true
+        type: choice
+        options:
+          - jev-api
+          - jev-api.oci-dev
 
 permissions:
   actions: read
@@ -64,11 +72,20 @@ jobs:
       - name: Record effect toolchain identity
         run: '"$ENVS_EFFECT_BIN/envs-effect" --root "$GITHUB_WORKSPACE" toolchain'
 
+      # One literal step per binding: each receives only its own inputs, and no target is substituted into a command.
       - name: Author ciphertext
+        if: inputs.target == 'jev-api'
         env:
           JEV_API_KEY: ${{ secrets.JEV_API_KEY }}
           SOPS_AGE_RECIPIENTS: ${{ vars.SOPS_AGE_RECIPIENTS }}
-        run: '"$ENVS_EFFECT_BIN/envs-effect" --root "$GITHUB_WORKSPACE" author'
+        run: '"$ENVS_EFFECT_BIN/envs-effect" --root "$GITHUB_WORKSPACE" author --target jev-api'
+
+      - name: Author OCI dev ciphertext
+        if: inputs.target == 'jev-api.oci-dev'
+        env:
+          JEV_API_KEY: ${{ secrets.JEV_API_KEY }}
+          OCI_DEV_AGE_RECIPIENT: ${{ vars.OCI_DEV_AGE_RECIPIENT }}
+        run: '"$ENVS_EFFECT_BIN/envs-effect" --root "$GITHUB_WORKSPACE" author --target jev-api.oci-dev'
 
       - name: Verify candidate tree
         run: '"$ENVS_EFFECT_BIN/python3" -I checks/repository.py'

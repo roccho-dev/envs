@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import copy
 import importlib.util
 import json
@@ -66,6 +67,27 @@ def author_env(**overrides: str) -> dict[str, str]:
     values = {"JEV_API_KEY": "fixture-secret", "SOPS_AGE_RECIPIENTS": RECIPIENT, "ENVS_EFFECT_TOOLCHAIN": MANIFEST}
     values.update(overrides)
     return values
+
+
+OCI_RECIPIENT = "age1" + "".join(secrets.choice(BECH32) for _ in range(58))
+OCI_OTHER = "age1" + "".join(secrets.choice(BECH32) for _ in range(58))
+# Generated per run: the OCI source value never appears in tracked source.
+OCI_KEY = "jev-" + secrets.token_urlsafe(24)
+
+
+def oci_env(**overrides: str) -> dict[str, str]:
+    values = {"JEV_API_KEY": OCI_KEY, jev.OCI_RECIPIENT: OCI_RECIPIENT, "ENVS_EFFECT_TOOLCHAIN": MANIFEST}
+    values.update(overrides)
+    return values
+
+
+def oci_ciphertext(recipients: tuple[str, ...] = (OCI_RECIPIENT,), extra: str = "", key: str = "JEV_API_KEY") -> bytes:
+    lines = "".join(f"    - recipient: {item}\n" for item in recipients)
+    return f"{key}: ENC[AES256_GCM,data:fixture]\n{extra}sops:\n  age:\n{lines}".encode()
+
+
+def snapshot(root: Path) -> dict[str, bytes]:
+    return {path.relative_to(root).as_posix(): path.read_bytes() for path in jev.repository_files(root)}
 
 
 def project_env(**overrides: str) -> dict[str, str]:
@@ -181,6 +203,249 @@ def test_author_red_inputs() -> None:
     expect_author_red(author_env(), mutate=lambda root: append(root / "checks/test_jev_api.py", f"\n# {RECIPIENT}\n"))
     expect_author_red(author_env(), output=ciphertext(f"note: {RECIPIENT}\n"))
     expect_author_red(author_env(), output=ciphertext().replace(RECIPIENT.encode(), ("age1" + "q" * 58).encode()))
+
+
+def test_author_oci() -> None:
+    # SOPS_AGE_RECIPIENTS is set to an invalid value: the OCI target must not read it, only its own recipient.
+    root = copy_root()
+    calls: list[tuple[list[str], bytes | None, dict[str, str]]] = []
+    try:
+        before = snapshot(root)
+
+        def runner(argv, input_data, env):
+            calls.append((list(argv), input_data, dict(env)))
+            return subprocess.CompletedProcess(argv, 0, stdout=oci_ciphertext(), stderr=b"")
+
+        with environment(oci_env(SOPS_AGE_RECIPIENTS="not-read")):
+            result = jev.author_oci(root, runner)
+        assert result == {
+            "kind": "envs.targetAuthoringResult.v1", "status": "PASS", "binding": jev.OCI_BINDING,
+            "ciphertext": jev.OCI_CIPHERTEXT.as_posix(), "recipient_count": 1,
+            "target_apply": "NOT_RUN", "application_runtime": "NOT_RUN",
+        }
+        assert len(calls) == 1
+        argv, stdin, env = calls[0]
+        assert argv == [TOOLS["sops"], "--encrypt", "--input-type", "json", "--output-type", "yaml", "/dev/stdin"]
+        assert json.loads(stdin) == {"JEV_API_KEY": OCI_KEY}
+        assert env["SOPS_AGE_RECIPIENTS"] == OCI_RECIPIENT and "JEV_API_KEY" not in env and jev.OCI_RECIPIENT not in env
+        assert not any(OCI_KEY in item for item in [*argv, *env.values()])
+        assert OCI_KEY not in json.dumps(result)
+        # Only the declared ciphertext is new; every other byte, plane state and handoff is unchanged.
+        after = snapshot(root)
+        assert set(after) - set(before) == {jev.OCI_CIPHERTEXT.as_posix()}
+        assert all(after[name] == data for name, data in before.items())
+        assert not (root / jev.CIPHERTEXT).exists() and not (root / jev.HANDOFF).exists()
+        contracts = jev.validate_contracts(root)
+        for plane in ("dev.authoring", "dev.projection"):
+            assert contracts["environments"][plane]["migration_state"] == "NOT_CONFIGURED"
+        # A second run (rotation) over the committed ciphertext is accepted: its recipient metadata is not a leak.
+        with environment(oci_env()):
+            jev.author_oci(root, runner)
+    finally:
+        shutil.rmtree(root.parent, ignore_errors=True)
+
+
+def test_targets_are_separate() -> None:
+    contracts = jev.validate_contracts(ROOT)
+    names = {target: [entry["name"] for entry in jev.authoring_inputs(contracts, target)] for target in jev.AUTHOR_TARGETS}
+    assert names == {"jev-api": ["JEV_API_KEY", "SOPS_AGE_RECIPIENTS"], jev.OCI_BINDING: ["JEV_API_KEY", jev.OCI_RECIPIENT]}
+    try:
+        jev.authoring_inputs(contracts, "rent-tunnel")
+    except jev.EnvsError:
+        pass
+    else:
+        raise AssertionError("an undeclared author target was accepted")
+    # The Cloudflare target still authors with the OCI recipient absent.
+    root = copy_root()
+    try:
+        values = author_env()
+        saved = os.environ.pop(jev.OCI_RECIPIENT, None)
+        try:
+            with environment(values):
+                jev.author(root, lambda argv, input_data, env: subprocess.CompletedProcess(argv, 0, stdout=ciphertext(), stderr=b""))
+        finally:
+            if saved is not None:
+                os.environ[jev.OCI_RECIPIENT] = saved
+        assert (root / jev.CIPHERTEXT).is_file() and not (root / jev.OCI_CIPHERTEXT).exists()
+    finally:
+        shutil.rmtree(root.parent, ignore_errors=True)
+
+
+def expect_oci_red(values: dict[str, str], *, mutate=None, output: bytes | None = None, returncode: int = 0) -> None:
+    root = copy_root()
+    calls: list[list[str]] = []
+    try:
+        if mutate is not None:
+            mutate(root)
+        before = snapshot(root)
+
+        def runner(argv, input_data, env):
+            calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, returncode, stdout=output if output is not None else oci_ciphertext(),
+                                               stderr=b"")
+
+        with environment(values):
+            try:
+                jev.author_oci(root, runner)
+            except jev.EnvsError as exc:
+                message = str(exc)
+            else:
+                raise AssertionError("invalid OCI authoring state was accepted")
+        assert OCI_KEY not in message, message
+        assert output is not None or returncode != 0 or not calls, "sops ran before the input gate"
+        assert snapshot(root) == before, "a RED OCI authoring changed the repository"
+    finally:
+        shutil.rmtree(root.parent, ignore_errors=True)
+
+
+def test_author_oci_red() -> None:
+    for name in ("JEV_API_KEY", jev.OCI_RECIPIENT):
+        expect_oci_red(oci_env(**{name: ""}))
+    # Exactly one target recipient: lists, duplicates and malformed recipients are RED before SOPS.
+    expect_oci_red(oci_env(**{jev.OCI_RECIPIENT: f"{OCI_RECIPIENT},{OCI_OTHER}"}))
+    expect_oci_red(oci_env(**{jev.OCI_RECIPIENT: f"{OCI_RECIPIENT},{OCI_RECIPIENT}"}))
+    expect_oci_red(oci_env(**{jev.OCI_RECIPIENT: OCI_RECIPIENT.upper()}))
+    expect_oci_red(oci_env(**{jev.OCI_RECIPIENT: f" {OCI_RECIPIENT}"}))
+    # The Cloudflare recipient list is not an OCI input.
+    expect_oci_red({**oci_env(**{jev.OCI_RECIPIENT: ""}), "SOPS_AGE_RECIPIENTS": OCI_RECIPIENT})
+    # A live recipient or source value already in Git is RED before SOPS.
+    expect_oci_red(oci_env(), mutate=lambda root: append(root / "README.md", f"\n{OCI_RECIPIENT}\n"))
+    expect_oci_red(oci_env(), mutate=lambda root: append(root / "README.md", f"\n{OCI_KEY}\n"))
+    # SOPS output must be this one recipient's ciphertext of exactly the key.
+    for output, returncode in (
+        (oci_ciphertext((OCI_RECIPIENT, OCI_OTHER)), 0),
+        (oci_ciphertext((OCI_OTHER,)), 0),
+        (oci_ciphertext(()), 0),
+        (oci_ciphertext(key=jev.RENT_KEY), 0),
+        (oci_ciphertext(extra="note: plain\n"), 0),
+        (oci_ciphertext(extra=f"note: {OCI_KEY}\n"), 0),
+        (oci_ciphertext() + f"# {OCI_RECIPIENT}\n".encode(), 0),
+        (oci_ciphertext(), 1),
+    ):
+        expect_oci_red(oci_env(), output=output, returncode=returncode)
+    outside = Path(tempfile.mkdtemp(prefix="envs-oci-outside-"))
+    try:
+        for values, mutate in toolchain_red_cases(outside / "toolchain.json"):
+            expect_oci_red(oci_env(**values), mutate=mutate)
+    finally:
+        shutil.rmtree(outside, ignore_errors=True)
+
+
+def test_committed_oci_state() -> None:
+    def write(data: bytes):
+        def mutate(root: Path) -> None:
+            (root / "ciphertexts").mkdir(exist_ok=True)
+            (root / jev.OCI_CIPHERTEXT).write_bytes(data)
+        return mutate
+
+    root = copy_root()
+    try:
+        write(oci_ciphertext())(root)
+        contracts = jev.validate_contracts(root)
+        assert contracts["environments"]["dev.authoring"]["migration_state"] == "NOT_CONFIGURED"
+    finally:
+        shutil.rmtree(root.parent, ignore_errors=True)
+    for mutate in (write(oci_ciphertext((OCI_RECIPIENT, OCI_OTHER))), write(oci_ciphertext(extra="note: plain\n")),
+                   write(oci_ciphertext(key=jev.RENT_KEY))):
+        root = copy_root()
+        try:
+            mutate(root)
+            try:
+                jev.validate_contracts(root)
+            except jev.EnvsError:
+                continue
+            raise AssertionError("an invalid committed OCI ciphertext was accepted")
+        finally:
+            shutil.rmtree(root.parent, ignore_errors=True)
+
+
+def test_author_target_cli() -> None:
+    # A dispatch without a target, or with an undeclared one, stops before any input is read or anything is written.
+    root = copy_root()
+    try:
+        before = snapshot(root)
+        for argv in (["author"], ["author", "--target", "rent-tunnel"], ["author", "--target", ""]):
+            with environment(oci_env()):
+                try:
+                    jev.main(["--root", str(root), *argv])
+                except SystemExit as exc:
+                    assert exc.code == 2, argv
+                else:
+                    raise AssertionError(f"author accepted {argv}")
+        assert snapshot(root) == before
+    finally:
+        shutil.rmtree(root.parent, ignore_errors=True)
+
+
+def run_tool(argv: list[str], env: dict[str, str]) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, shell=False)
+
+
+def real_oci_roundtrip(sops_bin: str, keygen_bin: str) -> None:
+    # The real locked sops encrypts to one throwaway target recipient; only that identity decrypts, tampering is RED.
+    sops_path, keygen = os.path.realpath(sops_bin), os.path.realpath(keygen_bin)
+    for path in (sops_path, keygen):
+        assert path.startswith("/nix/store/") and os.access(path, os.X_OK), f"not a locked store tool: {path}"
+    work = Path(tempfile.mkdtemp(prefix="envs-oci-roundtrip-"))
+    base = {"PATH": os.path.dirname(sops_path), "HOME": str(work)}
+    try:
+        def identity(name: str) -> tuple[Path, str]:
+            key = work / name
+            assert run_tool([keygen, "-o", str(key)], base).returncode == 0, "age-keygen failed"
+            public = run_tool([keygen, "-y", str(key)], base)
+            assert public.returncode == 0, "age-keygen -y failed"
+            return key, public.stdout.decode().strip()
+
+        key, recipient = identity("target.key")
+        other_key, other = identity("other.key")
+        assert jev.AGE_RECIPIENT.fullmatch(recipient) and jev.AGE_RECIPIENT.fullmatch(other) and recipient != other
+        calls: list[list[str]] = []
+
+        def runner(argv, input_data, env):
+            calls.append(list(argv))
+            return jev.default_runner(argv, input_data, env)
+
+        tools = {"sops": sops_path}
+        data = jev.encrypt_oci_key(OCI_KEY, recipient, tools, runner)
+        assert len(calls) == 1 and not any(OCI_KEY in item for item in calls[0])
+        assert OCI_KEY.encode() not in data and b"AGE-SECRET-KEY-1" not in data
+        jev.validate_oci_ciphertext(data, OCI_KEY.encode(), recipient)
+        cipher = work / "dev-jev-api.oci-dev.sops.yaml"
+        cipher.write_bytes(data)
+
+        def decrypt(path: Path, identity_file: Path) -> subprocess.CompletedProcess[bytes]:
+            return run_tool([sops_path, "--decrypt", "--input-type", "yaml", "--output-type", "json", str(path)],
+                            {**base, "SOPS_AGE_KEY_FILE": str(identity_file)})
+
+        opened = decrypt(cipher, key)
+        assert opened.returncode == 0, "the target identity could not decrypt"
+        assert json.loads(opened.stdout) == {"JEV_API_KEY": OCI_KEY}, "roundtrip changed the key"
+        wrong = decrypt(cipher, other_key)
+        assert wrong.returncode != 0 and OCI_KEY.encode() not in wrong.stdout + wrong.stderr, "another identity decrypted"
+        text = data.decode()
+        start = text.index("ENC[AES256_GCM,data:") + len("ENC[AES256_GCM,data:")
+        tampered = work / "tampered.sops.yaml"
+        tampered.write_text(text[:start] + ("A" if text[start] != "A" else "B") + text[start + 1:], encoding="utf-8")
+        broken = decrypt(tampered, key)
+        assert broken.returncode != 0 and OCI_KEY.encode() not in broken.stdout + broken.stderr, "tampered ciphertext decrypted"
+        # A real ciphertext does not pass as another recipient's, nor with its recipient metadata swapped.
+        for candidate, expected in ((data, other), (text.replace(recipient, other).encode(), recipient)):
+            try:
+                jev.validate_oci_ciphertext(candidate, None, expected)
+            except jev.EnvsError:
+                continue
+            raise AssertionError("a ciphertext for another recipient was accepted")
+        before = len(calls)
+        try:
+            jev.encrypt_oci_key(OCI_KEY, f"{recipient},{other}", tools, runner)
+        except jev.EnvsError:
+            pass
+        else:
+            raise AssertionError("two recipients were accepted")
+        assert len(calls) == before, "sops ran for a recipient list"
+        print(f"real OCI SOPS roundtrip: PASS (sops={sops_path}, age-keygen={keygen})")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def active_root() -> Path:
@@ -400,19 +665,36 @@ def test_receipt_mutations() -> None:
 
 
 def main() -> None:
-    jev.validate_contracts(ROOT)
-    state = jev.readiness(ROOT)
-    assert state["physical_dev_projection"] == "NOT_CONFIGURED"
-    assert state["provider_handoff_receipt"] == "ABSENT"
-    assert state["consumer_runtime_readiness"] == "OUT_OF_SCOPE"
-    test_author()
-    test_author_red_inputs()
-    test_project()
-    test_project_red_inputs()
-    test_toolchain_red()
-    test_decrypt_failure_has_no_provider_effect()
-    test_receipt_mutations()
-    shutil.rmtree(STORE, ignore_errors=True)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--sops")
+    parser.add_argument("--age-keygen")
+    args = parser.parse_args()
+    assert (args.sops is None) == (args.age_keygen is None), "--sops and --age-keygen go together"
+    try:
+        jev.validate_contracts(ROOT)
+        state = jev.readiness(ROOT)
+        assert state["physical_dev_projection"] == "NOT_CONFIGURED"
+        assert state["provider_handoff_receipt"] == "ABSENT"
+        assert state["consumer_runtime_readiness"] == "OUT_OF_SCOPE"
+        assert not (ROOT / jev.OCI_CIPHERTEXT).exists(), "no OCI ciphertext may exist before the authorized effect"
+        test_author()
+        test_author_red_inputs()
+        test_author_oci()
+        test_targets_are_separate()
+        test_author_oci_red()
+        test_committed_oci_state()
+        test_author_target_cli()
+        test_project()
+        test_project_red_inputs()
+        test_toolchain_red()
+        test_decrypt_failure_has_no_provider_effect()
+        test_receipt_mutations()
+        if args.sops is None:
+            print("real OCI SOPS roundtrip: NOT RUN (the check workflow runs it with --sops and --age-keygen)")
+        else:
+            real_oci_roundtrip(args.sops, args.age_keygen)
+    finally:
+        shutil.rmtree(STORE, ignore_errors=True)
     print("Jev adapter self-test: PASS")
 
 

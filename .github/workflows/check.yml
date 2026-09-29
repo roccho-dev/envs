@@ -138,6 +138,13 @@ jobs:
           tool="$RUNNER_TEMP/envs-effect/bin"
           "$tool/python3" -I checks/test_rent_tunnel.py --sops "$tool/sops" --age-keygen "$RUNNER_TEMP/check-age/bin/age-keygen"
 
+      # The same locked sops and check-only age prove the OCI dev target's single-recipient Jev ciphertext.
+      - name: Real locked SOPS roundtrip for the OCI dev Jev key
+        run: |
+          set -euo pipefail
+          tool="$RUNNER_TEMP/envs-effect/bin"
+          "$tool/python3" -I checks/test_jev_api.py --sops "$tool/sops" --age-keygen "$RUNNER_TEMP/check-age/bin/age-keygen"
+
       - name: Missing or mismatched toolchain is RED
         run: |
           set -euo pipefail

@@ -46,12 +46,13 @@ THIRD_PARTY_NOTICES.md
 
 ## Environment inputs
 
-`contracts/environments.jsonl` declares each GitHub Environment's `required_secrets` and `required_variables` by name, type, and lifecycle. The actual values live only in the GitHub Environment; the owner sets them there without a commit. Git never stores a value body: before any provider effect the adapter turns a missing or invalid required input RED, and turns RED when a live Variable value appears anywhere in the repository. The only exception is the recipient metadata that sops writes into `ciphertexts/dev-jev-api.sops.yaml` and `ciphertexts/dev-rent-tunnel.sops.yaml`.
+`contracts/environments.jsonl` declares each GitHub Environment's `required_secrets` and `required_variables` by name, type, and lifecycle. The actual values live only in the GitHub Environment; the owner sets them there without a commit. Git never stores a value body: before any provider effect the adapter turns a missing or invalid required input RED, and turns RED when a live Variable value appears anywhere in the repository. The only exception is the recipient metadata that sops writes into `ciphertexts/dev-jev-api.sops.yaml`, `ciphertexts/dev-rent-tunnel.sops.yaml` and `ciphertexts/dev-jev-api.oci-dev.sops.yaml`. A binding may declare its own input on an existing Environment (`jev-api.oci-dev` declares `OCI_DEV_AGE_RECIPIENT` on `dev-authoring`); only that binding's authoring reads it.
 
 | Environment input | Kind | Type | Lifecycle |
 |---|---|---|---|
 | `dev-authoring/JEV_API_KEY` | secret | opaque | one_shot_ingress |
 | `dev-authoring/SOPS_AGE_RECIPIENTS` | variable | age_recipient_list | persistent |
+| `dev-authoring/OCI_DEV_AGE_RECIPIENT` | variable | age_recipient | persistent |
 | `dev-projection/SOPS_AGE_KEY` | secret | age_identity | persistent |
 | `dev-projection/CLOUDFLARE_API_TOKEN` | secret | opaque | persistent |
 | `dev-projection/CLOUDFLARE_ACCOUNT_ID` | variable | cloudflare_account_id | persistent |
@@ -76,7 +77,7 @@ There are no stg or prd authoring Environments.
 ```text
 dev-authoring/SOPS_AGE_RECIPIENTS
 + dev-authoring/JEV_API_KEY
-→ author-dev-jev-api
+→ author-dev-jev-api, target jev-api
 → ciphertext PR
 → merge to exact proposals SHA
 → dev-authoring/JEV_API_KEY may then be deleted by the owner (one-shot ingress);
@@ -90,6 +91,26 @@ ciphertext
 ```
 
 `envs` never deletes an Environment input; deleting the one-shot source is a separate owner effect.
+
+`author-dev-jev-api` requires one declared target; there is no default. Each target has one literal step that receives only its own inputs, and `author --target jev-api` is the unchanged Cloudflare authoring above.
+
+## Dev OCI Jev target (roccho-dev/adrs#460)
+
+The trusted WSLC OCI dev target (owned by `roccho-dev/windows`) starts the apps dev server with `JEV_API_KEY` in one child process. envs owns only the target-bound ciphertext:
+
+```text
+dev-authoring/JEV_API_KEY + dev-authoring/OCI_DEV_AGE_RECIPIENT
+→ author-dev-jev-api, `author --target jev-api.oci-dev` (manual dispatch on proposals only)
+→ ciphertexts/dev-jev-api.oci-dev.sops.yaml, encrypted to exactly that one recipient
+→ ciphertext handoff PR → merge to exact proposals SHA
+```
+
+- The binding `jev-api.oci-dev` keeps capability `jev-api` and declares `OCI_DEV_AGE_RECIPIENT`, a single age recipient; a list is RED. This target never reads `SOPS_AGE_RECIPIENTS`, and the Cloudflare target never reads `OCI_DEV_AGE_RECIPIENT`.
+- OCI authoring writes only its ciphertext. It changes no plane state, no handoff, and no other target's ciphertext; its readiness is only that ciphertext validating at an exact commit (fields exactly `JEV_API_KEY` plus SOPS metadata, exactly one recipient).
+- The key reaches SOPS on stdin only; a key or recipient value already in a tracked file is RED before SOPS runs.
+- `checks/test_jev_api.py` proves the gates with fake sops, and in `check` it runs the real locked sops with check-only `age-keygen` identities: the target identity decrypts, and another identity or a tampered ciphertext is RED.
+
+Not proven here, and not owned by envs: the target's identity, applying the ciphertext on the target, the launcher, application runtime acceptance, and any deployment. Source and CI PASS is not a real authoring PASS.
 
 ## Dev rent tunnel flow (windows #14)
 
@@ -161,7 +182,7 @@ Normal apps/ops execution uses only target-native auth. It does not start or wai
 ```text
 python3 checks/repository.py
 python3 checks/test_repository.py
-python3 checks/test_jev_api.py
+python3 checks/test_jev_api.py                                        # --sops/--age-keygen in check: real OCI roundtrip
 python3 checks/test_rent_tunnel.py
 python3 checks/test_rent_access_probe.py
 nix build .#effect-toolchain .#effect-artifact --no-update-lock-file   # check workflow, toolchain job
