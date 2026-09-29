@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import json
 import os
 import secrets
 import shutil
 import subprocess
+import sys
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -34,20 +36,44 @@ def age_key_file(*identities: str) -> str:
 
 AGE_KEY = age_key_file(AGE_IDENTITY)
 
+# A fixture store stands in for /nix/store; python3 resolves to the interpreter running these tests.
+STORE = Path(tempfile.mkdtemp(prefix="envs-store-"))
+jev.STORE = STORE
+TOOLS: dict[str, str] = {}
+for _name in jev.TOOLCHAIN_TOOLS:
+    _path = STORE / f"{_name}-fixture" / "bin" / _name
+    _path.parent.mkdir(parents=True)
+    if _name == "python3":
+        _path.symlink_to(os.path.realpath(sys.executable))
+    else:
+        _path.write_text("#!/bin/false\n")
+        _path.chmod(0o755)
+    TOOLS[_name] = str(_path)
+
+
+def manifest(name: str, **changes) -> str:
+    value = {"kind": jev.TOOLCHAIN_KIND, "nixpkgs": jev.locked_nixpkgs(ROOT), "tools": dict(TOOLS)}
+    value.update(changes)
+    path = STORE / name
+    path.write_text(json.dumps(value), encoding="utf-8")
+    return str(path)
+
+
+MANIFEST = manifest("toolchain.json")
+
 
 def author_env(**overrides: str) -> dict[str, str]:
-    values = {"JEV_API_KEY": "fixture-secret", "SOPS_AGE_RECIPIENTS": RECIPIENT, "SOPS_BIN": "sops-fixture"}
+    values = {"JEV_API_KEY": "fixture-secret", "SOPS_AGE_RECIPIENTS": RECIPIENT, "ENVS_EFFECT_TOOLCHAIN": MANIFEST}
     values.update(overrides)
     return values
 
 
 def project_env(**overrides: str) -> dict[str, str]:
     values = {
-        "SOPS_BIN": "sops-fixture",
+        "ENVS_EFFECT_TOOLCHAIN": MANIFEST,
         "SOPS_AGE_KEY": AGE_KEY,
         "CLOUDFLARE_ACCOUNT_ID": ACCOUNT_ID,
         "CLOUDFLARE_API_TOKEN": "provider-token-fixture",
-        "NPX_BIN": "npx-fixture",
     }
     values.update(overrides)
     return values
@@ -107,8 +133,9 @@ def test_author() -> None:
         with environment(author_env()):
             result = jev.author(root, runner)
         assert result["status"] == "PASS"
-        assert len(calls) == 1 and calls[0][0][0] == "sops-fixture"
+        assert len(calls) == 1 and calls[0][0][0] == TOOLS["sops"]
         assert calls[0][1]["SOPS_AGE_RECIPIENTS"] == RECIPIENT
+        assert all(Path(item).parent.parent == STORE for item in calls[0][1]["PATH"].split(os.pathsep))
         assert "JEV_API_KEY" not in calls[0][1]
         assert (root / jev.CIPHERTEXT).is_file()
         assert b"fixture-secret" not in (root / jev.CIPHERTEXT).read_bytes()
@@ -173,7 +200,9 @@ def test_project() -> None:
         def runner(argv, input_data, env):
             command = list(argv)
             calls.append((command, input_data))
-            if command[0] == "sops-fixture":
+            assert "--yes" not in command and all(Path(item).parent.parent == STORE
+                                                  for item in env["PATH"].split(os.pathsep))
+            if command[0] == TOOLS["sops"]:
                 return subprocess.CompletedProcess(argv, 0, stdout=b'{"JEV_API_KEY":"fixture-secret"}\n', stderr=b"")
             if "put" in command:
                 assert input_data == b"fixture-secret"
@@ -194,7 +223,7 @@ def test_project() -> None:
                 runner=runner,
             )
         jev.validate_receipt(receipt)
-        assert ["sops-fixture", "npx-fixture", "npx-fixture"] == [call[0][0] for call in calls]
+        assert [TOOLS["sops"], TOOLS["wrangler"], TOOLS["wrangler"]] == [call[0][0] for call in calls]
         assert "account_id" not in receipt["target"]
         assert ACCOUNT_ID.encode() not in (root / jev.HANDOFF).read_bytes()
         assert jev.readiness(root)["provider_handoff_ready"] is True
@@ -244,6 +273,52 @@ def test_project_red_inputs() -> None:
     expect_project_red(project_env(SOPS_AGE_KEY=age_key_file(AGE_IDENTITY + "Q")))
     expect_project_red(project_env(), mutate=lambda root: append(root / "README.md", f"\n{ACCOUNT_ID}\n"))
     expect_project_red(project_env(), mutate=lambda root: append(root / jev.CIPHERTEXT, f"# {ACCOUNT_ID}\n"))
+
+
+def toolchain_red_cases(outside: Path) -> list[tuple[dict[str, str], object]]:
+    outside.write_text(Path(MANIFEST).read_text(encoding="utf-8"), encoding="utf-8")
+    other_python = STORE / "other-python-fixture"
+    other_python.write_text("#!/bin/false\n")
+    other_python.chmod(0o755)
+    lock = {**jev.locked_nixpkgs(ROOT)}
+    lock["narHash"] = "sha256-" + "A" * 43 + "="
+
+    def mismatch_lock(root: Path) -> None:
+        path = root / jev.FLAKE_LOCK
+        path.write_text(path.read_text(encoding="utf-8").replace(jev.locked_nixpkgs(ROOT)["narHash"], lock["narHash"]),
+                        encoding="utf-8")
+
+    return [
+        ({"ENVS_EFFECT_TOOLCHAIN": ""}, None),
+        ({"ENVS_EFFECT_TOOLCHAIN": str(outside)}, None),
+        ({"ENVS_EFFECT_TOOLCHAIN": str(STORE / "absent.json")}, None),
+        ({}, mismatch_lock),
+        ({}, lambda root: (root / jev.FLAKE_LOCK).unlink()),
+        ({"ENVS_EFFECT_TOOLCHAIN": manifest("stale-lock.json", nixpkgs=lock)}, None),
+        ({"ENVS_EFFECT_TOOLCHAIN": manifest("kind.json", kind="envs.effectToolchain.v0")}, None),
+        ({"ENVS_EFFECT_TOOLCHAIN": manifest("missing-tool.json", tools={**TOOLS, "sops": str(STORE / "absent")})}, None),
+        ({"ENVS_EFFECT_TOOLCHAIN": manifest("ambient-tool.json", tools={**TOOLS, "wrangler": "/usr/bin/wrangler"})}, None),
+        ({"ENVS_EFFECT_TOOLCHAIN": manifest("extra-tool.json", tools={**TOOLS, "npx": TOOLS["git"]})}, None),
+        ({"ENVS_EFFECT_TOOLCHAIN": manifest("python.json", tools={**TOOLS, "python3": str(other_python)})}, None),
+    ]
+
+
+def test_toolchain_red() -> None:
+    # Missing or mismatched toolchain must be RED before SOPS or the provider tool runs.
+    outside = Path(tempfile.mkdtemp(prefix="envs-outside-"))
+    try:
+        for values, mutate in toolchain_red_cases(outside / "toolchain.json"):
+            expect_author_red(author_env(**values), mutate=mutate)
+            expect_project_red(project_env(**values), mutate=mutate)
+    finally:
+        shutil.rmtree(outside, ignore_errors=True)
+    assert jev.toolchain(ROOT, {"ENVS_EFFECT_TOOLCHAIN": MANIFEST}) == TOOLS
+    try:
+        jev.toolchain(ROOT, {"ENVS_EFFECT_TOOLCHAIN": MANIFEST}, executable=TOOLS["git"])
+    except jev.EnvsError:
+        pass
+    else:
+        raise AssertionError("ambient interpreter was accepted")
 
 
 def test_decrypt_failure_has_no_provider_effect() -> None:
@@ -332,8 +407,10 @@ def main() -> None:
     test_author_red_inputs()
     test_project()
     test_project_red_inputs()
+    test_toolchain_red()
     test_decrypt_failure_has_no_provider_effect()
     test_receipt_mutations()
+    shutil.rmtree(STORE, ignore_errors=True)
     print("Jev adapter self-test: PASS")
 
 

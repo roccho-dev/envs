@@ -24,6 +24,7 @@ checks     = executable repository and adapter specifications
 
 ```text
 .github/workflows/
+flake.nix, flake.lock
 contracts/
 ciphertexts/       # absent while dev is NOT_CONFIGURED
 adapters/jev_api.py
@@ -82,6 +83,19 @@ ciphertext
 
 `envs` never deletes an Environment input; deleting the one-shot source is a separate owner effect.
 
+## Effect toolchain
+
+`flake.nix` and `flake.lock` define the only toolchain for authoring and projection: Python, SOPS, Wrangler, Git, and GitHub CLI from the locked nixpkgs input, plus the `envs-effect` entry.
+
+```text
+nix build .#effect-toolchain --no-update-lock-file   # before any secret is injected
+envs-effect author | project                         # store paths only; no ambient PATH
+```
+
+The effect workflows realize the closure before the secret-bearing step and then run only its store paths. No Nix, npm, or other package resolution runs after secret injection. The entry carries a manifest of its exact tools and nixpkgs lock; before SOPS or Wrangler starts, the adapter turns RED when that manifest is absent, outside the Nix store, differs from the checked-out `flake.lock`, lacks a tool, or is not running on its own Python. The secret-free `check` workflow reconstructs the same flake output, executes `envs-effect toolchain`, and proves the missing and mismatched cases RED.
+
+This is source and CI evidence only. It does not claim a real authoring or projection effect.
+
 Normal apps/ops execution uses only target-native auth. It does not start or wait for envs, use envctl as a parent, decrypt SOPS, or receive an age identity.
 
 ## Checks
@@ -90,6 +104,7 @@ Normal apps/ops execution uses only target-native auth. It does not start or wai
 python3 checks/repository.py
 python3 checks/test_repository.py
 python3 checks/test_jev_api.py
+nix build .#effect-toolchain --no-update-lock-file   # check workflow, toolchain job
 ```
 
 The repository oracle calculates accepted structure and state. Its tests deliberately create invalid states and require RED rather than repeating only happy-path execution.

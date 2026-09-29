@@ -40,3 +40,44 @@ jobs:
       - name: Verify explicit main compatibility refresh
         if: github.ref_name == 'main'
         run: python3 checks/repository.py --verify-main-compatibility-refresh
+
+  toolchain:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout exact revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
+        with:
+          extra_nix_config: |
+            extra-experimental-features = nix-command flakes
+
+      - name: Reconstruct repo-owned effect toolchain
+        run: nix build .#effect-toolchain --no-update-lock-file --print-build-logs --out-link "$RUNNER_TEMP/envs-effect"
+
+      - name: Execute exact effect entry
+        run: '"$RUNNER_TEMP/envs-effect/bin/envs-effect" toolchain'
+
+      - name: Test Jev adapter on the toolchain interpreter
+        run: '"$RUNNER_TEMP/envs-effect/bin/python3" -I checks/test_jev_api.py'
+
+      - name: Missing or mismatched toolchain is RED
+        run: |
+          set -euo pipefail
+          tool="$RUNNER_TEMP/envs-effect/bin"
+          if "$tool/python3" -I adapters/jev_api.py toolchain; then
+            echo "ambient entry without the toolchain manifest was accepted" >&2
+            exit 1
+          fi
+          copy="$RUNNER_TEMP/mismatched-lock"
+          mkdir "$copy"
+          "$tool/git" archive HEAD | tar -x -C "$copy"
+          "$tool/python3" -I -c 'import json, sys; p = sys.argv[1]; v = json.load(open(p)); v["nodes"]["nixpkgs"]["locked"]["narHash"] = "sha256-" + "A" * 43 + "="; json.dump(v, open(p, "w"))' "$copy/flake.lock"
+          if (cd "$copy" && "$tool/envs-effect" toolchain); then
+            echo "toolchain differing from flake.lock was accepted" >&2
+            exit 1
+          fi

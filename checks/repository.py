@@ -30,6 +30,8 @@ REQUIRED_FILES = {
     "contracts/environments.jsonl",
     "contracts/provider-consumer.jsonl",
     "contracts/targets.jsonl",
+    "flake.lock",
+    "flake.nix",
 }
 ALLOWED_ROOTS = {
     ".github",
@@ -45,6 +47,8 @@ ALLOWED_ROOT_FILES = {
     "LICENSE_POLICY.md",
     "README.md",
     "THIRD_PARTY_NOTICES.md",
+    "flake.lock",
+    "flake.nix",
 }
 FORBIDDEN_ROOTS = {
     "appearance",
@@ -63,7 +67,6 @@ FORBIDDEN_ROOTS = {
 FORBIDDEN_FILENAMES = {
     ".env",
     ".mise.toml",
-    "flake.nix",
     "go.mod",
     "go.sum",
     "id_ed25519",
@@ -87,6 +90,12 @@ EFFECT_WORKFLOWS = {
     "author-dev-jev-api.yml": "dev.authoring",
     "project-dev-jev-api.yml": "dev.projection",
 }
+TOOLCHAIN_BUILD = 'nix build .#effect-toolchain --no-update-lock-file'
+TOOLCHAIN_BIN = '"$RUNNER_TEMP/envs-effect/bin/'
+# Effect jobs may start only Nix (before secrets) and store paths from the repo-owned closure.
+AMBIENT_TOOL = re.compile(r"(?m)(?:^|[\s>|;&(])(?:python3?|git|gh|sops|wrangler|node|npx|npm|pip3?|curl|wget)\s")
+RUNTIME_ACQUISITION = ("npx", "npm ", "pip ", "--yes", "nix shell", "nix run", "nix profile", "github:", "--impure")
+FLAKE_NIXPKGS = re.compile(r'(?m)^\s*inputs\.nixpkgs\.url = "github:NixOS/nixpkgs/([0-9a-f]{40})";$')
 
 
 class RepositoryError(ValueError):
@@ -222,10 +231,21 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]]) -> None
     require("checks/repository.py" in check, "check workflow must execute repository oracle")
     require("checks/test_repository.py" in check, "check workflow must test repository oracle")
     require("checks/test_jev_api.py" in check, "check workflow must test Jev adapter")
+    require(TOOLCHAIN_BUILD in check, "check workflow must reconstruct the effect toolchain")
+    require(f'{TOOLCHAIN_BIN}envs-effect" toolchain' in check, "check workflow must execute the effect entry")
+    require(f'{TOOLCHAIN_BIN}python3" -I checks/test_jev_api.py' in check,
+            "check workflow must test the adapter on the toolchain interpreter")
 
     for name, plane in EFFECT_WORKFLOWS.items():
         text = texts[name]
         row = environments[plane]
+        for token in RUNTIME_ACQUISITION:
+            require(token not in text, f"{name}: runtime acquisition {token.strip()}")
+        require(AMBIENT_TOOL.search(text) is None, f"{name}: ambient tool on the effect path")
+        build = text.find(TOOLCHAIN_BUILD)
+        require(build != -1, f"{name}: repo-owned toolchain is not realized")
+        require(build < text.find("${{ secrets."), f"{name}: toolchain must be realized before secrets")
+        require(text.count("nix ") == 1, f"{name}: Nix may run only to realize the toolchain")
         require("workflow_dispatch:" in text, f"{name}: manual dispatch missing")
         require("\n  push:" not in text and "\n  pull_request:" not in text, f"{name}: automatic effect trigger")
         require(f"environment: {row['github_environment']}" in text, f"{name}: static Environment differs")
@@ -239,8 +259,21 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]]) -> None
             mapping = "^\\s+" + re.escape(f"{input_name}: ${{{{ {namespace}.{input_name} }}}}") + "$"
             require(re.search(mapping, text, re.MULTILINE) is not None, f"{name}: {input_name} mapping differs")
 
-    require("adapters/jev_api.py author" in texts["author-dev-jev-api.yml"], "author workflow adapter call missing")
-    require("adapters/jev_api.py project" in texts["project-dev-jev-api.yml"], "project workflow adapter call missing")
+    require(f'{TOOLCHAIN_BIN}envs-effect" author' in texts["author-dev-jev-api.yml"], "author workflow entry call missing")
+    require(f'{TOOLCHAIN_BIN}envs-effect" project' in texts["project-dev-jev-api.yml"], "project workflow entry call missing")
+
+
+def check_toolchain(root: Path, adapter) -> None:
+    flake = (root / "flake.nix").read_text(encoding="utf-8")
+    pinned = FLAKE_NIXPKGS.findall(flake)
+    require(len(pinned) == 1 and "inputs." not in FLAKE_NIXPKGS.sub("", flake), "flake must have exactly one pinned nixpkgs input")
+    require(adapter.locked_nixpkgs(root)["rev"] == pinned[0], "flake.lock differs from flake.nix")
+    for tool in adapter.TOOLCHAIN_TOOLS:
+        require(f'{tool} = "${{pkgs.' in flake, f"flake does not provide {tool}")
+    require('exec ${tools.python3} -I adapters/jev_api.py "$@"' in flake, "flake entry must run only the adapter")
+    source = (root / "adapters/jev_api.py").read_text(encoding="utf-8")
+    for token in ("npx", "--yes", "SOPS_BIN", "NPX_BIN", "WRANGLER_PACKAGE"):
+        require(token not in source, f"adapter selects an ambient or runtime tool: {token}")
 
 
 def check_readme(root: Path, environments: dict[str, dict[str, Any]]) -> None:
@@ -289,6 +322,7 @@ def inspect(root: Path = ROOT, *, verify_main_compatibility_refresh: bool = Fals
     if (root / adapter.HANDOFF).is_file():
         adapter.load_receipt(root / adapter.HANDOFF)
     check_workflows(root, environments)
+    check_toolchain(root, adapter)
     check_readme(root, environments)
     if verify_main_compatibility_refresh:
         check_main_compatibility_refresh(root)

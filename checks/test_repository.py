@@ -119,8 +119,32 @@ def main() -> None:
                             f"{obsolete_source}: ${{{{ secrets.{obsolete_source} }}}}"))
     expect_red(replace_text(author, "JEV_API_KEY: ${{ secrets.JEV_API_KEY }}", "JEV_API_KEY: fixture-literal"))
     expect_red(replace_text(author, "SOPS_AGE_RECIPIENTS: ${{ vars", "AGE_RECIPIENTS: ${{ vars"))
-    expect_red(replace_text(project, "          WRANGLER_PACKAGE:",
-                            "          EXTRA: ${{ secrets.EXTRA }}\n          WRANGLER_PACKAGE:"))
+    expect_red(replace_text(project, "          CLOUDFLARE_ACCOUNT_ID:",
+                            "          EXTRA: ${{ secrets.EXTRA }}\n          CLOUDFLARE_ACCOUNT_ID:"))
+
+    # The effect entry must stay repo-owned: no ambient tool, runtime acquisition, or unlocked closure.
+    entry = '"$RUNNER_TEMP/envs-effect/bin/envs-effect"'
+    build = "nix build .#effect-toolchain --no-update-lock-file"
+    expect_red(replace_text(author, f"{entry} author", "python3 adapters/jev_api.py author"))
+    expect_red(replace_text(project, f"{entry} project", "nix shell .#effect-toolchain -c envs-effect project"))
+    expect_red(replace_text(project, f"{entry} project", f"npx --yes wrangler@4 && {entry} project"))
+    expect_red(replace_text(author, '"$tool/gh" pr create', "gh pr create"))
+    expect_red(replace_text(author, '"$tool/git" push', "git push"))
+    expect_red(replace_text(project, build, "nix build github:NixOS/nixpkgs#sops"))
+    expect_red(replace_text(project, " --no-update-lock-file", ""))
+    expect_red(lambda root: (root / "flake.lock").unlink())
+    expect_red(replace_text("flake.lock", '"rev": "', '"rev": "0'))
+    expect_red(replace_text("flake.nix", "wrangler = \"${pkgs.wrangler}", "wrangler = \"/usr/bin/wrangler"))
+    expect_red(replace_text("adapters/jev_api.py", 'wrangler = tools["wrangler"]', 'wrangler = "npx"'))
+    expect_red(replace_text(".github/workflows/check.yml", build, "nix flake show"))
+
+    def move_build_after_secrets(root: Path) -> None:
+        path = root / author
+        text = path.read_text(encoding="utf-8")
+        step = next(block for block in text.split("\n\n") if build in block)
+        path.write_text(text.replace(step + "\n\n", "") + "\n" + step + "\n", encoding="utf-8")
+
+    expect_red(move_build_after_secrets)
     expect_red(replace_text("README.md", "dev-projection/SOPS_AGE_KEY", "dev-projection/REMOVED"))
     expect_red(replace_text("README.md", "prd-projection/CLOUDFLARE_ACCOUNT_ID", "prd-projection/REMOVED"))
     print("repository checker self-test: PASS")
