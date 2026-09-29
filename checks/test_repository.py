@@ -194,6 +194,41 @@ def main() -> None:
     expect_red(replace_text(check, "for case in lock adapter; do", "for case in lock; do"))
     expect_red(replace_text("flake.nix", "closureInfo { rootPaths = [ effect-toolchain ]; }", "closureInfo { rootPaths = [ ]; }"))
     expect_red(replace_text("flake.nix", "-I ${self}/adapters/jev_api.py", "-I adapters/jev_api.py"))
+
+    # The artifact is built from, named after, and resolved by the exact commit, repository, and push producer.
+    source_ref = "          ref: ${{ github.event.pull_request.head.sha || github.sha }}\n"
+    expect_red(replace_text(check, source_ref, ""))
+    expect_red(replace_text(check, '          test "$(git rev-parse HEAD)" = "$ENVS_SOURCE_SHA"\n', ""))
+    expect_red(replace_text(check, "name: envs-effect-${{ env.ENVS_SOURCE_SHA }}",
+                            "name: envs-effect-${{ github.sha }}"))
+    expect_red(replace_text(check, "cancel-in-progress: ${{ github.event_name == 'pull_request' }}", "cancel-in-progress: true"))
+    expect_red(replace_text("flake.nix", "        echo ${rev} > SOURCE\n", ""))
+
+    def weaken_consumer(old: str, new: str):
+        def mutate(root: Path) -> None:
+            for relative in (check, author, project):
+                replace_text(relative, old, new)(root)
+
+        return mutate
+
+    expect_red(weaken_consumer('          test "$(tar -xOf "$art/content/envs-effect.tar" SOURCE)" = "$ENVS_SOURCE_SHA"\n', ""))
+    expect_red(weaken_consumer('(.event == "push" and .conclusion == "success")', '.conclusion == "success"'))
+    expect_red(weaken_consumer(" and .head_repository.full_name == $repo", ""))
+    expect_red(replace_text(check, "            '.head_repository.full_name = \"fork/envs\"' \\\n", ""))
+    expect_red(replace_text(check, "artifact built from another commit was accepted", "accepted"))
+
+    # effect-shape runs the provided artifact over a same-commit data checkout, exactly as effect jobs do.
+    expect_red(replace_text(check, '"$ENVS_EFFECT_BIN/envs-effect" --root "$GITHUB_WORKSPACE" toolchain | tee',
+                            '"$ENVS_EFFECT_BIN/envs-effect" toolchain | tee'))
+    expect_red(replace_text(check, ".source == $sha and .root == $root", ".status == \"PASS\""))
+
+    # Effect jobs accept only declared step env; nothing but the consumer may alter the step environment.
+    expect_red(replace_text(author, "          SOPS_AGE_RECIPIENTS: ${{ vars.SOPS_AGE_RECIPIENTS }}\n",
+                            "          SOPS_AGE_RECIPIENTS: ${{ vars.SOPS_AGE_RECIPIENTS }}\n          BASH_ENV: /tmp/hook\n"))
+    expect_red(replace_text(project, "    environment: dev-projection\n",
+                            "    environment: dev-projection\n    env:\n      LD_PRELOAD: /tmp/hook.so\n"))
+    expect_red(replace_text(project, '          tool="$ENVS_EFFECT_BIN"\n',
+                            '          tool="$ENVS_EFFECT_BIN"\n          "$tool/git" config core.hooksPath >>"$GITHUB_PATH"\n'))
     expect_red(replace_text("README.md", "dev-projection/SOPS_AGE_KEY", "dev-projection/REMOVED"))
     expect_red(replace_text("README.md", "prd-projection/CLOUDFLARE_ACCOUNT_ID", "prd-projection/REMOVED"))
     print("repository checker self-test: PASS")

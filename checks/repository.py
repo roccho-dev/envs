@@ -92,7 +92,17 @@ EFFECT_WORKFLOWS = {
 }
 TOOLCHAIN_BUILD = 'nix build .#effect-toolchain --no-update-lock-file'
 ARTIFACT_BUILD = 'nix build .#effect-artifact --no-update-lock-file'
-ARTIFACT_NAME = "name: envs-effect-${{ github.event.pull_request.head.sha || github.sha }}"
+SOURCE_SHA = "${{ github.event.pull_request.head.sha || github.sha }}"
+ARTIFACT_NAME = "name: envs-effect-${{ env.ENVS_SOURCE_SHA }}"
+# The consumer binds the named commit to the producing run and to the artifact's own SOURCE.
+CONSUMER_BINDING = (
+    '.head_sha == $sha',
+    '.repository.full_name == $repo and .head_repository.full_name == $repo',
+    '((.id | tostring) == $current or (.event == "push" and .conclusion == "success"))',
+    'test "$(tar -xOf "$art/content/envs-effect.tar" SOURCE)" = "$ENVS_SOURCE_SHA"',
+)
+EFFECT_ENV = re.compile(r"(?m)^ {10}([A-Za-z_][A-Za-z0-9_-]*):")
+EFFECT_STEP_KEYS = {"ref", "fetch-depth", "GH_TOKEN", "ENVS_SOURCE_SHA"}
 TOOLCHAIN_BIN = '"$RUNNER_TEMP/envs-effect/bin/'
 # The one step that obtains the provided artifact; check's clean-start job holds the canonical text.
 CONSUMER_STEP = "- name: Obtain provided effect artifact\n"
@@ -304,19 +314,62 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]]) -> None
             "check workflow must execute the Wrangler argv shape")
     require(ARTIFACT_BUILD in check and ARTIFACT_NAME in check and "actions/upload-artifact@" in check,
             "check workflow must provide the effect artifact")
-    clean_start = check[check.find("\n  clean-start:\n"):] if "\n  clean-start:\n" in check else ""
+    require("cancel-in-progress: ${{ github.event_name == 'pull_request' }}" in check,
+            "check must not cancel the proposals run that provides an artifact")
+
+    def job(name: str, following: str | None) -> str:
+        start = check.find(f"\n  {name}:\n")
+        require(start != -1, f"check workflow job missing: {name}")
+        end = check.find(f"\n  {following}:\n", start) if following else -1
+        return check[start:] if end == -1 else check[start:end]
+
+    toolchain = job("toolchain", "effect-shape")
+    for marker in (
+        f"      ENVS_SOURCE_SHA: {SOURCE_SHA}\n",
+        f"          ref: {SOURCE_SHA}\n",
+        'test "$(git rev-parse HEAD)" = "$ENVS_SOURCE_SHA"',
+        'test "$(tar -xOf "$RUNNER_TEMP/provide/envs-effect.tar" SOURCE)" = "$ENVS_SOURCE_SHA"',
+    ):
+        require(marker in toolchain, f"artifact must be built from and bound to the named commit: {marker.strip()}")
+    effect_shape = job("effect-shape", "clean-start")
+    clean_start = job("clean-start", None)
     require("    needs: toolchain\n" in clean_start, "check workflow must clean-start from the provided artifact")
     for token in ("actions/checkout", "nix ", "install-nix"):
         require(token not in clean_start, f"clean-start must not use {token.strip()}")
     canonical = consumer_run(clean_start, "check.yml clean-start")
     require(clean_start.count(canonical) == 2, "clean-start must run the canonical consumer and its missing case")
+    for marker in CONSUMER_BINDING:
+        require(marker in canonical, f"consumer must bind the named commit: {marker}")
+    program = next(line.strip() for line in canonical.splitlines() if line.strip().startswith("'.path =="))
+    source_check = CONSUMER_BINDING[-1]
+    require(clean_start.count(program) == 3 and clean_start.count(source_check) == 3,
+            "clean-start must run the canonical producer and SOURCE checks against mismatches")
     for marker in (
         'test "$MISSING" = failure',
         'if echo "${ENVS_EFFECT_DIGEST#sha256:}  $altered" | sha256sum -c -; then',
         "for case in lock adapter; do",
         '"$ENVS_EFFECT_BIN/envs-effect" --root "$copy" toolchain',
+        "for change in . \\\n",
+        "'.head_sha = \"0000000000000000000000000000000000000000\"'",
+        "'.id = 1 | .event = \"pull_request\"'",
+        "'.repository.full_name = \"fork/envs\"'",
+        "'.head_repository.full_name = \"fork/envs\"'",
+        'test "$accepted" = "$expected"',
+        "artifact built from another commit was accepted",
     ):
         require(marker in clean_start, f"clean-start destructive case missing: {marker}")
+
+    require(consumer_run(effect_shape, "check.yml effect-shape") == canonical, "effect-shape must run the canonical consumer")
+    for token in ("nix ", "install-nix"):
+        require(token not in effect_shape, f"effect-shape must not use {token.strip()}")
+    for marker in (
+        f"          ref: {SOURCE_SHA}\n",
+        'test "$("$ENVS_EFFECT_BIN/git" -C "$GITHUB_WORKSPACE" rev-parse HEAD)" = "$ENVS_SOURCE_SHA"',
+        f"{TOOLCHAIN_IDENTITY} | tee",
+        ".status == \"PASS\" and .source == $sha and .root == $root",
+        f"{EFFECT_ENTRY} check",
+    ):
+        require(marker in effect_shape, f"effect-shape must run the effect data-root shape: {marker.strip()}")
 
     for name, plane in EFFECT_WORKFLOWS.items():
         text = texts[name]
@@ -327,6 +380,11 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]]) -> None
         require("          ENVS_SOURCE_SHA: ${{ github.sha }}\n" in text, f"{name}: artifact must resolve by the dispatched SHA")
         rest = text.replace(canonical, "")
         require(AMBIENT_TOOL.search(rest) is None, f"{name}: ambient tool on the effect path")
+        require(re.search(r"(?m)^ {0,4}env:", text) is None, f"{name}: workflow or job env is forbidden")
+        keys = set(EFFECT_ENV.findall(rest))
+        allowed = EFFECT_STEP_KEYS | {input_name for _, input_name in declared_inputs(row)}
+        require(keys <= allowed, f"{name}: step env or input not allowed: {sorted(keys - allowed)}")
+        require("GITHUB_ENV" not in rest and "GITHUB_PATH" not in rest, f"{name}: only the consumer may set step environment")
         consume = text.find(CONSUMER_STEP)
         identity = text.find(TOOLCHAIN_IDENTITY)
         require(-1 < consume < identity < text.find("${{ secrets."),
@@ -363,6 +421,8 @@ def check_toolchain(root: Path, adapter) -> None:
     require('exec ${tools.python3} -I ${self}/adapters/jev_api.py "$@"' in flake, "flake entry must run only the adapter")
     require("closureInfo { rootPaths = [ effect-toolchain ]; }" in flake and "echo ${effect-toolchain}/bin/envs-effect > ENTRY" in flake,
             "flake artifact must carry the whole entry closure and its ENTRY")
+    require('rev = self.rev or (throw "' in flake and "echo ${rev} > SOURCE" in flake and "ENTRY SOURCE $(cat" in flake
+            and "source = rev;" in flake, "flake artifact must record the exact committed source it was built from")
     source = (root / "adapters/jev_api.py").read_text(encoding="utf-8")
     for token in ("npx", "--yes", "SOPS_BIN", "NPX_BIN", "WRANGLER_PACKAGE"):
         require(token not in source, f"adapter selects an ambient or runtime tool: {token}")

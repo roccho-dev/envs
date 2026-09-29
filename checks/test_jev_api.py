@@ -52,7 +52,7 @@ for _name in jev.TOOLCHAIN_TOOLS:
 
 
 def manifest(name: str, **changes) -> str:
-    value = {"kind": jev.TOOLCHAIN_KIND, "nixpkgs": jev.locked_nixpkgs(ROOT), "tools": dict(TOOLS)}
+    value = {"kind": jev.TOOLCHAIN_KIND, "nixpkgs": jev.locked_nixpkgs(ROOT), "source": "a" * 40, "tools": dict(TOOLS)}
     value.update(changes)
     path = STORE / name
     path.write_text(json.dumps(value), encoding="utf-8")
@@ -297,6 +297,7 @@ def toolchain_red_cases(outside: Path) -> list[tuple[dict[str, str], object]]:
         ({}, lambda root: append(root / "adapters/jev_api.py", "\n# checkout differs from the artifact\n")),
         ({"ENVS_EFFECT_TOOLCHAIN": manifest("stale-lock.json", nixpkgs=lock)}, None),
         ({"ENVS_EFFECT_TOOLCHAIN": manifest("kind.json", kind="envs.effectToolchain.v0")}, None),
+        ({"ENVS_EFFECT_TOOLCHAIN": manifest("dirty-source.json", source="dirty")}, None),
         ({"ENVS_EFFECT_TOOLCHAIN": manifest("missing-tool.json", tools={**TOOLS, "sops": str(STORE / "absent")})}, None),
         ({"ENVS_EFFECT_TOOLCHAIN": manifest("ambient-tool.json", tools={**TOOLS, "wrangler": "/usr/bin/wrangler"})}, None),
         ({"ENVS_EFFECT_TOOLCHAIN": manifest("extra-tool.json", tools={**TOOLS, "npx": TOOLS["git"]})}, None),

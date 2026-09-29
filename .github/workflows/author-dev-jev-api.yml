@@ -43,13 +43,14 @@ jobs:
           digest="$(jq -r '.digest' "$art/artifact.json")"
           run_id="$(jq -r '.workflow_run.id' "$art/artifact.json")"
           curl -fsSL -H "$auth" -o "$art/run.json" "$api/runs/$run_id"
-          jq -e --arg sha "$ENVS_SOURCE_SHA" --arg branch "${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}" --arg current "$GITHUB_RUN_ID" \
-            '.path == ".github/workflows/check.yml" and .head_sha == $sha and .head_branch == $branch and (.conclusion == "success" or (.id | tostring) == $current)' \
+          jq -e --arg sha "$ENVS_SOURCE_SHA" --arg branch "${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}" --arg repo "$GITHUB_REPOSITORY" --arg current "$GITHUB_RUN_ID" \
+            '.path == ".github/workflows/check.yml" and .head_sha == $sha and .head_branch == $branch and .repository.full_name == $repo and .head_repository.full_name == $repo and ((.id | tostring) == $current or (.event == "push" and .conclusion == "success"))' \
             "$art/run.json" >/dev/null
           curl -fsSL -H "$auth" -o "$art/envs-effect.zip" "$api/artifacts/$id/zip"
           echo "${digest#sha256:}  $art/envs-effect.zip" | sha256sum -c -
           unzip -q "$art/envs-effect.zip" -d "$art/content"
           test "$(ls -A "$art/content")" = envs-effect.tar
+          test "$(tar -xOf "$art/content/envs-effect.tar" SOURCE)" = "$ENVS_SOURCE_SHA"
           entry="$(tar -xOf "$art/content/envs-effect.tar" ENTRY)"
           [[ "$entry" =~ ^/nix/store/[0-9a-z]{32}-envs-effect-toolchain/bin/envs-effect$ ]]
           sudo mkdir -p /nix/store

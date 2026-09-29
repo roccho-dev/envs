@@ -8,6 +8,8 @@
       system = "x86_64-linux";
       pkgs = nixpkgs.legacyPackages.${system};
       packages = with pkgs; [ python3 sops wrangler git gh ];
+      # The exact committed source this artifact is built from; a dirty tree cannot produce one.
+      rev = self.rev or (throw "envs effect artifact requires a clean committed source");
 
       # The adapter compares this manifest with flake.lock and uses only these absolute tools.
       tools = {
@@ -20,6 +22,7 @@
       manifest = pkgs.writeText "envs-effect-toolchain.json" (builtins.toJSON {
         kind = "envs.effectToolchain.v1";
         nixpkgs = { inherit (nixpkgs) rev narHash; };
+        source = rev;
         inherit tools;
       });
 
@@ -36,13 +39,14 @@
         paths = [ entry ] ++ packages;
       };
 
-      # Provided artifact: the complete store closure plus ENTRY, deterministic so CI can hand it off by digest.
+      # Provided artifact: the complete store closure plus ENTRY and SOURCE, deterministic so CI can hand it off by digest.
       effect-artifact = pkgs.runCommand "envs-effect.tar" {
         closure = pkgs.closureInfo { rootPaths = [ effect-toolchain ]; };
       } ''
         echo ${effect-toolchain}/bin/envs-effect > ENTRY
+        echo ${rev} > SOURCE
         tar --create --file "$out" --sort=name --mtime=@1 --owner=0 --group=0 --numeric-owner \
-          ENTRY $(cat "$closure/store-paths")
+          ENTRY SOURCE $(cat "$closure/store-paths")
       '';
     in
     {

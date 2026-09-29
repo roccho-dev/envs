@@ -346,8 +346,10 @@ def toolchain(root: Path, environ: Mapping[str, str] | None = None, executable: 
         value = json.loads(Path(manifest).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise EnvsError("repo-owned effect toolchain manifest is unreadable") from exc
-    require(isinstance(value, dict) and set(value) == {"kind", "nixpkgs", "tools"}
+    require(isinstance(value, dict) and set(value) == {"kind", "nixpkgs", "source", "tools"}
             and value["kind"] == TOOLCHAIN_KIND, "effect toolchain manifest differs")
+    require(isinstance(value["source"], str) and SHA40.fullmatch(value["source"]) is not None,
+            "effect toolchain source is not an exact commit")
     require(value["nixpkgs"] == locked_nixpkgs(root), "effect toolchain differs from flake.lock")
     try:
         same_adapter = (root / "adapters/jev_api.py").read_bytes() == Path(__file__).read_bytes()
@@ -571,6 +573,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps({
                 "kind": "envs.effectToolchainCheck.v1", "status": "PASS", "root": str(root),
                 "manifest": os.environ["ENVS_EFFECT_TOOLCHAIN"], "nixpkgs": locked_nixpkgs(root), "tools": tools,
+                "source": json.loads(Path(os.environ["ENVS_EFFECT_TOOLCHAIN"]).read_text(encoding="utf-8"))["source"],
             }, indent=2, sort_keys=True))
         elif args.command == "author":
             print(json.dumps(author(root), indent=2, sort_keys=True))
