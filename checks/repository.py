@@ -109,11 +109,17 @@ PROBE_TOOL_CHECKS = (
     '"$tool/tofu" -chdir="$probe" validate -no-color',
     '"$tool/python3" -I checks/test_rent_access_probe.py --real-ssh "$tool"',
 )
-CIPHERTEXTS = {"ciphertexts/dev-jev-api.sops.yaml", "ciphertexts/dev-rent-tunnel.sops.yaml"}
+CIPHERTEXTS = {
+    "ciphertexts/dev-jev-api.sops.yaml", "ciphertexts/dev-rent-tunnel.sops.yaml", "ciphertexts/dev-jev-api.oci-dev.sops.yaml",
+}
 # The real SOPS roundtrip runs the locked sops with a check-only age that never enters the effect toolchain.
 CHECK_AGE_BUILD = 'nix build .#check-age --no-update-lock-file --out-link "$RUNNER_TEMP/check-age"'
 REAL_ROUNDTRIP = ('"$tool/python3" -I checks/test_rent_tunnel.py --sops "$tool/sops"'
                   ' --age-keygen "$RUNNER_TEMP/check-age/bin/age-keygen"')
+OCI_ROUNDTRIP = ('"$tool/python3" -I checks/test_jev_api.py --sops "$tool/sops"'
+                 ' --age-keygen "$RUNNER_TEMP/check-age/bin/age-keygen"')
+# The author dispatch names one declared binding; each has exactly one literal step carrying only its own inputs.
+AUTHOR_STEP = re.compile(r"(?ms)^      - name: [^\n]+\n        if: inputs\.target == '([a-z.-]+)'\n(.*?)(?=^      - name: |\Z)")
 EFFECT_PACKAGES = "packages = with pkgs; [ python3 sops wrangler git gh openssh ] ++ [ cloudflared opentofu ];"
 PROBE_PINS = (
     'cloudflared = assert pkgs.cloudflared.version == "2026.6.1"; pkgs.cloudflared;',
@@ -289,6 +295,16 @@ def declared_inputs(row: dict[str, Any]) -> set[tuple[str, str]]:
     }
 
 
+def author_target_inputs(adapter, contracts: dict[str, dict[str, dict[str, Any]]]) -> dict[str, set[tuple[str, str]]]:
+    # Each author target's Environment inputs as the adapter reads them, in (namespace, name) form.
+    secrets = {item["name"] for item in contracts["environments"]["dev.authoring"]["required_secrets"]}
+    return {
+        target: {("secrets" if item["name"] in secrets else "vars", item["name"])
+                 for item in adapter.authoring_inputs(contracts, target)}
+        for target in adapter.AUTHOR_TARGETS
+    }
+
+
 def run_commands(text: str) -> list[str]:
     lines = text.splitlines()
     commands: list[str] = []
@@ -333,7 +349,23 @@ def consumer_run(text: str, name: str) -> str:
     return text[body:] if end == -1 else text[body:end + 1]
 
 
-def check_workflows(root: Path, environments: dict[str, dict[str, Any]]) -> None:
+def check_author_targets(text: str, targets: dict[str, set[tuple[str, str]]]) -> None:
+    options = "".join(f"          - {target}\n" for target in targets)
+    require("    inputs:\n      target:\n" in text
+            and "        required: true\n        type: choice\n        options:\n" + options in text,
+            "author target choice differs from the authorable bindings")
+    steps = AUTHOR_STEP.findall(text)
+    require([target for target, _ in steps] == list(targets), "author must have exactly one step per binding")
+    for target, body in steps:
+        require(f"        run: '{EFFECT_ENTRY} author --target {target}'\n" in body and body.count(" author ") == 1,
+                f"author step for {target} must run exactly its literal target")
+        require(set(INPUT_REFERENCE.findall(body)) == targets[target], f"author step for {target} maps other inputs")
+    require(text.count(" author --target ") == len(targets) and text.count("inputs.target") == len(targets),
+            "author target is selected or called outside its step")
+
+
+def check_workflows(root: Path, environments: dict[str, dict[str, Any]],
+                    author_targets: dict[str, set[tuple[str, str]]]) -> None:
     workflow_root = root / ".github/workflows"
     names = {path.name for path in workflow_root.iterdir() if path.is_file()}
     require(
@@ -390,6 +422,7 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]]) -> None
     for marker in (
         CHECK_AGE_BUILD,
         REAL_ROUNDTRIP,
+        OCI_ROUNDTRIP,
         'grep -qxF "$sops" "$RUNNER_TEMP/provided.list"',
         'if grep -qxF "$age" "$RUNNER_TEMP/provided.list"; then',
     ):
@@ -398,6 +431,8 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]]) -> None
         require(marker in toolchain, f"check must prove the probe tools from the closure: {marker}")
     require(toolchain.find(REAL_ROUNDTRIP) < toolchain.find('if grep -qxF "$age"') and toolchain.find(ARTIFACT_BUILD)
             < toolchain.find('if grep -qxF "$age"'), "check-only age must be proven outside the built artifact")
+    require(toolchain.find(CHECK_AGE_BUILD) < toolchain.find(OCI_ROUNDTRIP) < toolchain.find('if grep -qxF "$age"'),
+            "the OCI dev roundtrip must use the check-only age built before it")
     effect_shape = job("effect-shape", "clean-start")
     clean_start = job("clean-start", None)
     require("    needs: toolchain\n" in clean_start, "check workflow must clean-start from the provided artifact")
@@ -448,8 +483,10 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]]) -> None
         rest = text.replace(canonical, "")
         require(AMBIENT_TOOL.search(rest) is None, f"{name}: ambient tool on the effect path")
         require(re.search(r"(?m)^ {0,4}env:", text) is None, f"{name}: workflow or job env is forbidden")
+        # The author Environment also carries each binding's declared inputs; its steps prove which one reads which.
+        declared = set().union(*author_targets.values()) if name == "author-dev-jev-api.yml" else declared_inputs(row)
         keys = set(EFFECT_ENV.findall(rest))
-        allowed = EFFECT_STEP_KEYS | {input_name for _, input_name in declared_inputs(row)}
+        allowed = EFFECT_STEP_KEYS | {input_name for _, input_name in declared}
         require(keys <= allowed, f"{name}: step env or input not allowed: {sorted(keys - allowed)}")
         require("GITHUB_ENV" not in rest and "GITHUB_PATH" not in rest, f"{name}: only the consumer may set step environment")
         consume = text.find(CONSUMER_STEP)
@@ -468,13 +505,13 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]]) -> None
         require("github.ref_name == 'proposals'" in text, f"{name}: canonical ref guard missing")
         require("ref: ${{ github.sha }}" in text, f"{name}: exact checkout missing")
         require("main" not in text, f"{name}: main must not be an effect source")
-        declared = declared_inputs(row)
         require(set(INPUT_REFERENCE.findall(text)) == declared, f"{name}: Environment inputs differ from contract")
         for namespace, input_name in sorted(declared):
             mapping = "^\\s+" + re.escape(f"{input_name}: ${{{{ {namespace}.{input_name} }}}}") + "$"
             require(re.search(mapping, text, re.MULTILINE) is not None, f"{name}: {input_name} mapping differs")
 
     require(f"{EFFECT_ENTRY} author" in texts["author-dev-jev-api.yml"], "author workflow entry call missing")
+    check_author_targets(texts["author-dev-jev-api.yml"], author_targets)
     require(f"{EFFECT_ENTRY} project" in texts["project-dev-jev-api.yml"], "project workflow entry call missing")
     rent = texts["project-dev-rent-tunnel.yml"]
     require(f"run: '{EFFECT_ENTRY} rent-tunnel'" in rent, "rent tunnel workflow entry call missing")
@@ -529,6 +566,9 @@ def check_readme(root: Path, environments: dict[str, dict[str, Any]]) -> None:
         PROBE_CONFIG,
         "checks/test_rent_access_probe.py",
         "name lookup locates candidates and never proves ownership",
+        "dev-authoring/OCI_DEV_AGE_RECIPIENT",
+        "ciphertexts/dev-jev-api.oci-dev.sops.yaml",
+        "`author --target jev-api.oci-dev`",
     ):
         require(marker in text, f"README missing {marker}")
     require("delete `main`" not in text.lower(), "README proposes deleting main")
@@ -559,10 +599,11 @@ def inspect(root: Path = ROOT, *, verify_main_compatibility_refresh: bool = Fals
     check_text(root)
     check_jsonl(root)
     adapter = load_adapter(root)
-    environments = adapter.validate_contracts(root)["environments"]
+    contracts = adapter.validate_contracts(root)
+    environments = contracts["environments"]
     if (root / adapter.HANDOFF).is_file():
         adapter.load_receipt(root / adapter.HANDOFF)
-    check_workflows(root, environments)
+    check_workflows(root, environments, author_target_inputs(adapter, contracts))
     check_toolchain(root, adapter)
     check_readme(root, environments)
     if verify_main_compatibility_refresh:

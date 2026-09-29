@@ -51,6 +51,13 @@ PROBE_ADDRESSES = tuple(f"cloudflare_{kind}.probe[0]" for kind in (
     "zero_trust_tunnel_cloudflared", "zero_trust_tunnel_cloudflared_config", "dns_record",
     "zero_trust_access_service_token", "zero_trust_access_policy", "zero_trust_access_application"))
 PROBE_CREDENTIALS = ("tunnel_token", "service_token_id", "service_token_value")
+# WSLC OCI dev target (roccho-dev/adrs#460): the same one-shot Jev source, encrypted to exactly one target recipient.
+# It has no plane state and no handoff; the validated ciphertext at an exact commit is its whole readiness.
+OCI_BINDING = "jev-api.oci-dev"
+OCI_CIPHERTEXT = Path("ciphertexts/dev-jev-api.oci-dev.sops.yaml")
+OCI_RECIPIENT = "OCI_DEV_AGE_RECIPIENT"
+# Every binding `author --target` can select; a dispatch names exactly one of them.
+AUTHOR_TARGETS = ("jev-api", OCI_BINDING)
 
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -152,6 +159,16 @@ def expected_bindings() -> dict[str, dict[str, Any]]:
             "source": {"provider": "cloudflare", "operation": "cfd_tunnel_token"},
             "target": {"repository": "roccho-dev/windows", "host": "rent", "kind": "cloudflared_token_file"},
         },
+        OCI_BINDING: {
+            "id": OCI_BINDING,
+            "kind": "envs.authCapability.v1",
+            "capability": "jev-api",
+            "ciphertext": OCI_CIPHERTEXT.as_posix(),
+            "source_key": "JEV_API_KEY",
+            "github_environment": "dev-authoring",
+            "required_variables": [{"name": OCI_RECIPIENT, "type": "age_recipient", "lifecycle": "persistent"}],
+            "target": {"repository": "roccho-dev/windows", "host": "oci-dev", "kind": "process_env", "secret_name": "JEV_API_KEY"},
+        },
     }
 
 
@@ -185,6 +202,24 @@ def expected_probe_boundary() -> dict[str, Any]:
         "target_kind": "disposable_probe",
         "owns": ["disposable_probe_resources", "exact_id_cleanup", "name_lookup_locator"],
         "does_not_own": ["existing_cloudflare_resources", "name_matched_deletion", "rent_target", "client_credential_selection"],
+        "handoff_ref_kind": "exact_commit_sha",
+    }
+
+
+def expected_oci_boundary() -> dict[str, Any]:
+    # envs ends at the target-bound ciphertext PR; the target applies it and apps proves its own runtime.
+    return {
+        "id": "dev.jev-api-oci-dev.provider",
+        "kind": "envs.providerConsumerBoundary.v1",
+        "role": "provider",
+        "repository": "roccho-dev/envs",
+        "stage": "dev",
+        "capability": "jev-api",
+        "binding": OCI_BINDING,
+        "source_kind": "ephemeral_ingress",
+        "target_kind": "public_sops",
+        "owns": ["contract", "target_selected_authoring", "single_recipient_encryption", "ciphertext_handoff_pr"],
+        "does_not_own": ["target_apply", "target_age_identity", "application_runtime_acceptance", "deployment"],
         "handoff_ref_kind": "exact_commit_sha",
     }
 
@@ -329,13 +364,19 @@ def validate_contracts(root: Path = ROOT) -> dict[str, dict[str, dict[str, Any]]
             and probe["active_github_environment"] is None and probe["migration_state"] == "NOT_CONFIGURED",
             f"{PROBE_PLANE} must be a NOT_CONFIGURED disposable probe plane")
 
+    # The OCI target has no state of its own: its ciphertext, when present, is simply valid or RED.
+    oci_cipher = root / OCI_CIPHERTEXT
+    if oci_cipher.is_file():
+        validate_oci_ciphertext(oci_cipher.read_bytes(), None, None)
+
     require(bindings == expected_bindings(), "binding set differs")
     require(set(boundary) == {
         "repository.branch-policy", "dev.jev-api.provider", "dev.rent-tunnel.provider", "dev.rent-access-probe.provider",
-        "apps.voice-ui.consumer", "ops.voice-ui.consumer", "normal.consumer.path",
+        "dev.jev-api-oci-dev.provider", "apps.voice-ui.consumer", "ops.voice-ui.consumer", "normal.consumer.path",
     }, "provider-consumer boundary set differs")
     require(boundary["dev.rent-tunnel.provider"] == expected_rent_boundary(), "rent tunnel provider boundary differs")
     require(boundary["dev.rent-access-probe.provider"] == expected_probe_boundary(), "access probe provider boundary differs")
+    require(boundary["dev.jev-api-oci-dev.provider"] == expected_oci_boundary(), "OCI dev provider boundary differs")
     require(boundary["repository.branch-policy"] == {
         "id": "repository.branch-policy", "kind": "envs.branchPolicy.v1",
         "canonical_branch": "proposals", "default_branch": "proposals",
@@ -390,6 +431,13 @@ def validate_rent_ciphertext(data: bytes, token: bytes | None, recipient: str | 
     require(set(re.findall(r"(?m)^([^\s#][^:]*):", text)) == {RENT_KEY, "sops"}, "rent tunnel ciphertext fields differ")
 
 
+def validate_oci_ciphertext(data: bytes, secret: bytes | None, recipient: str | None) -> None:
+    validate_ciphertext(data, secret, None if recipient is None else [recipient])
+    text = data.decode("utf-8", errors="strict")
+    require(len(RECIPIENT_METADATA.findall(text)) == 1, "OCI dev ciphertext must have exactly one recipient")
+    require(set(re.findall(r"(?m)^([^\s#][^:]*):", text)) == {"JEV_API_KEY", "sops"}, "OCI dev ciphertext fields differ")
+
+
 def repository_files(root: Path) -> list[Path]:
     return sorted(
         path
@@ -405,7 +453,7 @@ def reject_live_values(root: Path, name: str, values: list[str]) -> None:
     for path in repository_files(root):
         relative = path.relative_to(root).as_posix()
         data = path.read_bytes()
-        if relative in {CIPHERTEXT.as_posix(), RENT_CIPHERTEXT.as_posix()}:
+        if relative in {CIPHERTEXT.as_posix(), RENT_CIPHERTEXT.as_posix(), OCI_CIPHERTEXT.as_posix()}:
             data = without_recipient_metadata(data.decode("utf-8", errors="replace")).encode()
         for value in values:
             require(value.encode() not in data, f"{relative}: live {name} value is stored in Git")
@@ -520,6 +568,62 @@ def author(root: Path = ROOT, runner: Runner = default_runner) -> dict[str, Any]
         stale.unlink()
     validate_contracts(root)
     return {"kind": "envs.authoringResult.v1", "status": "PASS", "ciphertext": CIPHERTEXT.as_posix()}
+
+
+def authoring_inputs(contracts: dict[str, dict[str, dict[str, Any]]], target: str) -> list[dict[str, str]]:
+    # The Environment inputs one author target reads. The Cloudflare target reads its plane's own; the OCI target
+    # reads the plane's source secret plus the recipient its binding declares. Neither reads the other's recipient.
+    require(target in AUTHOR_TARGETS, f"unknown author target: {target}")
+    plane = contracts["environments"]["dev.authoring"]
+    if target == "jev-api":
+        return plane["required_secrets"] + plane["required_variables"]
+    binding = contracts["bindings"][target]
+    require(binding["github_environment"] == plane["github_environment"], f"{target} Environment differs")
+    source = [entry for entry in plane["required_secrets"] if entry["name"] == binding["source_key"]]
+    require(len(source) == 1, f"{target} source secret is not declared")
+    return source + binding["required_variables"]
+
+
+def encrypt_oci_key(source: str, recipient: str, tools: Mapping[str, str], runner: Runner = default_runner) -> bytes:
+    # The key reaches SOPS on stdin only; the ciphertext must name exactly this one recipient.
+    require(AGE_RECIPIENT.fullmatch(recipient) is not None, "OCI dev target needs exactly one age recipient")
+    require(source != "", "OCI dev source key is empty")
+    payload = json.dumps({"JEV_API_KEY": source}, separators=(",", ":")).encode() + b"\n"
+    result = run_checked(
+        [tools["sops"], "--encrypt", "--input-type", "json", "--output-type", "yaml", "/dev/stdin"],
+        input_data=payload,
+        env=clean_env(tools, {"SOPS_AGE_RECIPIENTS": recipient}),
+        runner=runner,
+        label="SOPS encryption",
+    )
+    validate_oci_ciphertext(result.stdout, source.encode(), recipient)
+    return result.stdout
+
+
+def author_oci(root: Path = ROOT, runner: Runner = default_runner) -> dict[str, Any]:
+    # Writes only the OCI ciphertext: no plane state, no handoff, no other target's file.
+    contracts = validate_contracts(root)
+    tools = toolchain(root)
+    values: dict[str, str] = {}
+    for entry in authoring_inputs(contracts, OCI_BINDING):
+        name, kind = entry["name"], entry["type"]
+        value = os.environ.get(name, "")
+        require(value != "", f"{OCI_BINDING}: {name} is missing")
+        require(INPUT_TYPES[kind](value), f"{OCI_BINDING}: {name} is not a valid {kind}")
+        values[name] = value
+    # Secret and Variable alike: a value already in Git is RED before SOPS runs.
+    reject_live_values(root, OCI_RECIPIENT, [values[OCI_RECIPIENT]])
+    reject_live_values(root, "JEV_API_KEY", [values["JEV_API_KEY"]])
+    data = encrypt_oci_key(values["JEV_API_KEY"], values[OCI_RECIPIENT], tools, runner)
+    target = root / OCI_CIPHERTEXT
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(data)
+    validate_contracts(root)
+    return {
+        "kind": "envs.targetAuthoringResult.v1", "status": "PASS", "binding": OCI_BINDING,
+        "ciphertext": OCI_CIPHERTEXT.as_posix(), "recipient_count": 1,
+        "target_apply": "NOT_RUN", "application_runtime": "NOT_RUN",
+    }
 
 
 Fetch = Callable[[urllib.request.Request, float], bytes]
@@ -1025,7 +1129,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     sub.add_parser("check")
     sub.add_parser("readiness")
     sub.add_parser("toolchain")
-    sub.add_parser("author")
+    # A dispatch names its one target; there is no default, and an unknown one stops before any input is read.
+    author_parser = sub.add_parser("author")
+    author_parser.add_argument("--target", required=True, choices=AUTHOR_TARGETS)
     sub.add_parser("rent-tunnel")
     sub.add_parser("rent-access-probe")
     sub.add_parser("rent-access-locate")
@@ -1053,7 +1159,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "source": json.loads(Path(os.environ["ENVS_EFFECT_TOOLCHAIN"]).read_text(encoding="utf-8"))["source"],
             }, indent=2, sort_keys=True))
         elif args.command == "author":
-            print(json.dumps(author(root), indent=2, sort_keys=True))
+            result = author(root) if args.target == "jev-api" else author_oci(root)
+            print(json.dumps(result, indent=2, sort_keys=True))
         elif args.command == "rent-tunnel":
             print(json.dumps(rent_author(root), indent=2, sort_keys=True))
         elif args.command in {"rent-access-probe", "rent-access-locate"}:

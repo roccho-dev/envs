@@ -246,6 +246,30 @@ def main() -> None:
     expect_red(replace_text("contracts/provider-consumer.jsonl", '"does_not_own":["target_apply",', '"does_not_own":['))
     expect_red(replace_text("README.md", "dev-rent-tunnel/RENT_AGE_RECIPIENT", "dev-rent-tunnel/REMOVED"))
 
+    # The OCI dev target: one declared binding, one literal author step with only its own inputs, no default target.
+    oci_mapping = "          OCI_DEV_AGE_RECIPIENT: ${{ vars.OCI_DEV_AGE_RECIPIENT }}\n"
+    cloudflare_mapping = "          SOPS_AGE_RECIPIENTS: ${{ vars.SOPS_AGE_RECIPIENTS }}\n"
+    expect_red(replace_text(author, oci_mapping, ""))
+    expect_red(replace_text(author, oci_mapping, cloudflare_mapping))
+    expect_red(replace_text(author, cloudflare_mapping, cloudflare_mapping + oci_mapping))
+    expect_red(replace_text(author, "          - jev-api.oci-dev\n", ""))
+    expect_red(replace_text(author, "        required: true\n        type: choice\n", "        type: choice\n"))
+    expect_red(replace_text(author, "author --target jev-api.oci-dev'", "author --target ${{ inputs.target }}'"))
+    expect_red(replace_text(author, "author --target jev-api'", "author'"))
+    expect_red(replace_text(author, "        if: inputs.target == 'jev-api.oci-dev'\n", ""))
+    expect_red(replace_text("contracts/bindings.jsonl", '"required_variables":[{"name":"OCI_DEV_AGE_RECIPIENT","type":"age_recipient"',
+                            '"required_variables":[{"name":"OCI_DEV_AGE_RECIPIENT","type":"age_recipient_list"'))
+    expect_red(replace_text("contracts/bindings.jsonl", '"host":"oci-dev","kind":"process_env"', '"host":"oci-dev","kind":"env_file"'))
+    expect_red(replace_text("contracts/provider-consumer.jsonl", '"binding":"jev-api.oci-dev",', ""))
+    expect_red(replace_text("README.md", "dev-authoring/OCI_DEV_AGE_RECIPIENT", "dev-authoring/REMOVED"))
+    expect_red(replace_text(check, "checks/test_jev_api.py --sops", "checks/test_jev_api.py --no-sops"))
+
+    def invalid_oci_ciphertext(root: Path) -> None:
+        (root / "ciphertexts").mkdir(exist_ok=True)
+        (root / "ciphertexts/dev-jev-api.oci-dev.sops.yaml").write_text("JEV_API_KEY: plain\n")
+
+    expect_red(invalid_oci_ciphertext)
+
     def extra_ciphertext(root: Path) -> None:
         (root / "ciphertexts").mkdir(exist_ok=True)
         (root / "ciphertexts/dev-other.sops.yaml").write_text("x: 1\n")
