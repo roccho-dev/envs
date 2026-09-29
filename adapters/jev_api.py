@@ -626,7 +626,7 @@ def author_oci(root: Path = ROOT, runner: Runner = default_runner) -> dict[str, 
     }
 
 
-Fetch =Callable[[urllib.request.Request, float], bytes]
+Fetch = Callable[[urllib.request.Request, float], bytes]
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
