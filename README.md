@@ -28,6 +28,7 @@ flake.nix, flake.lock
 contracts/
 ciphertexts/       # absent while dev (Jev, rent tunnel) is NOT_CONFIGURED
 adapters/jev_api.py
+providers/         # disposable probe declarations only; never state or lock files
 handoffs/          # absent until real projection/readback PASS
 checks/
 LICENSES/
@@ -58,6 +59,9 @@ THIRD_PARTY_NOTICES.md
 | `dev-rent-tunnel/CLOUDFLARE_ACCOUNT_ID` | variable | cloudflare_account_id | persistent |
 | `dev-rent-tunnel/RENT_TUNNEL_ID` | variable | cloudflare_tunnel_id | persistent |
 | `dev-rent-tunnel/RENT_AGE_RECIPIENT` | variable | age_recipient | persistent |
+| `dev-rent-access-probe/CLOUDFLARE_API_TOKEN` | secret | opaque | persistent |
+| `dev-rent-access-probe/CLOUDFLARE_ACCOUNT_ID` | variable | cloudflare_account_id | persistent |
+| `dev-rent-access-probe/CLOUDFLARE_ZONE_ID` | variable | cloudflare_zone_id | persistent |
 | `stg-projection/JEV_API_KEY` | secret | opaque | persistent |
 | `stg-projection/CLOUDFLARE_API_TOKEN` | secret | opaque | persistent |
 | `stg-projection/CLOUDFLARE_ACCOUNT_ID` | variable | cloudflare_account_id | persistent |
@@ -104,6 +108,30 @@ dev-rent-tunnel/CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, RENT_TUNNEL_ID, REN
 - The token and the API token never enter argv, a log line, an error message, or the result JSON, and the adapter writes neither to Git. If either is already in a tracked file, the run is RED: the API token before the provider call, the tunnel token before SOPS or any write. The ciphertext is public and permanent in history; recovering from a leaked target identity means rotating the tunnel token, not deleting the file.
 - `checks/test_rent_tunnel.py` proves the gates and failure cases with a fake provider and fake sops, and in `check` it runs the real locked sops with check-only `age-keygen` identities: the target identity decrypts, another identity and a tampered ciphertext are RED. `age` is a separate `check-age` output, and `check` proves it is absent from the provided artifact.
 
+## Dev rent Access SSH probe (windows #14)
+
+Before any rent migration, one disposable probe must show whether the exact pinned client (`cloudflared` 2026.6.1, the version windows PR #21 ships) reaches an SSH origin through Cloudflare Access with a service token and no browser. `providers/dev-rent-access-probe/main.tf` declares it with the standard Cloudflare provider (5.21.1) for OpenTofu; `flake.nix` puts OpenTofu with only that provider, `cloudflared` and OpenSSH into the same effect artifact, so a run acquires nothing from a registry.
+
+```text
+dev-rent-access-probe/CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_ZONE_ID
+→ probe-dev-rent-access-ssh (manual dispatch on proposals only; read-only repository permissions)
+→ preflight lookup of the fixed names in a fresh state (create=false: no managed resource)
+   any match → UNKNOWN, ownership UNPROVEN, NEEDS_AUTHORITY; nothing created, adopted or deleted
+→ create: tunnel windows-rent-access-probe → ssh://localhost:2222, CNAME rent-access-probe.roccho.com,
+   Access app with one Service Auth policy for exactly one 1h service token
+→ localhost sshd answering a run-scoped nonce; cloudflared tunnel run with TUNNEL_TOKEN from the environment
+→ ssh -o BatchMode=yes with the PR #21 ProxyCommand shape, once per case:
+   service token → nonce; no token and wrong secret → denied
+→ destroy exactly this state, then read back absence from a fresh lookup state
+```
+
+- Outcomes: `PASS` only when the token case returns the nonce and both negative cases are denied; an admitted negative is `ACCESS_NOT_ENFORCED`; a failed token case is `UNATTENDED_PATH_FAILED` with cause `UNKNOWN`; any timeout is `UNKNOWN`. There is no retry, and no failure is attributed to a guessed cause.
+- Credentials (API token, tunnel token, service-token secret) reach only the process that needs them, by environment; never argv, the result JSON, a log line or Git. OpenTofu state stays in the runner's temporary directory and is never committed, cached, uploaded or printed.
+- Cleanup deletes only what this run's state created. If the runner loses that state, name lookup locates candidates and never proves ownership: `rent-access-locate` reports them as `UNKNOWN`/`NEEDS_AUTHORITY` and has no delete path. A deletion of name-located resources needs its own contract.
+- `checks/test_rent_access_probe.py` proves the order, isolation, redaction, outcome classes and cleanup model against a fake provider and client. In `check` it also runs a real localhost sshd/ssh exchange from the closure, and `check` asserts the exact `cloudflared` version and its `--service-token-id`/`--service-token-secret` flags and initializes and validates the provider declaration with network access closed.
+
+Not proven here: that `cloudflared` 2026.6.1 honours a service token (a reported 2026.6.0 regression, cloudflare/cloudflared#1673, is a risk), any real Cloudflare resource or Access decision, the API token scope, unattended SSH to the rent, or G6I3 credential selection. The live run needs the `dev-rent-access-probe` Environment and its own contract.
+
 Not proven here, and not owned by envs: a real provider retrieval or dispatch of this workflow, the Cloudflare API token scope it needs, whether Actions may open the handoff PR (a PR opened with the workflow token does not trigger `check`), the target's age identity, applying the ciphertext on the target, the client credential, and unattended SSH.
 
 ## Effect toolchain
@@ -131,6 +159,7 @@ python3 checks/repository.py
 python3 checks/test_repository.py
 python3 checks/test_jev_api.py
 python3 checks/test_rent_tunnel.py
+python3 checks/test_rent_access_probe.py
 nix build .#effect-toolchain .#effect-artifact --no-update-lock-file   # check workflow, toolchain job
 nix build .#check-age --no-update-lock-file                             # check-only, real SOPS roundtrip
 ```

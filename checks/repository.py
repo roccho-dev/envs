@@ -18,6 +18,7 @@ REQUIRED_FILES = {
     ".github/workflows/author-dev-jev-api.yml",
     ".github/workflows/project-dev-jev-api.yml",
     ".github/workflows/project-dev-rent-tunnel.yml",
+    ".github/workflows/probe-dev-rent-access-ssh.yml",
     ".gitignore",
     "LICENSE_POLICY.md",
     "LICENSES/README.md",
@@ -26,6 +27,7 @@ REQUIRED_FILES = {
     "adapters/jev_api.py",
     "checks/repository.py",
     "checks/test_jev_api.py",
+    "checks/test_rent_access_probe.py",
     "checks/test_rent_tunnel.py",
     "checks/test_repository.py",
     "contracts/bindings.jsonl",
@@ -34,6 +36,7 @@ REQUIRED_FILES = {
     "contracts/targets.jsonl",
     "flake.lock",
     "flake.nix",
+    "providers/dev-rent-access-probe/main.tf",
 }
 ALLOWED_ROOTS = {
     ".github",
@@ -43,6 +46,7 @@ ALLOWED_ROOTS = {
     "ciphertexts",
     "contracts",
     "handoffs",
+    "providers",
 }
 ALLOWED_ROOT_FILES = {
     ".gitignore",
@@ -92,13 +96,29 @@ EFFECT_WORKFLOWS = {
     "author-dev-jev-api.yml": "dev.authoring",
     "project-dev-jev-api.yml": "dev.projection",
     "project-dev-rent-tunnel.yml": "dev.rent-tunnel",
+    "probe-dev-rent-access-ssh.yml": "dev.rent-access-probe",
 }
+PROBE_CONFIG = "providers/dev-rent-access-probe/main.tf"
+# check proves the probe tools from the built closure: exact client version, its token flags, and an OpenTofu
+# init/validate of the provider declaration with every network route closed.
+PROBE_TOOL_CHECKS = (
+    '"$tool/cloudflared" --version | tee "$RUNNER_TEMP/cloudflared.version"',
+    'grep -qF "cloudflared version 2026.6.1 " "$RUNNER_TEMP/cloudflared.version"',
+    'grep -qF -- --service-token-id "$RUNNER_TEMP/access-ssh.help"',
+    'HTTPS_PROXY=http://127.0.0.1:9 HTTP_PROXY=http://127.0.0.1:9 "$tool/tofu" -chdir="$probe" init -input=false -no-color',
+    '"$tool/tofu" -chdir="$probe" validate -no-color',
+    '"$tool/python3" -I checks/test_rent_access_probe.py --real-ssh "$tool"',
+)
 CIPHERTEXTS = {"ciphertexts/dev-jev-api.sops.yaml", "ciphertexts/dev-rent-tunnel.sops.yaml"}
 # The real SOPS roundtrip runs the locked sops with a check-only age that never enters the effect toolchain.
 CHECK_AGE_BUILD = 'nix build .#check-age --no-update-lock-file --out-link "$RUNNER_TEMP/check-age"'
 REAL_ROUNDTRIP = ('"$tool/python3" -I checks/test_rent_tunnel.py --sops "$tool/sops"'
                   ' --age-keygen "$RUNNER_TEMP/check-age/bin/age-keygen"')
-EFFECT_PACKAGES = "packages = with pkgs; [ python3 sops wrangler git gh ];"
+EFFECT_PACKAGES = "packages = with pkgs; [ python3 sops wrangler git gh openssh ] ++ [ cloudflared opentofu ];"
+PROBE_PINS = (
+    'cloudflared = assert pkgs.cloudflared.version == "2026.6.1"; pkgs.cloudflared;',
+    "opentofu = pkgs.opentofu.withPlugins (p: [ p.cloudflare_cloudflare ]);",
+)
 TOOLCHAIN_BUILD = 'nix build .#effect-toolchain --no-update-lock-file'
 ARTIFACT_BUILD = 'nix build .#effect-artifact --no-update-lock-file'
 SOURCE_SHA = "${{ github.event.pull_request.head.sha || github.sha }}"
@@ -111,7 +131,7 @@ CONSUMER_BINDING = (
     'test "$(tar -xOf "$art/content/envs-effect.tar" SOURCE)" = "$ENVS_SOURCE_SHA"',
 )
 EFFECT_ENV = re.compile(r"(?m)^ {10}([A-Za-z_][A-Za-z0-9_-]*):")
-EFFECT_STEP_KEYS = {"ref", "fetch-depth", "GH_TOKEN", "ENVS_SOURCE_SHA"}
+EFFECT_STEP_KEYS = {"ref", "fetch-depth", "persist-credentials", "GH_TOKEN", "ENVS_SOURCE_SHA"}
 TOOLCHAIN_BIN = '"$RUNNER_TEMP/envs-effect/bin/'
 # The one step that obtains the provided artifact; check's clean-start job holds the canonical text.
 CONSUMER_STEP = "- name: Obtain provided effect artifact\n"
@@ -194,10 +214,35 @@ def check_shape(root: Path) -> None:
         ciphertexts = sorted(path.relative_to(root).as_posix() for path in ciphertext_dir.rglob("*") if path.is_file())
         require(bool(ciphertexts) and set(ciphertexts) <= CIPHERTEXTS, f"unexpected ciphertexts: {ciphertexts}")
 
+    providers = sorted(path.relative_to(root).as_posix() for path in (root / "providers").rglob("*") if path.is_file())
+    require(providers == [PROBE_CONFIG], f"unexpected provider files (state or lock files are never committed): {providers}")
+    check_probe_config((root / PROBE_CONFIG).read_text(encoding="utf-8"))
+
     handoff_dir = root / "handoffs"
     if handoff_dir.exists():
         handoffs = sorted(path.relative_to(root).as_posix() for path in handoff_dir.rglob("*") if path.is_file())
         require(handoffs == ["handoffs/dev-jev-api.json"], f"unexpected handoffs: {handoffs}")
+
+
+def check_probe_config(text: str) -> None:
+    # Standard provider at the locked version; local ephemeral state only; every managed resource exists only when
+    # create = true, so the default lookup run declares nothing it could create or delete.
+    require('source  = "cloudflare/cloudflare"' in text and 'version = "5.21.1"' in text,
+            "probe must pin the standard Cloudflare provider")
+    for token in ("backend", "cloud {", "import {", "removed {", "moved {", "provisioner", "local-exec"):
+        require(token not in text, f"probe declaration must not use {token.strip(' {')}")
+    resources = re.findall(r'(?m)^resource "([a-z_]+)" "probe" \{\n  count\s+= local\.count\n', text)
+    require(len(resources) == text.count('\nresource "') and len(resources) == 6,
+            "every probe resource must be gated by create")
+    require(re.search(r'(?m)^data "cloudflare_zero_trust_tunnel_cloudflared_token" "probe" \{\n  count\s+= local\.count\n', text)
+            is not None, "the tunnel token read must be gated by create")
+    require('decision   = "non_identity"' in text and "service_token = { token_id = cloudflare_zero_trust_access_service_token.probe[0].id }" in text
+            and "any_valid_service_token" not in text and '"bypass"' not in text and '"allow"' not in text,
+            "the Access policy must be Service Auth for exactly the probe token")
+    require('name     = "windows-rent-access-probe"' in text and 'hostname = "rent-access-probe.roccho.com"' in text,
+            "probe names differ")
+    require(re.search(r'(?ms)^output "credentials" \{\n  sensitive = true\n', text) is not None,
+            "probe credentials must be a sensitive output")
 
 
 def check_text(root: Path) -> None:
@@ -312,6 +357,7 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]]) -> None
     require("checks/test_repository.py" in check, "check workflow must test repository oracle")
     require("checks/test_jev_api.py" in check, "check workflow must test Jev adapter")
     require("run: python3 checks/test_rent_tunnel.py\n" in check, "check workflow must test the rent tunnel adapter")
+    require("run: python3 checks/test_rent_access_probe.py\n" in check, "check workflow must test the access probe adapter")
     require(TOOLCHAIN_BUILD in check, "check workflow must reconstruct the effect toolchain")
     require(f'{TOOLCHAIN_BIN}envs-effect" toolchain' in check, "check workflow must execute the effect entry")
     require(f'{TOOLCHAIN_BIN}python3" -I checks/test_jev_api.py' in check,
@@ -348,6 +394,8 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]]) -> None
         'if grep -qxF "$age" "$RUNNER_TEMP/provided.list"; then',
     ):
         require(marker in toolchain, f"check must run the real SOPS roundtrip with check-only age: {marker}")
+    for marker in PROBE_TOOL_CHECKS:
+        require(marker in toolchain, f"check must prove the probe tools from the closure: {marker}")
     require(toolchain.find(REAL_ROUNDTRIP) < toolchain.find('if grep -qxF "$age"') and toolchain.find(ARTIFACT_BUILD)
             < toolchain.find('if grep -qxF "$age"'), "check-only age must be proven outside the built artifact")
     effect_shape = job("effect-shape", "clean-start")
@@ -432,6 +480,11 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]]) -> None
     require(f"run: '{EFFECT_ENTRY} rent-tunnel'" in rent, "rent tunnel workflow entry call missing")
     require('"$tool/git" add ciphertexts/dev-rent-tunnel.sops.yaml contracts/environments.jsonl\n' in rent,
             "rent tunnel handoff must stage only its ciphertext and plane state")
+    probe = texts["probe-dev-rent-access-ssh.yml"]
+    require(f"run: '{EFFECT_ENTRY} rent-access-probe'" in probe, "access probe workflow entry call missing")
+    require("permissions:\n  actions: read\n  contents: read\n" in probe and "write" not in probe,
+            "access probe workflow must be read-only on the repository")
+    require("rent-access-locate" not in probe, "live name lookup dispatch needs its own contract")
 
 
 def check_toolchain(root: Path, adapter) -> None:
@@ -440,7 +493,10 @@ def check_toolchain(root: Path, adapter) -> None:
     require(len(pinned) == 1 and "inputs." not in FLAKE_NIXPKGS.sub("", flake), "flake must have exactly one pinned nixpkgs input")
     require(adapter.locked_nixpkgs(root)["rev"] == pinned[0], "flake.lock differs from flake.nix")
     for tool in adapter.TOOLCHAIN_TOOLS:
-        require(f'{tool} = "${{pkgs.' in flake, f"flake does not provide {tool}")
+        require(re.search(rf'(?m)^        {tool} = "\$\{{(pkgs\.[a-z0-9]+|cloudflared|opentofu)\}}/bin/[a-z0-9-]+";$', flake)
+                is not None, f"flake does not provide {tool}")
+    for pin in PROBE_PINS:
+        require(pin in flake, f"flake must pin the probe tool: {pin}")
     require(flake.count("packages = with pkgs; [") == 1 and EFFECT_PACKAGES in flake,
             "effect toolchain packages differ; check-only age must stay outside them")
     require(flake.count("pkgs.age") == 1 and "        check-age = pkgs.age;\n" in flake, "check-age must be a separate check-only output")
@@ -470,6 +526,9 @@ def check_readme(root: Path, environments: dict[str, dict[str, Any]]) -> None:
         "handoffs/dev-jev-api.json",
         "ciphertexts/dev-rent-tunnel.sops.yaml",
         "checks/test_rent_tunnel.py",
+        PROBE_CONFIG,
+        "checks/test_rent_access_probe.py",
+        "name lookup locates candidates and never proves ownership",
     ):
         require(marker in text, f"README missing {marker}")
     require("delete `main`" not in text.lower(), "README proposes deleting main")

@@ -7,7 +7,11 @@
     let
       system = "x86_64-linux";
       pkgs = nixpkgs.legacyPackages.${system};
-      packages = with pkgs; [ python3 sops wrangler git gh ];
+      # Access probe: the cloudflared version windows PR #21 ships, and OpenTofu carrying only the standard Cloudflare
+      # provider in its closure, so a run acquires nothing from a registry.
+      cloudflared = assert pkgs.cloudflared.version == "2026.6.1"; pkgs.cloudflared;
+      opentofu = pkgs.opentofu.withPlugins (p: [ p.cloudflare_cloudflare ]);
+      packages = with pkgs; [ python3 sops wrangler git gh openssh ] ++ [ cloudflared opentofu ];
       # The exact committed source this artifact is built from; a dirty tree cannot produce one.
       rev = self.rev or (throw "envs effect artifact requires a clean committed source");
 
@@ -18,6 +22,11 @@
         wrangler = "${pkgs.wrangler}/bin/wrangler";
         git = "${pkgs.git}/bin/git";
         gh = "${pkgs.gh}/bin/gh";
+        tofu = "${opentofu}/bin/tofu";
+        cloudflared = "${cloudflared}/bin/cloudflared";
+        ssh = "${pkgs.openssh}/bin/ssh";
+        sshd = "${pkgs.openssh}/bin/sshd";
+        ssh_keygen = "${pkgs.openssh}/bin/ssh-keygen";
       };
       manifest = pkgs.writeText "envs-effect-toolchain.json" (builtins.toJSON {
         kind = "envs.effectToolchain.v1";
