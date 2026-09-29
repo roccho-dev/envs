@@ -257,9 +257,42 @@ def main() -> None:
     expect_red(replace_text(check, "run: python3 checks/test_rent_tunnel.py\n", "run: 'true'\n"))
     expect_red(replace_text(check, 'if grep -qxF "$age" "$RUNNER_TEMP/provided.list"; then', "if false; then"))
     expect_red(replace_text(check, '          grep -qxF "$sops" "$RUNNER_TEMP/provided.list"\n', ""))
-    expect_red(replace_text("flake.nix", "[ python3 sops wrangler git gh ]", "[ python3 sops wrangler git gh age ]"))
+    expect_red(replace_text("flake.nix", "[ python3 sops wrangler git gh openssh ]", "[ python3 sops wrangler git gh openssh age ]"))
     expect_red(replace_text("flake.nix", "        check-age = pkgs.age;\n", ""))
     expect_red(replace_text("flake.nix", "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt", "/etc/ssl/certs/ca-certificates.crt"))
+
+    # The Access probe: manual, read-only on the repository, standard provider, every resource gated, no state in Git.
+    probe = ".github/workflows/probe-dev-rent-access-ssh.yml"
+    tf = "providers/dev-rent-access-probe/main.tf"
+    expect_red(replace_text(probe, "on:\n  workflow_dispatch:\n", "on:\n  workflow_dispatch:\n  push:\n"))
+    expect_red(replace_text(probe, "  contents: read\n", "  contents: write\n"))
+    expect_red(replace_text(probe, "environment: dev-rent-access-probe", "environment: dev-rent-tunnel"))
+    expect_red(replace_text(probe, "          CLOUDFLARE_ZONE_ID: ${{ vars.CLOUDFLARE_ZONE_ID }}\n", ""))
+    expect_red(replace_text(probe, f"{entry} rent-access-probe", f"{entry} rent-access-locate"))
+    expect_red(replace_text(probe, f"{entry} rent-access-probe", '"$ENVS_EFFECT_BIN/tofu" destroy'))
+    expect_red(replace_text(tf, '  count   = local.count\n  zone_id = var.zone_id\n  name    = local.hostname',
+                            '  zone_id = var.zone_id\n  name    = local.hostname'))
+    expect_red(replace_text(tf, "terraform {\n", 'terraform {\n  backend "local" {}\n'))
+    expect_red(replace_text(tf, 'decision   = "non_identity"', 'decision   = "allow"'))
+    expect_red(replace_text(tf, "service_token = { token_id = cloudflare_zero_trust_access_service_token.probe[0].id }",
+                            "any_valid_service_token = {}"))
+    expect_red(replace_text(tf, 'version = "5.21.1"', 'version = ">= 5.0"'))
+    expect_red(replace_text(tf, 'output "credentials" {\n  sensitive = true\n', 'output "credentials" {\n'))
+    expect_red(lambda root: (root / "providers/dev-rent-access-probe/terraform.tfstate").write_text("{}\n"))
+    expect_red(lambda root: (root / "providers/dev-rent-access-probe/.terraform.lock.hcl").write_text("\n"))
+    expect_red(mutate_plane("dev.rent-access-probe", lambda row: row.update(
+        {"active_github_environment": "dev-rent-access-probe", "migration_state": "ACTIVE"})))
+    expect_red(replace_text("contracts/provider-consumer.jsonl", '"does_not_own":["existing_cloudflare_resources",',
+                            '"does_not_own":['))
+    expect_red(replace_text("flake.nix", 'pkgs.cloudflared.version == "2026.6.1"', 'pkgs.cloudflared.version != ""'))
+    expect_red(replace_text("flake.nix", "[ p.cloudflare_cloudflare ]", "[ p.cloudflare_cloudflare p.hashicorp_random ]"))
+    expect_red(replace_text("flake.nix", 'tofu = "${opentofu}/bin/tofu";', 'tofu = "/usr/bin/tofu";'))
+    expect_red(replace_text(check, "HTTPS_PROXY=http://127.0.0.1:9 HTTP_PROXY=http://127.0.0.1:9 ", ""))
+    expect_red(replace_text(check, ' --real-ssh "$tool"', ""))
+    expect_red(replace_text(check, 'grep -qF "cloudflared version 2026.6.1 "', 'grep -qF "cloudflared version"'))
+    expect_red(replace_text(check, "run: python3 checks/test_rent_access_probe.py\n", "run: 'true'\n"))
+    expect_red(replace_text("README.md", "name lookup locates candidates and never proves ownership", "name lookup finds ours"))
+    expect_red(replace_text("README.md", "dev-rent-access-probe/CLOUDFLARE_ZONE_ID", "dev-rent-access-probe/REMOVED"))
     print("repository checker self-test: PASS")
 
 

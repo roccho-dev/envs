@@ -42,6 +42,9 @@ jobs:
       - name: Test rent tunnel adapter
         run: python3 checks/test_rent_tunnel.py
 
+      - name: Test access probe adapter
+        run: python3 checks/test_rent_access_probe.py
+
       - name: Verify explicit main compatibility refresh
         if: github.ref_name == 'main'
         run: python3 checks/repository.py --verify-main-compatibility-refresh
@@ -104,6 +107,25 @@ jobs:
             grep -F -- '--project-name' <<<"$help" >/dev/null
           done
           "$tool/wrangler" pages secret put --help 2>&1 | grep -Ei 'pages secret put <key>' >/dev/null
+
+      # The probe tools come from the built closure: the exact client version and its service-token flags, the provider
+      # declaration initialized and validated with every network route closed, and a real localhost sshd/ssh exchange.
+      - name: Access probe tools from the closure without network or credentials
+        run: |
+          set -euo pipefail
+          tool="$RUNNER_TEMP/envs-effect/bin"
+          "$tool/cloudflared" --version | tee "$RUNNER_TEMP/cloudflared.version"
+          grep -qF "cloudflared version 2026.6.1 " "$RUNNER_TEMP/cloudflared.version"
+          "$tool/cloudflared" access ssh --help >"$RUNNER_TEMP/access-ssh.help" 2>&1 || true
+          grep -qF -- --service-token-id "$RUNNER_TEMP/access-ssh.help"
+          grep -qF -- --service-token-secret "$RUNNER_TEMP/access-ssh.help"
+          probe="$RUNNER_TEMP/probe-config"
+          mkdir "$probe"
+          cp providers/dev-rent-access-probe/main.tf "$probe/"
+          HTTPS_PROXY=http://127.0.0.1:9 HTTP_PROXY=http://127.0.0.1:9 "$tool/tofu" -chdir="$probe" init -input=false -no-color
+          "$tool/tofu" -chdir="$probe" validate -no-color
+          "$tool/ssh" -V
+          "$tool/python3" -I checks/test_rent_access_probe.py --real-ssh "$tool"
 
       - name: Test Jev adapter on the toolchain interpreter
         run: '"$RUNNER_TEMP/envs-effect/bin/python3" -I checks/test_jev_api.py'

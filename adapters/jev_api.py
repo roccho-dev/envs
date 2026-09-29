@@ -5,10 +5,14 @@ import argparse
 import hashlib
 import json
 import os
+import getpass
 import re
+import secrets
 import ssl
 import subprocess
 import sys
+import tempfile
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -24,7 +28,7 @@ HANDOFF = Path("handoffs/dev-jev-api.json")
 FLAKE_LOCK = Path("flake.lock")
 RECEIPT_KIND = "envs.projectionReceipt.v1"
 TOOLCHAIN_KIND = "envs.effectToolchain.v1"
-TOOLCHAIN_TOOLS = ("python3", "sops", "wrangler", "git", "gh")
+TOOLCHAIN_TOOLS = ("python3", "sops", "wrangler", "git", "gh", "tofu", "cloudflared", "ssh", "sshd", "ssh_keygen")
 STORE = Path("/nix/store")
 # Rent tunnel (windows #14): a provider-issued Named Tunnel token, encrypted to exactly one target age recipient.
 RENT_PLANE = "dev.rent-tunnel"
@@ -33,6 +37,20 @@ RENT_KEY = "RENT_TUNNEL_TOKEN"
 CLOUDFLARE_API = "https://api.cloudflare.com/client/v4"
 RETRIEVAL_TIMEOUT = 30.0
 RESPONSE_LIMIT = 65536
+# Access SSH probe (windows #14): one disposable Named Tunnel, hostname, Service Auth app and service token.
+PROBE_PLANE = "dev.rent-access-probe"
+PROBE_CONFIG = Path("providers/dev-rent-access-probe/main.tf")
+PROBE_NAME = "windows-rent-access-probe"
+PROBE_HOSTNAME = "rent-access-probe.roccho.com"
+PROBE_PORT = 2222
+PROBE_TIMEOUT = 60.0
+PROBE_SETTLE = 20.0
+PROBE_LOCATED = ("tunnels", "dns_records", "access_applications", "service_tokens")
+# Every managed resource in the probe declaration (six, including the tunnel configuration).
+PROBE_ADDRESSES = tuple(f"cloudflare_{kind}.probe[0]" for kind in (
+    "zero_trust_tunnel_cloudflared", "zero_trust_tunnel_cloudflared_config", "dns_record",
+    "zero_trust_access_service_token", "zero_trust_access_policy", "zero_trust_access_application"))
+PROBE_CREDENTIALS = ("tunnel_token", "service_token_id", "service_token_value")
 
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -154,6 +172,23 @@ def expected_rent_boundary() -> dict[str, Any]:
     }
 
 
+def expected_probe_boundary() -> dict[str, Any]:
+    # A disposable probe of the client path; name lookup locates, it never proves ownership or deletes.
+    return {
+        "id": "dev.rent-access-probe.provider",
+        "kind": "envs.providerConsumerBoundary.v1",
+        "role": "provider",
+        "repository": "roccho-dev/envs",
+        "stage": "dev",
+        "capability": "rent-access-probe",
+        "source_kind": "provider_issued",
+        "target_kind": "disposable_probe",
+        "owns": ["disposable_probe_resources", "exact_id_cleanup", "name_lookup_locator"],
+        "does_not_own": ["existing_cloudflare_resources", "name_matched_deletion", "rent_target", "client_credential_selection"],
+        "handoff_ref_kind": "exact_commit_sha",
+    }
+
+
 def expected_inputs() -> dict[str, dict[str, list[dict[str, str]]]]:
     def entries(*values: tuple[str, str, str]) -> list[dict[str, str]]:
         return [{"name": name, "type": kind, "lifecycle": lifecycle} for name, kind, lifecycle in values]
@@ -189,6 +224,13 @@ def expected_inputs() -> dict[str, dict[str, list[dict[str, str]]]]:
                 ("RENT_AGE_RECIPIENT", "age_recipient", "persistent"),
             ),
         },
+        PROBE_PLANE: {
+            "required_secrets": entries(("CLOUDFLARE_API_TOKEN", "opaque", "persistent")),
+            "required_variables": entries(
+                ("CLOUDFLARE_ACCOUNT_ID", "cloudflare_account_id", "persistent"),
+                ("CLOUDFLARE_ZONE_ID", "cloudflare_zone_id", "persistent"),
+            ),
+        },
     }
 
 
@@ -213,6 +255,7 @@ INPUT_TYPES: dict[str, Callable[[str], bool]] = {
     "age_recipient": lambda value: AGE_RECIPIENT.fullmatch(value) is not None,
     "cloudflare_account_id": lambda value: CLOUDFLARE_ACCOUNT_ID.fullmatch(value) is not None,
     "cloudflare_tunnel_id": lambda value: CLOUDFLARE_TUNNEL_ID.fullmatch(value) is not None,
+    "cloudflare_zone_id": lambda value: CLOUDFLARE_ACCOUNT_ID.fullmatch(value) is not None,
 }
 
 
@@ -222,7 +265,7 @@ def validate_contracts(root: Path = ROOT) -> dict[str, dict[str, dict[str, Any]]
     boundary = index(root / BOUNDARY)
 
     require(set(envs) == {
-        "dev.authoring", "dev.projection", "dev.runtime", RENT_PLANE,
+        "dev.authoring", "dev.projection", "dev.runtime", RENT_PLANE, PROBE_PLANE,
         "stg.projection", "stg.runtime", "prd.projection", "prd.runtime",
         "voice-ui.dev", "voice-ui.stg", "voice-ui.prd",
     }, "environment set differs")
@@ -280,12 +323,19 @@ def validate_contracts(root: Path = ROOT) -> dict[str, dict[str, dict[str, Any]]
         require(rent["active_github_environment"] is None and rent["migration_state"] == "NOT_CONFIGURED",
                 f"{RENT_PLANE} must be NOT_CONFIGURED without its ciphertext")
 
+    probe = envs[PROBE_PLANE]
+    require(probe["github_environment"] == "dev-rent-access-probe" and probe["owner"] == "envs"
+            and probe["source_kind"] == "provider_issued" and probe["target_kind"] == "disposable_probe"
+            and probe["active_github_environment"] is None and probe["migration_state"] == "NOT_CONFIGURED",
+            f"{PROBE_PLANE} must be a NOT_CONFIGURED disposable probe plane")
+
     require(bindings == expected_bindings(), "binding set differs")
     require(set(boundary) == {
-        "repository.branch-policy", "dev.jev-api.provider", "dev.rent-tunnel.provider",
+        "repository.branch-policy", "dev.jev-api.provider", "dev.rent-tunnel.provider", "dev.rent-access-probe.provider",
         "apps.voice-ui.consumer", "ops.voice-ui.consumer", "normal.consumer.path",
     }, "provider-consumer boundary set differs")
     require(boundary["dev.rent-tunnel.provider"] == expected_rent_boundary(), "rent tunnel provider boundary differs")
+    require(boundary["dev.rent-access-probe.provider"] == expected_probe_boundary(), "access probe provider boundary differs")
     require(boundary["repository.branch-policy"] == {
         "id": "repository.branch-policy", "kind": "envs.branchPolicy.v1",
         "canonical_branch": "proposals", "default_branch": "proposals",
@@ -554,6 +604,276 @@ def rent_author(root: Path = ROOT, runner: Runner = default_runner, fetch: Fetch
     }
 
 
+# A bounded client attempt returns ("exit", code, stdout) or ("timeout", -1, b""); stderr is never kept or logged.
+Bounded = Callable[[Sequence[str], Mapping[str, str], float], tuple[str, int, bytes]]
+Spawn = Callable[[Sequence[str], Mapping[str, str]], Any]
+
+
+def default_bounded(argv: Sequence[str], env: Mapping[str, str], timeout: float) -> tuple[str, int, bytes]:
+    try:
+        result = subprocess.run(list(argv), env=dict(env), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, timeout=timeout, check=False, shell=False)
+    except subprocess.TimeoutExpired:
+        return ("timeout", -1, b"")
+    return ("exit", result.returncode, result.stdout)
+
+
+def default_spawn(argv: Sequence[str], env: Mapping[str, str]) -> subprocess.Popen[bytes]:
+    return subprocess.Popen(list(argv), env=dict(env), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, shell=False)
+
+
+def stop(process: Any) -> None:
+    process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=10)
+
+
+def tofu(tools: Mapping[str, str], work: Path, env: Mapping[str, str], runner: Runner, *args: str) -> bytes:
+    # Output may carry sensitive values: it is parsed, never printed, and a failure names only the command.
+    return run_checked([tools["tofu"], f"-chdir={work}", *args], env=env, runner=runner,
+                       label=f"OpenTofu {args[0]}").stdout
+
+
+def tofu_workdir(root: Path, scratch: Path, name: str, tools: Mapping[str, str], env: Mapping[str, str],
+                 runner: Runner) -> Path:
+    # Each phase gets its own fresh state; a lookup directory never holds a managed resource it could delete.
+    work = scratch / name
+    work.mkdir()
+    (work / "main.tf").write_bytes((root / PROBE_CONFIG).read_bytes())
+    tofu(tools, work, env, runner, "init", "-input=false", "-no-color")
+    return work
+
+
+def output(tools: Mapping[str, str], work: Path, env: Mapping[str, str], runner: Runner, name: str,
+           keys: Sequence[str]) -> dict[str, Any]:
+    try:
+        value = json.loads(tofu(tools, work, env, runner, "output", "-json", name))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise EnvsError(f"OpenTofu output {name} is not JSON") from None
+    require(isinstance(value, dict) and set(value) == set(keys), f"OpenTofu output {name} differs")
+    return value
+
+
+def locate(root: Path, scratch: Path, name: str, tools: Mapping[str, str], env: Mapping[str, str],
+           runner: Runner) -> dict[str, list[str]]:
+    # A locator only: create=false declares no managed resource, so this path has no create or delete.
+    work = tofu_workdir(root, scratch, name, tools, env, runner)
+    tofu(tools, work, env, runner, "apply", "-input=false", "-auto-approve", "-no-color", "-var", "create=false")
+    found = output(tools, work, env, runner, "located", PROBE_LOCATED)
+    require(all(isinstance(ids, list) and all(isinstance(item, str) for item in ids) for ids in found.values()),
+            "OpenTofu located output differs")
+    return found
+
+
+def ssh_fixture(tools: Mapping[str, str], directory: Path, runner: Runner) -> dict[str, Any]:
+    # A throwaway localhost sshd that answers every login with a run-scoped nonce, and the client files for it.
+    directory.mkdir(mode=0o700)
+    for key in ("host", "client"):
+        run_checked([tools["ssh_keygen"], "-q", "-t", "ed25519", "-N", "", "-C", PROBE_NAME, "-f", str(directory / key)],
+                    env=clean_env(tools, {}), runner=runner, label="ssh-keygen")
+    nonce = secrets.token_hex(16)
+    (directory / "nonce").write_text(nonce + "\n", encoding="utf-8")
+    (directory / "authorized_keys").write_bytes((directory / "client.pub").read_bytes())
+    host = (directory / "host.pub").read_text(encoding="utf-8").split()
+    (directory / "known_hosts").write_text(f"{PROBE_NAME} {host[0]} {host[1]}\n", encoding="utf-8")
+    user = getpass.getuser()
+    (directory / "sshd_config").write_text("".join(f"{line}\n" for line in (
+        f"Port {PROBE_PORT}", "ListenAddress 127.0.0.1", f"HostKey {directory / 'host'}",
+        f"AuthorizedKeysFile {directory / 'authorized_keys'}", f"PidFile {directory / 'sshd.pid'}",
+        "PasswordAuthentication no", "KbdInteractiveAuthentication no", "PubkeyAuthentication yes",
+        "UsePAM no", "StrictModes no", f"AllowUsers {user}", f"ForceCommand cat {directory / 'nonce'}",
+    )), encoding="utf-8")
+    return {"directory": directory, "nonce": nonce, "user": user}
+
+
+def ssh_argv(tools: Mapping[str, str], fixture: Mapping[str, Any], target: str, proxy: bool) -> list[str]:
+    directory = fixture["directory"]
+    argv = [tools["ssh"], "-F", "/dev/null", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
+            "-i", str(directory / "client"), "-o", "StrictHostKeyChecking=yes",
+            "-o", f"UserKnownHostsFile={directory / 'known_hosts'}", "-o", f"HostKeyAlias={PROBE_NAME}",
+            "-o", "UpdateHostKeys=no", "-o", "ConnectTimeout=30", "-l", fixture["user"]]
+    if proxy:
+        # The same ProxyCommand shape windows PR #21 writes; credentials only ever come from the environment.
+        argv += ["-o", f'ProxyCommand="{tools["cloudflared"]}" access ssh --hostname %h']
+    else:
+        argv += ["-p", str(PROBE_PORT)]
+    return argv + [target]
+
+
+PROBE_CASES = ("service_token", "no_token", "wrong_token", "service_token_again")
+
+
+def classify(outcomes: Mapping[str, tuple[str, int, bytes]], nonce: str) -> dict[str, Any]:
+    # The client sees only its own exit and output, so a refused negative is not evidence that Access denied it: DNS,
+    # edge, tunnel or sshd failures look the same. The negatives are bracketed by two token cases; only when both
+    # reach the nonce was the path up around them, and even then the refusal cause stays unattributed.
+    def reached(outcome: tuple[str, int, bytes]) -> bool:
+        return outcome[0] == "exit" and outcome[1] == 0 and outcome[2].strip() == nonce.encode()
+
+    require(set(outcomes) == set(PROBE_CASES), "probe cases differ")
+    labels: dict[str, str] = {}
+    for case, outcome in outcomes.items():
+        if outcome[0] == "timeout":
+            labels[case] = "UNKNOWN"
+        elif case.startswith("service_token"):
+            labels[case] = "REACHED" if reached(outcome) else "FAILED"
+        else:
+            labels[case] = "ADMITTED" if outcome[1] == 0 or nonce.encode() in outcome[2] else "REFUSED"
+    if any(labels[case] == "ADMITTED" for case in ("no_token", "wrong_token")):
+        status = "ACCESS_NOT_ENFORCED"
+    elif "UNKNOWN" in labels.values():
+        status = "UNKNOWN"
+    elif labels["service_token"] == labels["service_token_again"] == "REACHED":
+        status = "TOKEN_REACHED_NEGATIVES_REFUSED"
+    elif labels["service_token"] == labels["service_token_again"] == "FAILED":
+        status = "UNATTENDED_PATH_FAILED"
+    else:
+        status = "UNKNOWN"
+    return {"status": status, "cases": labels, "cause": "UNKNOWN",
+            "access_denial_evidence": "NOT_OBSERVED",
+            "needed_for_denial_claim": "a provider-side Access decision record for each negative attempt"}
+
+
+def run_probe(tools: Mapping[str, str], credentials: Mapping[str, str], scratch: Path, runner: Runner,
+              bounded: Bounded, spawn: Spawn, sleep: Callable[[float], None]) -> dict[str, Any]:
+    fixture = ssh_fixture(tools, scratch / "ssh", runner)
+
+    def isolated(name: str, extra: Mapping[str, str]) -> dict[str, str]:
+        # Every process and case gets its own fresh, empty HOME: no runner login cache (~/.cloudflared) and no
+        # token cached by one case can reach another.
+        home = scratch / f"home-{name}"
+        home.mkdir(mode=0o700)
+        return {**clean_env(tools, {}), "HOME": str(home), **extra}
+
+    processes = [spawn([tools["sshd"], "-D", "-e", "-f", str(fixture["directory"] / "sshd_config")], isolated("sshd", {}))]
+    try:
+        processes.append(spawn([tools["cloudflared"], "tunnel", "--no-autoupdate", "run"],
+                               isolated("tunnel", {"TUNNEL_TOKEN": credentials["tunnel_token"]})))
+        sleep(PROBE_SETTLE)
+        argv = ssh_argv(tools, fixture, PROBE_HOSTNAME, proxy=True)
+        token = {"TUNNEL_SERVICE_TOKEN_ID": credentials["service_token_id"],
+                 "TUNNEL_SERVICE_TOKEN_SECRET": credentials["service_token_value"]}
+        cases = {
+            "service_token": token,
+            "no_token": {},
+            "wrong_token": {"TUNNEL_SERVICE_TOKEN_ID": credentials["service_token_id"],
+                            "TUNNEL_SERVICE_TOKEN_SECRET": secrets.token_hex(32)},
+            "service_token_again": token,
+        }
+        # Each case runs once, in this order, with no retry.
+        outcomes = {case: bounded(argv, isolated(case, extra), PROBE_TIMEOUT) for case, extra in cases.items()}
+    finally:
+        for process in reversed(processes):
+            stop(process)
+    return classify(outcomes, fixture["nonce"])
+
+
+def access_probe(root: Path = ROOT, *, locate_only: bool = False, runner: Runner = default_runner,
+                 bounded: Bounded = default_bounded, spawn: Spawn = default_spawn,
+                 sleep: Callable[[float], None] = time.sleep) -> dict[str, Any]:
+    contracts = validate_contracts(root)
+    tools = toolchain(root)
+    inputs = gate(root, contracts, PROBE_PLANE)
+    reject_live_values(root, "CLOUDFLARE_API_TOKEN", [inputs["CLOUDFLARE_API_TOKEN"]])
+    env = clean_env(tools, {
+        "CLOUDFLARE_API_TOKEN": inputs["CLOUDFLARE_API_TOKEN"], "TF_VAR_account_id": inputs["CLOUDFLARE_ACCOUNT_ID"],
+        "TF_VAR_zone_id": inputs["CLOUDFLARE_ZONE_ID"], "TF_IN_AUTOMATION": "1", "TF_INPUT": "0",
+    })
+    result: dict[str, Any] = {"kind": "envs.rentAccessProbeResult.v1", "hostname": PROBE_HOSTNAME,
+                              "real_ssh_acceptance": "NOT_CLAIMED", "rent_target": "UNTOUCHED"}
+    with tempfile.TemporaryDirectory(prefix="envs-access-probe-") as temporary:
+        scratch = Path(temporary)
+        before = locate(root, scratch, "before", tools, env, runner)
+        if locate_only or any(before.values()):
+            # Name matches are candidates only: ownership is unproven and nothing is adopted or deleted.
+            located = any(before.values())
+            result.update({"stage": "locate" if locate_only else "preflight", "located": before,
+                           "status": "UNKNOWN" if located else "NONE_LOCATED",
+                           "ownership": "UNPROVEN" if located else None,
+                           "next": "NEEDS_AUTHORITY" if located else None})
+            if not locate_only:
+                result["status"] = "UNKNOWN"
+            return result
+        work = tofu_workdir(root, scratch, "probe", tools, env, runner)
+        result.update({"stage": "create", "status": "UNKNOWN", "observed_state_ids": None, "probe": None,
+                       "id_claim": "IDs are as recorded in this run's OpenTofu state; provider existence or "
+                                   "absence is not asserted"})
+        observed: dict[str, str] | None = None
+        try:
+            try:
+                tofu(tools, work, env, runner, "apply", "-input=false", "-auto-approve", "-no-color",
+                     "-var", "create=true")
+            finally:
+                # Whatever apply managed to create, its exact IDs are taken from the state before anything else.
+                observed = state_ids(tools, work, env, runner)
+                result["observed_state_ids"] = observed if observed is not None else "STATE_UNREADABLE"
+                print(json.dumps({"kind": "envs.rentAccessProbeStateIds.v1", "observed_state_ids":
+                                  result["observed_state_ids"]}, sort_keys=True), file=sys.stderr, flush=True)
+            require(observed is not None and set(observed) == set(PROBE_ADDRESSES), "created resource set differs")
+            result["stage"] = "probe"
+            credentials = output(tools, work, env, runner, "credentials", PROBE_CREDENTIALS)
+            require(all(isinstance(value, str) and value for value in credentials.values()), "credentials differ")
+            probe = run_probe(tools, credentials, scratch, runner, bounded, spawn, sleep)
+            result.update({"probe": probe, "status": probe["status"]})
+        except EnvsError as exc:
+            result["error"] = str(exc)
+        finally:
+            # Cleanup destroys only this state, then re-reads the state and looks up absence in a fresh lookup state.
+            destroyed = True
+            try:
+                tofu(tools, work, env, runner, "destroy", "-input=false", "-auto-approve", "-no-color",
+                     "-var", "create=true")
+            except EnvsError:
+                destroyed = False
+            remaining = state_ids(tools, work, env, runner)
+            after = None
+            if destroyed and remaining == {}:
+                try:
+                    after = locate(root, scratch, "after", tools, env, runner)
+                except EnvsError:
+                    after = None
+            result["located_after"] = after
+            if destroyed and remaining == {} and after is not None and not any(after.values()):
+                result["cleanup"] = "ABSENT"
+            else:
+                result["cleanup"] = "CLEANUP_UNKNOWN"
+                # Still in state: destroy did not remove them. Unverified: state says removed (or state unreadable),
+                # but absence was not read back. Either way only these exact IDs may be cleaned up; a name match may not.
+                known = observed or {}
+                result["remaining_in_state"] = remaining if remaining is not None else "STATE_UNREADABLE"
+                result["unverified_after_destroy"] = {
+                    address: value for address, value in known.items() if remaining is None or address not in remaining}
+                result["owner_cleanup"] = "exact IDs above only; name-matched deletion needs its own contract"
+    if result["cleanup"] != "ABSENT":
+        # The current state is what matters: resources may remain, so no probe outcome stands as the status.
+        result["status"] = "CLEANUP_UNKNOWN"
+    return result
+
+
+def state_ids(tools: Mapping[str, str], work: Path, env: Mapping[str, str], runner: Runner) -> dict[str, str] | None:
+    # The state JSON can hold secrets in plain text: it is parsed in memory and only managed addresses and IDs leave.
+    try:
+        state = json.loads(tofu(tools, work, env, runner, "show", "-json", "-no-color") or b"{}")
+    except (EnvsError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    resources = (state.get("values") or {}).get("root_module", {}).get("resources", []) if isinstance(state, dict) else None
+    if not isinstance(resources, list):
+        return None
+    found: dict[str, str] = {}
+    for item in resources:
+        if not isinstance(item, dict) or item.get("mode") != "managed":
+            continue
+        address, value = item.get("address"), (item.get("values") or {}).get("id")
+        if address not in PROBE_ADDRESSES or not isinstance(value, str) or not value or address in found:
+            return None
+        found[address] = value
+    return found
+
+
 def walk_receipt(value: Any) -> None:
     if isinstance(value, dict):
         for key, item in value.items():
@@ -707,6 +1027,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     sub.add_parser("toolchain")
     sub.add_parser("author")
     sub.add_parser("rent-tunnel")
+    sub.add_parser("rent-access-probe")
+    sub.add_parser("rent-access-locate")
     project_parser = sub.add_parser("project")
     project_parser.add_argument("--envs-sha", required=True)
     project_parser.add_argument("--run-id", type=int, required=True)
@@ -734,6 +1056,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(author(root), indent=2, sort_keys=True))
         elif args.command == "rent-tunnel":
             print(json.dumps(rent_author(root), indent=2, sort_keys=True))
+        elif args.command in {"rent-access-probe", "rent-access-locate"}:
+            result = access_probe(root, locate_only=args.command == "rent-access-locate")
+            print(json.dumps(result, indent=2, sort_keys=True))
+            passed = result["status"] == "NONE_LOCATED" if args.command == "rent-access-locate" else (
+                result["status"] == "TOKEN_REACHED_NEGATIVES_REFUSED" and result.get("cleanup") == "ABSENT")
+            return 0 if passed else 1
         else:
             receipt = project(
                 envs_sha=args.envs_sha, run_id=args.run_id, run_attempt=args.run_attempt,
@@ -741,7 +1069,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             print(json.dumps({"kind": receipt["kind"], "status": "PASS", "output": str(args.output)}, sort_keys=True))
     except (EnvsError, OSError) as exc:
-        label = "RENT_TUNNEL" if args.command == "rent-tunnel" else "JEV_API"
+        label = {"rent-tunnel": "RENT_TUNNEL", "rent-access-probe": "RENT_ACCESS_PROBE",
+                 "rent-access-locate": "RENT_ACCESS_PROBE"}.get(args.command, "JEV_API")
         print(f"{label}=RED: {exc}", file=sys.stderr)
         return 1
     return 0
