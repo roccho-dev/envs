@@ -51,6 +51,42 @@ PROBE_ADDRESSES = tuple(f"cloudflare_{kind}.probe[0]" for kind in (
     "zero_trust_tunnel_cloudflared", "zero_trust_tunnel_cloudflared_config", "dns_record",
     "zero_trust_access_service_token", "zero_trust_access_policy", "zero_trust_access_application"))
 PROBE_CREDENTIALS = ("tunnel_token", "service_token_id", "service_token_value")
+# Durable-state proof (windows #8/#14): OpenTofu S3-backend state, lock file and encryption on two per-run R2 buckets.
+# The parent token is an existing finite account token on the same Environment under its own secret name.
+STATE_PLANE = "dev.rent-state-proof"
+STATE_CONFIG = Path("providers/dev-rent-state-proof/main.tf")
+STATE_BACKEND = Path("providers/dev-rent-state-proof/backend/main.tf")
+STATE_BUCKET_PREFIX = "windows-rent-state-proof-"
+STATE_RESERVED_BUCKET = "windows-rent-state"
+STATE_ALLOWED_PREFIX = "state/"
+STATE_KEY = "state/proof.tfstate"
+STATE_OUTSIDE_KEY = "outside/proof.tfstate"
+# The workflow's timeout-minutes (the repository check requires equality) bounds the whole run, including the
+# temporary-credential wait; the parent token must outlive it by the margin before anything is created.
+STATE_JOB_MINUTES = 45
+STATE_MARGIN = 900.0
+STATE_CREDENTIAL_TTL = 900
+STATE_EXPIRY_GRACE = 60.0
+STATE_HOLD = 60
+STATE_SETTLE = 20.0
+STATE_LOCK_ERROR = b"Error acquiring the state lock"
+STATE_EVIDENCE_KIND = "envs.rentStateProofCreated.v1"
+STATE_CHECKS = (
+    "lock_holder_applied", "lock_contender_rejected", "lock_released", "raw_state_encrypted", "readback_exact",
+    "rotation_rewritten", "rotated_readback", "path_up_after_negatives",
+)
+# Each negative is REFUSED only after an adjacent control that differs in that one input succeeds and the negative fails
+# for its own cause; a negative that succeeds is ADMITTED; anything else (transport, 5xx, other cause) is UNKNOWN.
+STATE_NEGATIVES = {
+    "old_key_refused": {"decryption"},
+    "unencrypted_read_refused": {"encryption", "decryption"},
+    "no_credential_refused": {"credential"},
+    "outside_prefix_write_refused": {"access_denied"},
+    "decoy_refused": {"access_denied"},
+}
+STATE_STATUS = re.compile(rb"StatusCode: ([0-9]{3})\b")
+STATE_TRANSIENT = re.compile(rb"(?<![-\w])timeout|timed out|connection (?:refused|reset)|no such host|unexpected EOF",
+                             re.IGNORECASE)
 # WSLC OCI dev target (roccho-dev/adrs#460): the same one-shot Jev source, encrypted to exactly one target recipient.
 # It has no plane state and no handoff; the validated ciphertext at an exact commit is its whole readiness.
 OCI_BINDING = "jev-api.oci-dev"
@@ -65,6 +101,7 @@ AGE_RECIPIENT = re.compile(r"^age1[02-9ac-hj-np-z]{58}$")
 AGE_IDENTITY = re.compile(r"^AGE-SECRET-KEY-1[02-9AC-HJ-NP-Z]{58}$")
 CLOUDFLARE_ACCOUNT_ID = re.compile(r"^[0-9a-f]{32}$")
 CLOUDFLARE_TUNNEL_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+CLOUDFLARE_TOKEN_ID = re.compile(r"^[0-9a-f]{32}$")
 # The target's token file gate accepts 1-4096 non-blank bytes; the provider returns base64 text.
 TUNNEL_TOKEN = re.compile(r"^[A-Za-z0-9+/=_-]{1,4096}$")
 BEARER = re.compile(r"^[\x21-\x7e]+$")
@@ -86,6 +123,10 @@ SECRET_PLANE_KEYS = {
 
 class EnvsError(ValueError):
     pass
+
+
+# State proof: provider doubt (EnvsError) and local launch or storage failures; none may bypass cleanup or become evidence.
+STATE_FAILURES = (EnvsError, OSError, subprocess.SubprocessError)
 
 
 Runner = Callable[
@@ -206,6 +247,24 @@ def expected_probe_boundary() -> dict[str, Any]:
     }
 
 
+def expected_state_boundary() -> dict[str, Any]:
+    # A disposable proof of the state backend; the parent credential and every existing bucket belong to others.
+    return {
+        "id": "dev.rent-state-proof.provider",
+        "kind": "envs.providerConsumerBoundary.v1",
+        "role": "provider",
+        "repository": "roccho-dev/envs",
+        "stage": "dev",
+        "capability": "rent-state-proof",
+        "source_kind": "github_environment",
+        "target_kind": "disposable_state_proof",
+        "owns": ["disposable_state_buckets", "run_scoped_temporary_credentials", "evidence_bound_cleanup"],
+        "does_not_own": ["parent_credential", "existing_r2_buckets", "reserved_production_state_bucket",
+                         "name_matched_deletion", "production_state"],
+        "handoff_ref_kind": "exact_commit_sha",
+    }
+
+
 def expected_oci_boundary() -> dict[str, Any]:
     # envs ends at the target-bound ciphertext PR; the target applies it and apps proves its own runtime.
     return {
@@ -266,6 +325,13 @@ def expected_inputs() -> dict[str, dict[str, list[dict[str, str]]]]:
                 ("CLOUDFLARE_ZONE_ID", "cloudflare_zone_id", "persistent"),
             ),
         },
+        STATE_PLANE: {
+            "required_secrets": entries(("R2_PARENT_API_TOKEN", "opaque", "finite_expiry")),
+            "required_variables": entries(
+                ("CLOUDFLARE_ACCOUNT_ID", "cloudflare_account_id", "persistent"),
+                ("R2_PARENT_ACCESS_KEY_ID", "cloudflare_api_token_id", "finite_expiry"),
+            ),
+        },
     }
 
 
@@ -291,6 +357,7 @@ INPUT_TYPES: dict[str, Callable[[str], bool]] = {
     "cloudflare_account_id": lambda value: CLOUDFLARE_ACCOUNT_ID.fullmatch(value) is not None,
     "cloudflare_tunnel_id": lambda value: CLOUDFLARE_TUNNEL_ID.fullmatch(value) is not None,
     "cloudflare_zone_id": lambda value: CLOUDFLARE_ACCOUNT_ID.fullmatch(value) is not None,
+    "cloudflare_api_token_id": lambda value: CLOUDFLARE_TOKEN_ID.fullmatch(value) is not None,
 }
 
 
@@ -300,7 +367,7 @@ def validate_contracts(root: Path = ROOT) -> dict[str, dict[str, dict[str, Any]]
     boundary = index(root / BOUNDARY)
 
     require(set(envs) == {
-        "dev.authoring", "dev.projection", "dev.runtime", RENT_PLANE, PROBE_PLANE,
+        "dev.authoring", "dev.projection", "dev.runtime", RENT_PLANE, PROBE_PLANE, STATE_PLANE,
         "stg.projection", "stg.runtime", "prd.projection", "prd.runtime",
         "voice-ui.dev", "voice-ui.stg", "voice-ui.prd",
     }, "environment set differs")
@@ -363,6 +430,15 @@ def validate_contracts(root: Path = ROOT) -> dict[str, dict[str, dict[str, Any]]
             and probe["source_kind"] == "provider_issued" and probe["target_kind"] == "disposable_probe"
             and probe["active_github_environment"] is None and probe["migration_state"] == "NOT_CONFIGURED",
             f"{PROBE_PLANE} must be a NOT_CONFIGURED disposable probe plane")
+    # The state proof shares the probe's Environment under its own secret name, so neither reads the other's token.
+    state = envs[STATE_PLANE]
+    require(state["github_environment"] == probe["github_environment"] and state["owner"] == "envs"
+            and state["source_kind"] == "github_environment" and state["target_kind"] == "disposable_state_proof"
+            and state["active_github_environment"] is None and state["migration_state"] == "NOT_CONFIGURED",
+            f"{STATE_PLANE} must be a NOT_CONFIGURED disposable state plane")
+    probe_secrets = {entry["name"] for entry in probe["required_secrets"]}
+    require(not probe_secrets & {entry["name"] for entry in state["required_secrets"]},
+            f"{STATE_PLANE} must not reuse the access probe secret")
 
     # The OCI target has no state of its own: its ciphertext, when present, is simply valid or RED.
     oci_cipher = root / OCI_CIPHERTEXT
@@ -372,10 +448,12 @@ def validate_contracts(root: Path = ROOT) -> dict[str, dict[str, dict[str, Any]]
     require(bindings == expected_bindings(), "binding set differs")
     require(set(boundary) == {
         "repository.branch-policy", "dev.jev-api.provider", "dev.rent-tunnel.provider", "dev.rent-access-probe.provider",
-        "dev.jev-api-oci-dev.provider", "apps.voice-ui.consumer", "ops.voice-ui.consumer", "normal.consumer.path",
+        "dev.rent-state-proof.provider", "dev.jev-api-oci-dev.provider", "apps.voice-ui.consumer", "ops.voice-ui.consumer",
+        "normal.consumer.path",
     }, "provider-consumer boundary set differs")
     require(boundary["dev.rent-tunnel.provider"] == expected_rent_boundary(), "rent tunnel provider boundary differs")
     require(boundary["dev.rent-access-probe.provider"] == expected_probe_boundary(), "access probe provider boundary differs")
+    require(boundary["dev.rent-state-proof.provider"] == expected_state_boundary(), "state proof provider boundary differs")
     require(boundary["dev.jev-api-oci-dev.provider"] == expected_oci_boundary(), "OCI dev provider boundary differs")
     require(boundary["repository.branch-policy"] == {
         "id": "repository.branch-policy", "kind": "envs.branchPolicy.v1",
@@ -978,6 +1056,501 @@ def state_ids(tools: Mapping[str, str], work: Path, env: Mapping[str, str], runn
     return found
 
 
+# A Cloudflare API call returns (HTTP status, parsed JSON or None); a transport failure is UNKNOWN, never a status.
+Api = Callable[[str, str, str, Any], tuple[int, Any]]
+
+
+def default_api(method: str, path: str, token: str, body: Any) -> tuple[int, Any]:
+    # Same bounds as the tunnel token GET; errors never carry the response, the request headers or the token.
+    bundle = os.environ.get("SSL_CERT_FILE", "")
+    require(in_store(bundle) and os.path.isfile(bundle), "repo-owned CA bundle is missing")
+    require(BEARER.fullmatch(token) is not None, "invalid Cloudflare API token shape")
+    data = None if body is None else json.dumps(body, separators=(",", ":")).encode()
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(f"{CLOUDFLARE_API}{path}", data=data, headers=headers, method=method)
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=ssl.create_default_context(cafile=bundle)), NoRedirect)
+    try:
+        with opener.open(request, timeout=RETRIEVAL_TIMEOUT) as response:
+            status, raw = response.status, response.read(RESPONSE_LIMIT + 1)
+    except urllib.error.HTTPError as exc:
+        status, raw = exc.code, exc.read(RESPONSE_LIMIT + 1)
+    except (urllib.error.URLError, OSError, ValueError):
+        raise EnvsError("Cloudflare request outcome is UNKNOWN") from None
+    require(len(raw) <= RESPONSE_LIMIT, "Cloudflare response exceeds its bound")
+    try:
+        return status, (json.loads(raw) if raw else None)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return status, None
+
+
+def api_result(status: int, value: Any) -> Any:
+    return value.get("result") if status == 200 and isinstance(value, dict) and value.get("success") is True else None
+
+
+def utc_seconds(value: Any) -> float:
+    require(isinstance(value, str) and value.endswith("Z"), "provider timestamp is not UTC")
+    try:
+        return datetime.fromisoformat(value[:-1] + "+00:00").timestamp()
+    except ValueError:
+        raise EnvsError("provider timestamp is invalid") from None
+
+
+def state_window() -> float:
+    # The job bound (which includes the temporary-credential wait and cleanup) plus the declared margin.
+    return STATE_JOB_MINUTES * 60 + STATE_MARGIN
+
+
+def verify_parent(api: Api, account: str, token: str, expected: str, now: float) -> dict[str, str]:
+    # Verify proves identity, status and time bounds only; R2 authority is proven by the first bounded create.
+    result = api_result(*api("GET", f"/accounts/{account}/tokens/verify", token, None))
+    require(isinstance(result, dict), "parent token verify did not succeed")
+    require(result.get("id") == expected, "parent token ID differs from R2_PARENT_ACCESS_KEY_ID")
+    require(result.get("status") == "active", "parent token is not active")
+    if result.get("not_before") is not None:
+        require(utc_seconds(result["not_before"]) <= now, "parent token is not yet valid")
+    require(result.get("expires_on") is not None, "parent token has no expiry")
+    require(utc_seconds(result["expires_on"]) - now >= state_window(), "parent token expiry does not cover the proof window")
+    return {"id": "MATCHED", "status": "ACTIVE", "expiry": "COVERS_WINDOW"}
+
+
+def run_identity(environ: Mapping[str, str]) -> dict[str, str]:
+    run_id, attempt, head = (environ.get(name, "") for name in ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_SHA"))
+    require(re.fullmatch(r"[1-9][0-9]{0,19}", run_id) is not None and re.fullmatch(r"[1-9][0-9]{0,3}", attempt) is not None
+            and SHA40.fullmatch(head) is not None, "GitHub run identity is missing")
+    return {"run_id": run_id, "run_attempt": attempt, "head": head, "scope": f"{run_id}-{attempt}"}
+
+
+def state_bucket_names(run: Mapping[str, str]) -> dict[str, str]:
+    proof = STATE_BUCKET_PREFIX + run["scope"]
+    names = {"proof": proof, "decoy": proof + "-decoy"}
+    require(STATE_RESERVED_BUCKET not in names.values() and all(len(name) <= 63 for name in names.values()),
+            "state bucket names differ")
+    return names
+
+
+def bucket_creation(api: Api, account: str, token: str, name: str) -> str | None:
+    # None is absent (404); a present bucket returns its provider creation_date; anything else is UNKNOWN.
+    status, value = api("GET", f"/accounts/{account}/r2/buckets/{name}", token, None)
+    if status == 404:
+        return None
+    result = api_result(status, value)
+    require(isinstance(result, dict) and result.get("name") == name and isinstance(result.get("creation_date"), str),
+            "bucket readback is UNKNOWN")
+    return result["creation_date"]
+
+
+def temporary_credentials(api: Api, account: str, token: str, parent: str, bucket: str) -> dict[str, str]:
+    # One bucket-bound, prefix-bound, object-level credential that cannot exceed its parent and expires by itself.
+    result = api_result(*api("POST", f"/accounts/{account}/r2/temp-access-credentials", token, {
+        "bucket": bucket, "parentAccessKeyId": parent, "permission": "object-read-write",
+        "ttlSeconds": STATE_CREDENTIAL_TTL, "prefixes": [STATE_ALLOWED_PREFIX]}))
+    require(isinstance(result, dict), "temporary credential issuance did not succeed")
+    values = {name: result.get(field) for name, field in (
+        ("AWS_ACCESS_KEY_ID", "accessKeyId"), ("AWS_SECRET_ACCESS_KEY", "secretAccessKey"),
+        ("AWS_SESSION_TOKEN", "sessionToken"))}
+    require(all(isinstance(value, str) and BEARER.fullmatch(value) for value in values.values()),
+            "temporary credential differs")
+    return values
+
+
+def state_buckets(tools: Mapping[str, str], work: Path, env: Mapping[str, str], runner: Runner) -> dict[str, str] | None:
+    # This run's own create results: bucket name and provider creation_date from its state, parsed in memory.
+    try:
+        state = json.loads(tofu(tools, work, env, runner, "show", "-json", "-no-color") or b"{}")
+    except (EnvsError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    resources = (state.get("values") or {}).get("root_module", {}).get("resources", []) if isinstance(state, dict) else None
+    if not isinstance(resources, list):
+        return None
+    found: dict[str, str] = {}
+    for item in resources:
+        if not isinstance(item, dict) or item.get("mode") != "managed":
+            continue
+        values = item.get("values") or {}
+        name, created = values.get("name"), values.get("creation_date")
+        if item.get("type") != "cloudflare_r2_bucket" or not isinstance(name, str) or not isinstance(created, str) \
+                or name in found:
+            return None
+        found[name] = created
+    return found
+
+
+def state_evidence(run: Mapping[str, str], bucket: str, created: str) -> dict[str, str]:
+    return {"kind": STATE_EVIDENCE_KIND, "bucket": bucket, "creation_date": created,
+            "run_id": run["run_id"], "run_attempt": run["run_attempt"], "head": run["head"]}
+
+
+def record_created(tools: Mapping[str, str], work: Path, env: Mapping[str, str], runner: Runner,
+                   run: Mapping[str, str], previous: dict[str, str] | None) -> dict[str, str] | None:
+    # Right after each create, every new bucket is emitted once as a non-secret evidence line.
+    found = state_buckets(tools, work, env, runner)
+    if found is None or previous is None:
+        return None
+    for bucket, created in sorted(found.items()):
+        if previous.get(bucket) != created:
+            print(json.dumps(state_evidence(run, bucket, created), sort_keys=True), file=sys.stderr, flush=True)
+    return found
+
+
+def parse_state_evidence(text: str, run: Mapping[str, str]) -> dict[str, str]:
+    # Recovery input: the evidence lines of one exact run, attempt and head, from a job log with any line prefix.
+    names = set(state_bucket_names(run).values())
+    found: dict[str, str] = {}
+    for line in text.splitlines():
+        start = line.find("{")
+        if start == -1 or STATE_EVIDENCE_KIND not in line:
+            continue
+        try:
+            value = json.loads(line[start:])
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(value, dict) or value.get("kind") != STATE_EVIDENCE_KIND:
+            continue
+        if any(value.get(key) != run[key] for key in ("run_id", "run_attempt", "head")):
+            continue
+        bucket, created = value.get("bucket"), value.get("creation_date")
+        if bucket not in names or not isinstance(created, str):
+            continue
+        require(found.get(bucket, created) == created, "conflicting bucket creation evidence")
+        found[bucket] = created
+    return found
+
+
+def owned_buckets(evidence: Mapping[str, str], current: Mapping[str, str | None], run: Mapping[str, str]) -> list[str]:
+    # Deletion needs this run's create evidence and the same provider creation_date now; a name alone never suffices.
+    return sorted(name for name in state_bucket_names(run).values()
+                  if name in evidence and current.get(name) is not None and current[name] == evidence[name])
+
+
+def encryption_config(current: str, previous: str | None = None) -> str:
+    # TF_ENCRYPTION text with per-run pbkdf2 passphrases; it reaches OpenTofu only through the process environment.
+    blocks = [f'key_provider "pbkdf2" "current" {{\n  passphrase = "{current}"\n}}\n',
+              'method "aes_gcm" "current" {\n  keys = key_provider.pbkdf2.current\n}\n']
+    fallback = ""
+    if previous is not None:
+        blocks += [f'key_provider "pbkdf2" "previous" {{\n  passphrase = "{previous}"\n}}\n',
+                   'method "aes_gcm" "previous" {\n  keys = key_provider.pbkdf2.previous\n}\n']
+        fallback = "  fallback {\n    method = method.aes_gcm.previous\n  }\n"
+    blocks += [f"{target} {{\n  method = method.aes_gcm.current\n{fallback}}}\n" for target in ("state", "plan")]
+    return "".join(blocks)
+
+
+def wrangler_env(tools: Mapping[str, str], scratch: Path, account: str, token: str) -> dict[str, str]:
+    home = Path(tempfile.mkdtemp(prefix="home-wrangler-", dir=scratch))
+    return clean_env(tools, {"CLOUDFLARE_API_TOKEN": token, "CLOUDFLARE_ACCOUNT_ID": account,
+                             "WRANGLER_SEND_METRICS": "false", "HOME": str(home)})
+
+
+def raw_state(tools: Mapping[str, str], scratch: Path, account: str, token: str, bucket: str, runner: Runner) -> bytes | None:
+    # The raw object bytes stay in this process: never stdout, a file, an artifact or a cache.
+    result = runner([tools["wrangler"], "r2", "object", "get", f"{bucket}/{STATE_KEY}", "--remote", "--pipe"], None,
+                    wrangler_env(tools, scratch, account, token))
+    return result.stdout if result.returncode == 0 else None
+
+
+def encrypted_raw(raw: bytes | None, canary: str) -> bool:
+    if raw is None or canary.encode() in raw:
+        return False
+    try:
+        value = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return False
+    return isinstance(value, dict) and isinstance(value.get("encrypted_data"), str) and "resources" not in value
+
+
+def failure_cause(result: subprocess.CompletedProcess[bytes]) -> str:
+    # The captured output is classified in memory and never printed. An S3 status wins over wording; 401 is the
+    # credential as a whole, 403 AccessDenied is its scope; transport noise or any other status is UNKNOWN.
+    text = result.stderr + result.stdout
+    statuses = set(STATE_STATUS.findall(text))
+    if STATE_TRANSIENT.search(text) or any(code.startswith(b"5") for code in statuses) or len(statuses) > 1:
+        return "unknown"
+    if statuses == {b"401"}:
+        return "unauthorized"
+    if statuses == {b"403"}:
+        return "access_denied" if b"AccessDenied" in text else "unknown"
+    if statuses:
+        return "unknown"
+    lowered = text.lower()
+    for cause, word in (("decryption", b"decrypt"), ("encryption", b"encrypt"), ("credential", b"credential")):
+        if word in lowered:
+            return cause
+    return "unknown"
+
+
+def refusal(control: bool, attempt: subprocess.CompletedProcess[bytes], causes: set[str]) -> str:
+    if attempt.returncode == 0:
+        return "ADMITTED"
+    return "REFUSED" if control and failure_cause(attempt) in causes else "UNKNOWN"
+
+
+def credential_probe(root: Path, scratch: Path, name: str, tools: Mapping[str, str], account: str, bucket: str,
+                     credentials: Mapping[str, str], encryption: str,
+                     runner: Runner) -> subprocess.CompletedProcess[bytes]:
+    # A fresh directory each time (no cached backend), with the same valid encryption, credential, bucket and an absent
+    # key inside the allowed prefix, so only the credential can decide the outcome.
+    work, home = scratch / name, scratch / f"home-{name}"
+    work.mkdir()
+    home.mkdir(mode=0o700)
+    (work / "main.tf").write_bytes((root / STATE_BACKEND).read_bytes())
+    env = clean_env(tools, {"TF_IN_AUTOMATION": "1", "TF_INPUT": "0", "HOME": str(home),
+                            "AWS_EC2_METADATA_DISABLED": "true", "TF_VAR_account_id": account, "TF_VAR_bucket": bucket,
+                            "TF_VAR_key": STATE_ALLOWED_PREFIX + "credential-probe.tfstate", "TF_ENCRYPTION": encryption,
+                            **credentials})
+    return runner([tools["tofu"], f"-chdir={work}", "init", "-input=false", "-no-color"], None, env)
+
+
+def state_checks(root: Path, scratch: Path, tools: Mapping[str, str], account: str, token: str,
+                 names: Mapping[str, str], credentials: Mapping[str, str], runner: Runner, spawn: Spawn,
+                 sleep: Callable[[float], None]) -> tuple[dict[str, bool], dict[str, str]]:
+    passphrase, rotated = secrets.token_hex(32), secrets.token_hex(32)
+    first, second = "canary-" + secrets.token_hex(16), "canary-" + secrets.token_hex(16)
+    hold = {"TF_VAR_python": tools["python3"], "TF_VAR_hold_nonce": secrets.token_hex(8),
+            "TF_VAR_hold_seconds": str(STATE_HOLD)}
+    init = ("init", "-input=false", "-no-color")
+    apply = ("apply", "-input=false", "-auto-approve", "-no-color")
+
+    def backend(name: str, *, encryption: str | None, creds: Mapping[str, str] = credentials,
+                bucket: str = names["proof"], key: str = STATE_KEY, canary: str = first) -> tuple[Path, dict[str, str]]:
+        # Every OpenTofu process gets its own directory and empty HOME; only this run's temporary credential and
+        # encryption text reach it, never the parent token.
+        work, home = scratch / name, scratch / f"home-{name}"
+        work.mkdir()
+        home.mkdir(mode=0o700)
+        (work / "main.tf").write_bytes((root / STATE_BACKEND).read_bytes())
+        extra = {"TF_IN_AUTOMATION": "1", "TF_INPUT": "0", "HOME": str(home), "AWS_EC2_METADATA_DISABLED": "true",
+                 "TF_VAR_account_id": account, "TF_VAR_bucket": bucket, "TF_VAR_key": key, "TF_VAR_canary": canary,
+                 **hold, **creds}
+        if encryption is not None:
+            extra["TF_ENCRYPTION"] = encryption
+        return work, clean_env(tools, extra)
+
+    def run(work: Path, env: Mapping[str, str], *args: str) -> subprocess.CompletedProcess[bytes]:
+        return runner([tools["tofu"], f"-chdir={work}", *args], None, env)
+
+    def ok(work: Path, env: Mapping[str, str], *args: str) -> bool:
+        return run(work, env, *args).returncode == 0
+
+    def reads(work: Path, env: Mapping[str, str], expected: str) -> bool:
+        if not ok(work, env, *init):
+            return False
+        result = run(work, env, "output", "-raw", "canary")
+        return result.returncode == 0 and result.stdout == expected.encode()
+
+    def read_attempt(name: str, **options: Any) -> subprocess.CompletedProcess[bytes]:
+        work, env = backend(name, **options)
+        opened = run(work, env, *init)
+        return opened if opened.returncode != 0 else run(work, env, "output", "-raw", "canary")
+
+    checks = dict.fromkeys(STATE_CHECKS, False)
+    negatives = dict.fromkeys(STATE_NEGATIVES, "UNKNOWN")
+    current = encryption_config(passphrase)
+    holder_work, holder_env = backend("holder", encryption=current)
+    contender_work, contender_env = backend("contender", encryption=current)
+    if not (ok(holder_work, holder_env, *init) and ok(contender_work, contender_env, *init)):
+        return checks, negatives
+    holder = spawn([tools["tofu"], f"-chdir={holder_work}", *apply], holder_env)
+    code = None
+    try:
+        sleep(STATE_SETTLE)
+        contender = run(contender_work, contender_env, "plan", "-lock-timeout=0", "-input=false", "-no-color")
+        checks["lock_contender_rejected"] = contender.returncode != 0 and STATE_LOCK_ERROR in contender.stderr + contender.stdout
+        code = holder.wait(timeout=STATE_HOLD + 300)
+    except subprocess.TimeoutExpired:
+        code = None
+    finally:
+        if code is None:
+            stop(holder)
+    checks["lock_holder_applied"] = code == 0
+    checks["lock_released"] = run(contender_work, contender_env, "plan", "-lock-timeout=0", "-detailed-exitcode",
+                                  "-input=false", "-no-color").returncode == 0
+    before = raw_state(tools, scratch, account, token, names["proof"], runner)
+    checks["raw_state_encrypted"] = encrypted_raw(before, first)
+    checks["readback_exact"] = reads(*backend("readback", encryption=current), first)
+    rotate_work, rotate_env = backend("rotate", encryption=encryption_config(rotated, passphrase), canary=second)
+    rewritten = ok(rotate_work, rotate_env, *init) and ok(rotate_work, rotate_env, *apply)
+    after = raw_state(tools, scratch, account, token, names["proof"], runner)
+    checks["rotation_rewritten"] = rewritten and encrypted_raw(after, second) and after != before
+    only_rotated = encryption_config(rotated)
+    checks["rotated_readback"] = reads(*backend("rotated", encryption=only_rotated), second)
+    # Each negative runs right after a control that differs only in the input under test.
+    control = reads(*backend("old-key-control", encryption=only_rotated), second)
+    negatives["old_key_refused"] = refusal(control, read_attempt("old-key", encryption=current),
+                                           STATE_NEGATIVES["old_key_refused"])
+    control = reads(*backend("no-encryption-control", encryption=only_rotated), second)
+    negatives["unencrypted_read_refused"] = refusal(control, read_attempt("no-encryption", encryption=None),
+                                                    STATE_NEGATIVES["unencrypted_read_refused"])
+    control = ok(*backend("no-credential-control", encryption=only_rotated), *init)
+    work, env = backend("no-credential", encryption=only_rotated, creds={})
+    negatives["no_credential_refused"] = refusal(control, run(work, env, *init), STATE_NEGATIVES["no_credential_refused"])
+    # The prefix is tested by OpenTofu's own lock-file write; the control takes and releases the lock inside it.
+    lock = ("plan", "-lock-timeout=0", "-input=false", "-no-color")
+    control_work, control_env = backend("outside-prefix-control", encryption=only_rotated, canary=second)
+    control = ok(control_work, control_env, *init) and ok(control_work, control_env, *lock)
+    work, env = backend("outside-prefix", encryption=only_rotated, key=STATE_OUTSIDE_KEY, canary=second)
+    opened = run(work, env, *init)
+    # An init already refused proves no write denial: the write result stays UNKNOWN.
+    negatives["outside_prefix_write_refused"] = "UNKNOWN" if opened.returncode != 0 else refusal(
+        control, run(work, env, *lock), STATE_NEGATIVES["outside_prefix_write_refused"])
+    control = ok(*backend("decoy-control", encryption=only_rotated), *init)
+    work, env = backend("decoy", encryption=only_rotated, bucket=names["decoy"])
+    negatives["decoy_refused"] = refusal(control, run(work, env, *init), STATE_NEGATIVES["decoy_refused"])
+    # The negatives mean something only if the same credential still reads the same state after them.
+    checks["path_up_after_negatives"] = reads(*backend("bracket", encryption=only_rotated), second)
+    return checks, negatives
+
+
+def state_cleanup(root: Path, tools: Mapping[str, str], scratch: Path, account: str, token: str,
+                  run: Mapping[str, str], names: Mapping[str, str], outer: Path, outer_env: Mapping[str, str],
+                  created: dict[str, str] | None, credential: str, control: bool, issued: float | None,
+                  credentials: Mapping[str, str] | None, encryption: str, runner: Runner, api: Api,
+                  sleep: Callable[[float], None], clock: Callable[[], float]) -> dict[str, Any]:
+    # Runs once: after the TTL, the same credential must be refused 401 in a fresh directory; delete only the exact
+    # expected keys and only buckets this run provably created, then read both names back. Doubt is never ABSENT.
+    report: dict[str, Any] = {"credential": credential, "buckets": "UNKNOWN", "owned": [], "cleanup": "UNKNOWN"}
+    if credential == "ISSUED":
+        report["credential"] = "UNKNOWN"
+        try:
+            if control and issued is not None and credentials is not None:
+                sleep(max(0.0, issued + STATE_CREDENTIAL_TTL + STATE_EXPIRY_GRACE - clock()))
+                after = credential_probe(root, scratch, "unusable-after-ttl", tools, account, names["proof"],
+                                         credentials, encryption, runner)
+                if after.returncode == 0:
+                    report["credential"] = "STILL_USABLE"
+                elif failure_cause(after) == "unauthorized":
+                    report["credential"] = "UNUSABLE_AFTER_TTL"
+        except STATE_FAILURES:
+            # A probe that could not run observes nothing: the credential stays UNKNOWN and cleanup still proceeds.
+            report["credential"] = "UNKNOWN"
+    if created is None:
+        return report
+    # Phase 1: ownership needs a complete current readback; without it nothing is deleted.
+    try:
+        current = {name: bucket_creation(api, account, token, name) for name in names.values()}
+    except STATE_FAILURES:
+        return report
+    owned = owned_buckets(created, current, run)
+    report["owned"] = owned
+    # Phase 2: delete only the exact keys, then only owned buckets; a failure here is settled by the readback below.
+    try:
+        if names["proof"] in owned:
+            env = wrangler_env(tools, scratch, account, token)
+            for key in (STATE_KEY, STATE_KEY + ".tflock"):
+                runner([tools["wrangler"], "r2", "object", "delete", f"{names['proof']}/{key}", "--remote"], None, env)
+    except STATE_FAILURES:
+        pass
+    try:
+        present = {name for name, value in current.items() if value is not None}
+        if present and present <= set(owned):
+            runner([tools["tofu"], f"-chdir={outer}", "destroy", "-input=false", "-auto-approve", "-no-color",
+                    "-var", "decoy=true"], None, outer_env)
+    except STATE_FAILURES:
+        pass
+    # Phase 3: the final readback always runs after phase 1; a readback that fails is UNKNOWN, never ABSENT.
+    try:
+        after_buckets = [bucket_creation(api, account, token, name) for name in names.values()]
+        report["buckets"] = "LEFTOVER" if any(value is not None for value in after_buckets) else "ABSENT"
+    except STATE_FAILURES:
+        report["buckets"] = "UNKNOWN"
+    if report["buckets"] == "LEFTOVER":
+        report["cleanup"] = "LEFTOVER"
+    elif report["buckets"] == "ABSENT" and report["credential"] in {"NOT_ATTEMPTED", "UNUSABLE_AFTER_TTL"}:
+        report["cleanup"] = "ABSENT"
+    return report
+
+
+def state_proof(root: Path = ROOT, *, runner: Runner = default_runner, api: Api = default_api,
+                spawn: Spawn = default_spawn, sleep: Callable[[float], None] = time.sleep,
+                clock: Callable[[], float] = time.time) -> dict[str, Any]:
+    contracts = validate_contracts(root)
+    tools = toolchain(root)
+    inputs = gate(root, contracts, STATE_PLANE)
+    token, account, parent = (inputs[name] for name in ("R2_PARENT_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID",
+                                                        "R2_PARENT_ACCESS_KEY_ID"))
+    reject_live_values(root, "R2_PARENT_API_TOKEN", [token])
+    run = run_identity(os.environ)
+    names = state_bucket_names(run)
+    result: dict[str, Any] = {
+        "kind": "envs.rentStateProofResult.v1", "status": "UNKNOWN", "stage": "preflight", "buckets": names,
+        "parent": verify_parent(api, account, token, parent, clock()), "checks": None, "negatives": None,
+        "credential": "NOT_ATTEMPTED", "credential_control": None, "cleanup": "NOT_STARTED",
+        "production_state": "UNTOUCHED", "existing_buckets": "UNTOUCHED",
+    }
+    for name in names.values():
+        require(bucket_creation(api, account, token, name) is None, "a per-run bucket name already exists")
+    with tempfile.TemporaryDirectory(prefix="envs-state-proof-") as temporary:
+        scratch = Path(temporary)
+        outer, home = scratch / "outer", scratch / "home-outer"
+        outer.mkdir()
+        home.mkdir(mode=0o700)
+        (outer / "main.tf").write_bytes((root / STATE_CONFIG).read_bytes())
+        outer_env = clean_env(tools, {"CLOUDFLARE_API_TOKEN": token, "TF_VAR_account_id": account,
+                                      "TF_VAR_run": run["scope"], "TF_IN_AUTOMATION": "1", "TF_INPUT": "0",
+                                      "HOME": str(home)})
+        created: dict[str, str] | None = {}
+        issued: float | None = None
+        credentials: dict[str, str] | None = None
+        control = False
+        probe_encryption = encryption_config(secrets.token_hex(32))
+        try:
+            tofu(tools, outer, outer_env, runner, "init", "-input=false", "-no-color")
+            result["stage"] = "create"
+            # The first bounded create is the only capability probe: no decoy, credential or state before it.
+            for decoy, label in (("false", "the first bounded bucket create"), ("true", "the decoy bucket create")):
+                applied = True
+                try:
+                    tofu(tools, outer, outer_env, runner, "apply", "-input=false", "-auto-approve", "-no-color",
+                         "-var", f"decoy={decoy}")
+                except EnvsError:
+                    applied = False
+                finally:
+                    created = record_created(tools, outer, outer_env, runner, run, created)
+                require(applied and created is not None and names["proof"] in created, f"{label} did not succeed")
+            require(created is not None and set(created) == set(names.values()), "created bucket set differs")
+            result["stage"] = "credential"
+            # Recorded before the one POST: after any failure the provider may still have issued a credential.
+            result["credential"] = "ATTEMPTED"
+            try:
+                credentials = temporary_credentials(api, account, token, parent, names["proof"])
+            except STATE_FAILURES:
+                result["credential"] = "ISSUANCE_UNKNOWN"
+                raise
+            issued = clock()
+            result["credential"] = "ISSUED"
+            opened = credential_probe(root, scratch, "usable-control", tools, account, names["proof"], credentials,
+                                      probe_encryption, runner)
+            control = opened.returncode == 0
+            result["credential_control"] = "USABLE" if control else "UNKNOWN"
+            result["stage"] = "proof"
+            checks, negatives = state_checks(root, scratch, tools, account, token, names, credentials, runner, spawn,
+                                             sleep)
+            result["checks"], result["negatives"] = checks, negatives
+            if not all(checks.values()) or "ADMITTED" in negatives.values():
+                result["status"] = "STATE_BACKEND_RED"
+            elif control and set(negatives.values()) == {"REFUSED"}:
+                result["status"] = "STATE_BACKEND_PROVEN"
+            else:
+                result["status"] = "UNKNOWN"
+        except EnvsError as exc:
+            result["error"] = str(exc)
+            result["status"] = "STATE_BACKEND_RED"
+        except (OSError, subprocess.SubprocessError) as exc:
+            # A local launch or storage failure proves nothing about R2: UNKNOWN, named by class only (no paths).
+            result["error"] = type(exc).__name__
+            result["status"] = "UNKNOWN"
+        finally:
+            result.update(state_cleanup(root, tools, scratch, account, token, run, names, outer, outer_env, created,
+                                        result["credential"], control, issued, credentials, probe_encryption, runner,
+                                        api, sleep, clock))
+    if result["cleanup"] != "ABSENT":
+        # Resources or a usable credential may remain: no proof outcome stands as the status.
+        result["status"] = result["cleanup"]
+    return result
+
+
 def walk_receipt(value: Any) -> None:
     if isinstance(value, dict):
         for key, item in value.items():
@@ -1135,6 +1708,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     sub.add_parser("rent-tunnel")
     sub.add_parser("rent-access-probe")
     sub.add_parser("rent-access-locate")
+    sub.add_parser("rent-state-proof")
     project_parser = sub.add_parser("project")
     project_parser.add_argument("--envs-sha", required=True)
     project_parser.add_argument("--run-id", type=int, required=True)
@@ -1169,6 +1743,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             passed = result["status"] == "NONE_LOCATED" if args.command == "rent-access-locate" else (
                 result["status"] == "TOKEN_REACHED_NEGATIVES_REFUSED" and result.get("cleanup") == "ABSENT")
             return 0 if passed else 1
+        elif args.command == "rent-state-proof":
+            result = state_proof(root)
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return 0 if result["status"] == "STATE_BACKEND_PROVEN" and result["cleanup"] == "ABSENT" else 1
         else:
             receipt = project(
                 envs_sha=args.envs_sha, run_id=args.run_id, run_attempt=args.run_attempt,
@@ -1177,7 +1755,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps({"kind": receipt["kind"], "status": "PASS", "output": str(args.output)}, sort_keys=True))
     except (EnvsError, OSError) as exc:
         label = {"rent-tunnel": "RENT_TUNNEL", "rent-access-probe": "RENT_ACCESS_PROBE",
-                 "rent-access-locate": "RENT_ACCESS_PROBE"}.get(args.command, "JEV_API")
+                 "rent-access-locate": "RENT_ACCESS_PROBE", "rent-state-proof": "RENT_STATE_PROOF"}.get(args.command, "JEV_API")
         print(f"{label}=RED: {exc}", file=sys.stderr)
         return 1
     return 0
