@@ -28,7 +28,7 @@ flake.nix, flake.lock
 contracts/
 ciphertexts/       # absent while dev (Jev, rent tunnel) is NOT_CONFIGURED
 adapters/jev_api.py
-providers/         # disposable probe declarations only; never state or lock files
+providers/         # disposable probe and state-proof declarations only; never state or lock files
 handoffs/          # absent until real projection/readback PASS
 checks/
 LICENSES/
@@ -63,6 +63,8 @@ THIRD_PARTY_NOTICES.md
 | `dev-rent-access-probe/CLOUDFLARE_API_TOKEN` | secret | opaque | persistent |
 | `dev-rent-access-probe/CLOUDFLARE_ACCOUNT_ID` | variable | cloudflare_account_id | persistent |
 | `dev-rent-access-probe/CLOUDFLARE_ZONE_ID` | variable | cloudflare_zone_id | persistent |
+| `dev-rent-access-probe/R2_PARENT_API_TOKEN` | secret | opaque | finite_expiry |
+| `dev-rent-access-probe/R2_PARENT_ACCESS_KEY_ID` | variable | cloudflare_api_token_id | finite_expiry |
 | `stg-projection/JEV_API_KEY` | secret | opaque | persistent |
 | `stg-projection/CLOUDFLARE_API_TOKEN` | secret | opaque | persistent |
 | `stg-projection/CLOUDFLARE_ACCOUNT_ID` | variable | cloudflare_account_id | persistent |
@@ -70,7 +72,7 @@ THIRD_PARTY_NOTICES.md
 | `prd-projection/CLOUDFLARE_API_TOKEN` | secret | opaque | persistent |
 | `prd-projection/CLOUDFLARE_ACCOUNT_ID` | variable | cloudflare_account_id | persistent |
 
-There are no stg or prd authoring Environments.
+There are no stg or prd authoring Environments. `dev-rent-access-probe` carries two planes: the Access probe reads `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ZONE_ID`, the state proof (`dev.rent-state-proof`) reads `R2_PARENT_API_TOKEN` and `R2_PARENT_ACCESS_KEY_ID`, both read `CLOUDFLARE_ACCOUNT_ID`, and neither reads the other's secret.
 
 ## Dev Jev flow
 
@@ -159,6 +161,29 @@ Not proven here: that `cloudflared` 2026.6.1 honours a service token (a reported
 
 Not proven here, and not owned by envs: a real provider retrieval or dispatch of this workflow, the Cloudflare API token scope it needs, whether Actions may open the handoff PR (a PR opened with the workflow token does not trigger `check`), the target's age identity, applying the ciphertext on the target, the client credential, and unattended SSH.
 
+## Dev rent R2 state proof (windows #8/#14)
+
+Before any production state, one bounded run must show that the bundled OpenTofu keeps encrypted state with a native lock file in Cloudflare R2. `providers/dev-rent-state-proof/main.tf` declares exactly two per-run buckets (`windows-rent-state-proof-<run_id>-<attempt>` and its `-decoy`); `providers/dev-rent-state-proof/backend/main.tf` is an S3-backend root on the proof bucket with `use_lockfile = true`, enforced state and plan encryption, and only built-in resources.
+
+```text
+dev-rent-access-probe/R2_PARENT_API_TOKEN, R2_PARENT_ACCESS_KEY_ID, CLOUDFLARE_ACCOUNT_ID
+→ probe-dev-rent-state (manual dispatch on proposals only; read-only repository permissions)
+→ parent verify: ID equals R2_PARENT_ACCESS_KEY_ID, active, not_before passed, expiry covers the job bound + margin
+→ both per-run names absent; first bounded create (proof bucket) is the only capability probe, then the decoy
+→ one temporary credential: proof bucket, prefix state/, object-read-write, 900 s, never the parent token
+→ one lock holder and one refused contender, then release; raw object is ciphertext without the canary;
+   fresh-directory readback; pbkdf2 key rotation through fallback; old key, no encryption, no credential,
+   outside prefix and decoy bucket refused; the same credential reads again after the negatives
+→ cleanup once: credential observed refused after its TTL, exact keys deleted, owned buckets destroyed, both names 404
+```
+
+- Every OpenTofu process gets its own directory and empty HOME. The parent token reaches only the bucket root, Wrangler and the Cloudflare API; the temporary credential and the `TF_ENCRYPTION` text reach only the backend root, by environment. Neither enters argv, `-backend-config`, a log line, the result JSON, an artifact, a cache or Git; the raw state object stays in process memory.
+- Right after each create the run emits one evidence line per bucket (`envs.rentStateProofCreated.v1`: bucket, provider `creation_date`, run ID, attempt, head). Cleanup deletes only a bucket whose evidence and current `creation_date` match; a bucket name alone never authorizes deletion. The same parser reads those lines from a job log as recovery input for a later exact contract.
+- `STATE_BACKEND_PROVEN` needs every check and `cleanup` `ABSENT`. A remaining bucket is `LEFTOVER`, an unobserved credential expiry or unreadable evidence `UNKNOWN`; either replaces the status, with no retry. Force cancellation or runner loss can bypass cleanup.
+- `checks/test_rent_state_proof.py` proves the gates, order, isolation, redaction, outcome classes, cleanup model and evidence parser against a fake provider; `check` initializes and validates both roots with network access closed and checks Wrangler's `r2 object get --pipe --remote` shape.
+
+Not proven here: any real R2 effect, the parent token's permission (only the first bounded create proves it), R2 lock-file and prefix-scoped temporary-credential behaviour, or production state. The live run needs its own contract.
+
 ## Effect toolchain
 
 `flake.nix` and `flake.lock` define the only toolchain for authoring and projection: Python, SOPS, Wrangler, Git, and GitHub CLI from the locked nixpkgs input, plus the `envs-effect` entry running this source's adapter. `.#effect-artifact` is that entry's complete store closure as one tar with an `ENTRY` pointer.
@@ -185,6 +210,7 @@ python3 checks/test_repository.py
 python3 checks/test_jev_api.py                                        # --sops/--age-keygen in check: real OCI roundtrip
 python3 checks/test_rent_tunnel.py
 python3 checks/test_rent_access_probe.py
+python3 checks/test_rent_state_proof.py
 nix build .#effect-toolchain .#effect-artifact --no-update-lock-file   # check workflow, toolchain job
 nix build .#check-age --no-update-lock-file                             # check-only, real SOPS roundtrip
 ```

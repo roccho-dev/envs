@@ -45,6 +45,9 @@ jobs:
       - name: Test access probe adapter
         run: python3 checks/test_rent_access_probe.py
 
+      - name: Test state proof adapter
+        run: python3 checks/test_rent_state_proof.py
+
       - name: Verify explicit main compatibility refresh
         if: github.ref_name == 'main'
         run: python3 checks/repository.py --verify-main-compatibility-refresh
@@ -126,6 +129,26 @@ jobs:
           "$tool/tofu" -chdir="$probe" validate -no-color
           "$tool/ssh" -V
           "$tool/python3" -I checks/test_rent_access_probe.py --real-ssh "$tool"
+
+      # The state proof roots come from the same closure: both initialized and validated with every network route
+      # closed (the backend root without a backend), the Wrangler raw-read argv shape, and the self-test.
+      - name: State proof roots from the closure without network or credentials
+        run: |
+          set -euo pipefail
+          tool="$RUNNER_TEMP/envs-effect/bin"
+          state="$RUNNER_TEMP/state-config"
+          mkdir -p "$state/backend"
+          cp providers/dev-rent-state-proof/main.tf "$state/"
+          cp providers/dev-rent-state-proof/backend/main.tf "$state/backend/"
+          HTTPS_PROXY=http://127.0.0.1:9 HTTP_PROXY=http://127.0.0.1:9 "$tool/tofu" -chdir="$state" init -input=false -no-color
+          "$tool/tofu" -chdir="$state" validate -no-color
+          HTTPS_PROXY=http://127.0.0.1:9 HTTP_PROXY=http://127.0.0.1:9 "$tool/tofu" -chdir="$state/backend" init -backend=false -input=false -no-color
+          "$tool/tofu" -chdir="$state/backend" validate -no-color
+          "$tool/tofu" version
+          "$tool/wrangler" r2 object get --help >"$RUNNER_TEMP/r2-object-get.help" 2>&1 || true
+          grep -qF -- --pipe "$RUNNER_TEMP/r2-object-get.help"
+          grep -qF -- --remote "$RUNNER_TEMP/r2-object-get.help"
+          "$tool/python3" -I checks/test_rent_state_proof.py
 
       - name: Test Jev adapter on the toolchain interpreter
         run: '"$RUNNER_TEMP/envs-effect/bin/python3" -I checks/test_jev_api.py'

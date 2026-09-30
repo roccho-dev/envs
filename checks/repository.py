@@ -19,6 +19,7 @@ REQUIRED_FILES = {
     ".github/workflows/project-dev-jev-api.yml",
     ".github/workflows/project-dev-rent-tunnel.yml",
     ".github/workflows/probe-dev-rent-access-ssh.yml",
+    ".github/workflows/probe-dev-rent-state.yml",
     ".gitignore",
     "LICENSE_POLICY.md",
     "LICENSES/README.md",
@@ -28,6 +29,7 @@ REQUIRED_FILES = {
     "checks/repository.py",
     "checks/test_jev_api.py",
     "checks/test_rent_access_probe.py",
+    "checks/test_rent_state_proof.py",
     "checks/test_rent_tunnel.py",
     "checks/test_repository.py",
     "contracts/bindings.jsonl",
@@ -37,6 +39,8 @@ REQUIRED_FILES = {
     "flake.lock",
     "flake.nix",
     "providers/dev-rent-access-probe/main.tf",
+    "providers/dev-rent-state-proof/main.tf",
+    "providers/dev-rent-state-proof/backend/main.tf",
 }
 ALLOWED_ROOTS = {
     ".github",
@@ -97,8 +101,23 @@ EFFECT_WORKFLOWS = {
     "project-dev-jev-api.yml": "dev.projection",
     "project-dev-rent-tunnel.yml": "dev.rent-tunnel",
     "probe-dev-rent-access-ssh.yml": "dev.rent-access-probe",
+    "probe-dev-rent-state.yml": "dev.rent-state-proof",
 }
 PROBE_CONFIG = "providers/dev-rent-access-probe/main.tf"
+STATE_CONFIG = "providers/dev-rent-state-proof/main.tf"
+STATE_BACKEND = "providers/dev-rent-state-proof/backend/main.tf"
+# check initializes and validates both state-proof roots from the built closure with every network route closed, proves
+# the Wrangler raw-read argv shape, and runs the state-proof self-test on the closure interpreter.
+STATE_TOOL_CHECKS = (
+    'HTTPS_PROXY=http://127.0.0.1:9 HTTP_PROXY=http://127.0.0.1:9 "$tool/tofu" -chdir="$state" init -input=false -no-color',
+    '"$tool/tofu" -chdir="$state" validate -no-color',
+    'HTTPS_PROXY=http://127.0.0.1:9 HTTP_PROXY=http://127.0.0.1:9 "$tool/tofu" -chdir="$state/backend" init -backend=false'
+    ' -input=false -no-color',
+    '"$tool/tofu" -chdir="$state/backend" validate -no-color',
+    'grep -qF -- --pipe "$RUNNER_TEMP/r2-object-get.help"',
+    'grep -qF -- --remote "$RUNNER_TEMP/r2-object-get.help"',
+    '"$tool/python3" -I checks/test_rent_state_proof.py',
+)
 # check proves the probe tools from the built closure: exact client version, its token flags, and an OpenTofu
 # init/validate of the provider declaration with every network route closed.
 PROBE_TOOL_CHECKS = (
@@ -221,8 +240,10 @@ def check_shape(root: Path) -> None:
         require(bool(ciphertexts) and set(ciphertexts) <= CIPHERTEXTS, f"unexpected ciphertexts: {ciphertexts}")
 
     providers = sorted(path.relative_to(root).as_posix() for path in (root / "providers").rglob("*") if path.is_file())
-    require(providers == [PROBE_CONFIG], f"unexpected provider files (state or lock files are never committed): {providers}")
+    require(providers == sorted([PROBE_CONFIG, STATE_CONFIG, STATE_BACKEND]),
+            f"unexpected provider files (state or lock files are never committed): {providers}")
     check_probe_config((root / PROBE_CONFIG).read_text(encoding="utf-8"))
+    check_state_config((root / STATE_CONFIG).read_text(encoding="utf-8"), (root / STATE_BACKEND).read_text(encoding="utf-8"))
 
     handoff_dir = root / "handoffs"
     if handoff_dir.exists():
@@ -249,6 +270,36 @@ def check_probe_config(text: str) -> None:
             "probe names differ")
     require(re.search(r'(?ms)^output "credentials" \{\n  sensitive = true\n', text) is not None,
             "probe credentials must be a sensitive output")
+
+
+def check_state_config(buckets: str, backend: str) -> None:
+    # Buckets: the standard provider at the locked version, local ephemeral state, exactly the proof bucket and a
+    # count-gated decoy, both named from the run; no existing or reserved bucket, adoption or other resource.
+    require('source  = "cloudflare/cloudflare"' in buckets and 'version = "5.21.1"' in buckets,
+            "state buckets must pin the standard Cloudflare provider")
+    for token in ("backend", "cloud {", "import {", "removed {", "moved {", "provisioner", "local-exec", "data \""):
+        require(token not in buckets, f"state buckets must not use {token.strip(' {')}")
+    resources = re.findall(r'(?m)^resource "([a-z0-9_]+)" "([a-z]+)" \{$', buckets)
+    require(resources == [("cloudflare_r2_bucket", "proof"), ("cloudflare_r2_bucket", "decoy")]
+            and buckets.count("\nresource \"") == 2, "state buckets must be exactly proof and decoy")
+    require('  name = "windows-rent-state-proof-${var.run}"\n' in buckets and '  count      = var.decoy ? 1 : 0\n' in buckets
+            and '  name       = "${local.name}-decoy"\n' in buckets and '  name       = local.name\n' in buckets,
+            "state bucket names must derive from the run and the decoy must be gated")
+    require('"windows-rent-state"' not in buckets, "the reserved production state bucket is never declared")
+    # Backend: native S3 lock file on R2 and enforced native encryption; no credential, provider or server-side flag.
+    for marker in ('  backend "s3" {\n', "    bucket                      = var.bucket\n",
+                   "    key                         = var.key\n", "    use_lockfile                = true\n",
+                   '    endpoints                   = { s3 = "https://${var.account_id}.r2.cloudflarestorage.com" }\n',
+                   "    state {\n      enforced = true\n    }\n", "    plan {\n      enforced = true\n    }\n"):
+        require(marker in backend, f"state backend differs: {marker.strip()}")
+    for token in ("access_key", "secret_key", "token", "encrypt ", "encrypt=", "required_providers", "passphrase",
+                  "cloudflare_", "dynamodb", "profile", "shared_"):
+        require(token not in backend, f"state backend must not carry {token.strip()}")
+    backend_resources = re.findall(r'(?m)^resource "([a-z_]+)" "([a-z]+)" \{$', backend)
+    require(backend_resources == [("terraform_data", "canary"), ("terraform_data", "hold")],
+            "state backend resources must be the built-in canary and lock holder only")
+    require("    interpreter = [var.python, \"-I\", \"-c\"]\n" in backend and backend.count("local-exec") == 1,
+            "the lock holder must run only the closure interpreter")
 
 
 def check_text(root: Path) -> None:
@@ -365,7 +416,7 @@ def check_author_targets(text: str, targets: dict[str, set[tuple[str, str]]]) ->
 
 
 def check_workflows(root: Path, environments: dict[str, dict[str, Any]],
-                    author_targets: dict[str, set[tuple[str, str]]]) -> None:
+                    author_targets: dict[str, set[tuple[str, str]]], adapter) -> None:
     workflow_root = root / ".github/workflows"
     names = {path.name for path in workflow_root.iterdir() if path.is_file()}
     require(
@@ -390,6 +441,7 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]],
     require("checks/test_jev_api.py" in check, "check workflow must test Jev adapter")
     require("run: python3 checks/test_rent_tunnel.py\n" in check, "check workflow must test the rent tunnel adapter")
     require("run: python3 checks/test_rent_access_probe.py\n" in check, "check workflow must test the access probe adapter")
+    require("run: python3 checks/test_rent_state_proof.py\n" in check, "check workflow must test the state proof adapter")
     require(TOOLCHAIN_BUILD in check, "check workflow must reconstruct the effect toolchain")
     require(f'{TOOLCHAIN_BIN}envs-effect" toolchain' in check, "check workflow must execute the effect entry")
     require(f'{TOOLCHAIN_BIN}python3" -I checks/test_jev_api.py' in check,
@@ -429,6 +481,8 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]],
         require(marker in toolchain, f"check must run the real SOPS roundtrip with check-only age: {marker}")
     for marker in PROBE_TOOL_CHECKS:
         require(marker in toolchain, f"check must prove the probe tools from the closure: {marker}")
+    for marker in STATE_TOOL_CHECKS:
+        require(marker in toolchain, f"check must prove the state proof roots from the closure: {marker}")
     require(toolchain.find(REAL_ROUNDTRIP) < toolchain.find('if grep -qxF "$age"') and toolchain.find(ARTIFACT_BUILD)
             < toolchain.find('if grep -qxF "$age"'), "check-only age must be proven outside the built artifact")
     require(toolchain.find(CHECK_AGE_BUILD) < toolchain.find(OCI_ROUNDTRIP) < toolchain.find('if grep -qxF "$age"'),
@@ -522,6 +576,16 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]],
     require("permissions:\n  actions: read\n  contents: read\n" in probe and "write" not in probe,
             "access probe workflow must be read-only on the repository")
     require("rent-access-locate" not in probe, "live name lookup dispatch needs its own contract")
+    state = texts["probe-dev-rent-state.yml"]
+    require(f"run: '{EFFECT_ENTRY} rent-state-proof'" in state and state.count(" rent-state-proof'") == 1,
+            "state proof workflow entry call missing")
+    require("permissions:\n  actions: read\n  contents: read\n" in state and "write" not in state,
+            "state proof workflow must be read-only on the repository")
+    require(f"    timeout-minutes: {adapter.STATE_JOB_MINUTES}\n" in state and state.count("timeout-minutes:") == 1,
+            "state proof job bound differs from the adapter's expiry window")
+    # One Environment, two meanings kept apart: neither workflow maps the other's secret.
+    require("CLOUDFLARE_API_TOKEN" not in state and "R2_PARENT_" not in probe,
+            "the access probe and state proof secrets must stay distinct")
 
 
 def check_toolchain(root: Path, adapter) -> None:
@@ -566,6 +630,10 @@ def check_readme(root: Path, environments: dict[str, dict[str, Any]]) -> None:
         PROBE_CONFIG,
         "checks/test_rent_access_probe.py",
         "name lookup locates candidates and never proves ownership",
+        STATE_CONFIG,
+        STATE_BACKEND,
+        "checks/test_rent_state_proof.py",
+        "a bucket name alone never authorizes deletion",
         "dev-authoring/OCI_DEV_AGE_RECIPIENT",
         "ciphertexts/dev-jev-api.oci-dev.sops.yaml",
         "`author --target jev-api.oci-dev`",
@@ -603,7 +671,7 @@ def inspect(root: Path = ROOT, *, verify_main_compatibility_refresh: bool = Fals
     environments = contracts["environments"]
     if (root / adapter.HANDOFF).is_file():
         adapter.load_receipt(root / adapter.HANDOFF)
-    check_workflows(root, environments, author_target_inputs(adapter, contracts))
+    check_workflows(root, environments, author_target_inputs(adapter, contracts), adapter)
     check_toolchain(root, adapter)
     check_readme(root, environments)
     if verify_main_compatibility_refresh:
