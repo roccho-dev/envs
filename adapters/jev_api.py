@@ -125,6 +125,10 @@ class EnvsError(ValueError):
     pass
 
 
+# State proof: provider doubt (EnvsError) and local launch or storage failures; none may bypass cleanup or become evidence.
+STATE_FAILURES = (EnvsError, OSError, subprocess.SubprocessError)
+
+
 Runner = Callable[
     [Sequence[str], bytes | None, Mapping[str, str] | None],
     subprocess.CompletedProcess[bytes],
@@ -1409,30 +1413,47 @@ def state_cleanup(root: Path, tools: Mapping[str, str], scratch: Path, account: 
     report: dict[str, Any] = {"credential": credential, "buckets": "UNKNOWN", "owned": [], "cleanup": "UNKNOWN"}
     if credential == "ISSUED":
         report["credential"] = "UNKNOWN"
-        if control and issued is not None and credentials is not None:
-            sleep(max(0.0, issued + STATE_CREDENTIAL_TTL + STATE_EXPIRY_GRACE - clock()))
-            after = credential_probe(root, scratch, "unusable-after-ttl", tools, account, names["proof"], credentials,
-                                     encryption, runner)
-            if after.returncode == 0:
-                report["credential"] = "STILL_USABLE"
-            elif failure_cause(after) == "unauthorized":
-                report["credential"] = "UNUSABLE_AFTER_TTL"
+        try:
+            if control and issued is not None and credentials is not None:
+                sleep(max(0.0, issued + STATE_CREDENTIAL_TTL + STATE_EXPIRY_GRACE - clock()))
+                after = credential_probe(root, scratch, "unusable-after-ttl", tools, account, names["proof"],
+                                         credentials, encryption, runner)
+                if after.returncode == 0:
+                    report["credential"] = "STILL_USABLE"
+                elif failure_cause(after) == "unauthorized":
+                    report["credential"] = "UNUSABLE_AFTER_TTL"
+        except STATE_FAILURES:
+            # A probe that could not run observes nothing: the credential stays UNKNOWN and cleanup still proceeds.
+            report["credential"] = "UNKNOWN"
+    if created is None:
+        return report
+    # Phase 1: ownership needs a complete current readback; without it nothing is deleted.
     try:
-        if created is not None:
-            current = {name: bucket_creation(api, account, token, name) for name in names.values()}
-            owned = owned_buckets(created, current, run)
-            report["owned"] = owned
-            if names["proof"] in owned:
-                env = wrangler_env(tools, scratch, account, token)
-                for key in (STATE_KEY, STATE_KEY + ".tflock"):
-                    runner([tools["wrangler"], "r2", "object", "delete", f"{names['proof']}/{key}", "--remote"], None, env)
-            present = {name for name, value in current.items() if value is not None}
-            if present and present <= set(owned):
-                runner([tools["tofu"], f"-chdir={outer}", "destroy", "-input=false", "-auto-approve", "-no-color",
-                        "-var", "decoy=true"], None, outer_env)
-            after_buckets = [bucket_creation(api, account, token, name) for name in names.values()]
-            report["buckets"] = "LEFTOVER" if any(value is not None for value in after_buckets) else "ABSENT"
-    except EnvsError:
+        current = {name: bucket_creation(api, account, token, name) for name in names.values()}
+    except STATE_FAILURES:
+        return report
+    owned = owned_buckets(created, current, run)
+    report["owned"] = owned
+    # Phase 2: delete only the exact keys, then only owned buckets; a failure here is settled by the readback below.
+    try:
+        if names["proof"] in owned:
+            env = wrangler_env(tools, scratch, account, token)
+            for key in (STATE_KEY, STATE_KEY + ".tflock"):
+                runner([tools["wrangler"], "r2", "object", "delete", f"{names['proof']}/{key}", "--remote"], None, env)
+    except STATE_FAILURES:
+        pass
+    try:
+        present = {name for name, value in current.items() if value is not None}
+        if present and present <= set(owned):
+            runner([tools["tofu"], f"-chdir={outer}", "destroy", "-input=false", "-auto-approve", "-no-color",
+                    "-var", "decoy=true"], None, outer_env)
+    except STATE_FAILURES:
+        pass
+    # Phase 3: the final readback always runs after phase 1; a readback that fails is UNKNOWN, never ABSENT.
+    try:
+        after_buckets = [bucket_creation(api, account, token, name) for name in names.values()]
+        report["buckets"] = "LEFTOVER" if any(value is not None for value in after_buckets) else "ABSENT"
+    except STATE_FAILURES:
         report["buckets"] = "UNKNOWN"
     if report["buckets"] == "LEFTOVER":
         report["cleanup"] = "LEFTOVER"
@@ -1494,7 +1515,7 @@ def state_proof(root: Path = ROOT, *, runner: Runner = default_runner, api: Api 
             result["credential"] = "ATTEMPTED"
             try:
                 credentials = temporary_credentials(api, account, token, parent, names["proof"])
-            except EnvsError:
+            except STATE_FAILURES:
                 result["credential"] = "ISSUANCE_UNKNOWN"
                 raise
             issued = clock()
@@ -1516,6 +1537,10 @@ def state_proof(root: Path = ROOT, *, runner: Runner = default_runner, api: Api 
         except EnvsError as exc:
             result["error"] = str(exc)
             result["status"] = "STATE_BACKEND_RED"
+        except (OSError, subprocess.SubprocessError) as exc:
+            # A local launch or storage failure proves nothing about R2: UNKNOWN, named by class only (no paths).
+            result["error"] = type(exc).__name__
+            result["status"] = "UNKNOWN"
         finally:
             result.update(state_cleanup(root, tools, scratch, account, token, run, names, outer, outer_env, created,
                                         result["credential"], control, issued, credentials, probe_encryption, runner,

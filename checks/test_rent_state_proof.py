@@ -77,7 +77,9 @@ class World:
 
     def __init__(self, *, verify=None, present=(), fail=(), unknown=(), lock_ignored=False, plaintext=False,
                  never_expire=False, redated=(), issuance=None, transient=(), admit=(), outside_init_denied=False,
-                 expiry=UNAUTHORIZED, decoy=DENIED) -> None:
+                 expiry=UNAUTHORIZED, decoy=DENIED, raising=None) -> None:
+        # raising: a work directory, "wrangler-delete", "outer-destroy" or "api-current" -> a local exception type.
+        self.raising = dict(raising or {})
         self.verify = {"id": PARENT_ID, "status": "active", "not_before": iso(NOW - 3600),
                        "expires_on": iso(NOW + 86400), **(verify or {})}
         self.fail, self.unknown, self.redated = set(fail), set(unknown), set(redated)
@@ -103,6 +105,8 @@ class World:
         assert token == PARENT_TOKEN, "only the parent token reaches the Cloudflare API"
         kind = "verify" if path.endswith("/tokens/verify") else "temporary" if "temp-access" in path else "bucket"
         self.api_calls.append((method, kind))
+        if kind == "bucket" and "api-current" in self.raising and self.state:
+            raise self.raising["api-current"](f"local failure under {Path.home()}")
         if kind in self.unknown or (kind == "bucket" and "bucket-after" in self.unknown and self.state == {}
                                     and self.created):
             raise jev.EnvsError("Cloudflare request outcome is UNKNOWN")
@@ -137,9 +141,13 @@ class World:
         argv, env = list(argv), dict(env)
         self.calls.append((argv, env))
         if argv[0] == TOOLS["wrangler"]:
+            if argv[3] == "delete" and "wrangler-delete" in self.raising:
+                raise self.raising["wrangler-delete"]("fixture launch failure")
             return self.wrangler(argv, env)
         assert argv[0] == TOOLS["tofu"], argv
         work = Path(argv[1].split("=", 1)[1]).name
+        if work in self.raising or (work == "outer" and argv[2] == "destroy" and "outer-destroy" in self.raising):
+            raise self.raising.get(work, self.raising.get("outer-destroy"))("fixture launch failure")
         if work == "outer":
             return self.outer(argv, env)
         return self.inner(work, argv[2], argv, env)
@@ -417,6 +425,45 @@ def test_cleanup_is_evidence_bound(root: Path) -> None:
 
 
 @with_root
+def test_cleanup_survives_local_failures(root: Path) -> None:
+    readback = [("GET", "bucket"), ("GET", "bucket")]
+
+    def outer_commands(world: World) -> list[str]:
+        return [args[0] for args in world.tofu("outer")]
+
+    # The post-TTL probe cannot launch (either local failure class): the credential is UNKNOWN, yet the owned
+    # buckets are still deleted and read back once.
+    for error in (OSError, subprocess.SubprocessError):
+        world = World(raising={"unusable-after-ttl": error})
+        result = world.prove(root)
+        assert result["credential"] == "UNKNOWN" and result["buckets"] == "ABSENT", result
+        assert result["cleanup"] == "UNKNOWN" and result["status"] == "UNKNOWN" and world.buckets == {}
+        assert outer_commands(world).count("destroy") == 1 and world.api_calls[-2:] == readback
+        no_red_leak(world, result)
+    # A key delete or the destroy cannot launch: the final readback still runs and finds the buckets.
+    for raising in ({"wrangler-delete": OSError}, {"outer-destroy": OSError}):
+        world = World(raising=raising)
+        result = world.prove(root)
+        assert result["buckets"] == "LEFTOVER" and result["cleanup"] == "LEFTOVER" and result["status"] == "LEFTOVER"
+        assert outer_commands(world)[-1] == "destroy" and world.api_calls[-2:] == readback, raising
+        assert set(world.buckets) == set(NAMES.values())
+        no_red_leak(world, result)
+    # No complete ownership readback: nothing is deleted, no final readback claims anything, UNKNOWN.
+    world = World(raising={"api-current": OSError})
+    result = world.prove(root)
+    assert result["buckets"] == "UNKNOWN" and result["cleanup"] == "UNKNOWN" and result["owned"] == []
+    assert "destroy" not in outer_commands(world) and set(world.buckets) == set(NAMES.values())
+    assert not [argv for argv, _ in world.calls if argv[0] == TOOLS["wrangler"] and argv[3] == "delete"]
+    # A local failure inside the proof is UNKNOWN (class name only), the result is still returned after cleanup.
+    world = World(raising={"readback": OSError})
+    result = world.prove(root)
+    assert result["status"] == "UNKNOWN" and result["error"] == "OSError" and result["checks"] is None, result
+    assert result["cleanup"] == "ABSENT" and result["credential"] == "UNUSABLE_AFTER_TTL" and world.buckets == {}
+    assert str(Path.home()) not in json.dumps(result)
+    no_red_leak(world, result)
+
+
+@with_root
 def test_negative_classes(root: Path) -> None:
     # A negative that succeeds is ADMITTED and RED; one failing for another cause, or behind a failed control, is
     # UNKNOWN; an outside-prefix init already refused proves no write denial.
@@ -534,6 +581,7 @@ def main() -> None:
         test_first_create_is_the_only_probe()
         test_proof_failures()
         test_cleanup_is_evidence_bound()
+        test_cleanup_survives_local_failures()
         test_negative_classes()
         test_failure_cause()
         test_state_red_inputs()
