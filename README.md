@@ -170,16 +170,22 @@ dev-rent-access-probe/R2_PARENT_API_TOKEN, R2_PARENT_ACCESS_KEY_ID, CLOUDFLARE_A
 → probe-dev-rent-state (manual dispatch on proposals only; read-only repository permissions)
 → parent verify: ID equals R2_PARENT_ACCESS_KEY_ID, active, not_before passed, expiry covers the job bound + margin
 → both per-run names absent; first bounded create (proof bucket) is the only capability probe, then the decoy
-→ one temporary credential: proof bucket, prefix state/, object-read-write, 900 s, never the parent token
+→ one temporary credential (attempt recorded before the one POST): proof bucket, prefix state/, object-read-write,
+   900 s, never the parent token; a usable control right after issuance
 → one lock holder and one refused contender, then release; raw object is ciphertext without the canary;
-   fresh-directory readback; pbkdf2 key rotation through fallback; old key, no encryption, no credential,
-   outside prefix and decoy bucket refused; the same credential reads again after the negatives
-→ cleanup once: credential observed refused after its TTL, exact keys deleted, owned buckets destroyed, both names 404
+   fresh-directory readback; pbkdf2 key rotation through fallback; each negative right after its control:
+   old key, no encryption, no credential, the lock-file write outside the prefix, the decoy bucket;
+   the same credential reads again after the negatives
+→ cleanup once: the same credential refused 401 in a fresh directory after its TTL, exact keys deleted,
+   owned buckets destroyed, both names 404
 ```
+
+- Negatives are `REFUSED` only when the adjacent control succeeds and the failure has its own cause: decryption, missing encryption method, missing credential, or `403 AccessDenied` for the decoy and for OpenTofu's own lock-file write outside the prefix. A negative that succeeds is `ADMITTED` (RED); a 401, a 5xx, a transport error or any other cause is `UNKNOWN`. If `init` outside the prefix is already refused, the write result is `UNKNOWN`: no write was attempted.
+- The credential is `UNUSABLE_AFTER_TTL` only for a 401 after a usable control; otherwise it is `UNKNOWN`. Any issuance failure (transport, 5xx, malformed, 4xx) is `ISSUANCE_UNKNOWN`: the provider may still have issued one, so cleanup is at best `UNKNOWN` even when both buckets are gone.
 
 - Every OpenTofu process gets its own directory and empty HOME. The parent token reaches only the bucket root, Wrangler and the Cloudflare API; the temporary credential and the `TF_ENCRYPTION` text reach only the backend root, by environment. Neither enters argv, `-backend-config`, a log line, the result JSON, an artifact, a cache or Git; the raw state object stays in process memory.
 - Right after each create the run emits one evidence line per bucket (`envs.rentStateProofCreated.v1`: bucket, provider `creation_date`, run ID, attempt, head). Cleanup deletes only a bucket whose evidence and current `creation_date` match; a bucket name alone never authorizes deletion. The same parser reads those lines from a job log as recovery input for a later exact contract.
-- `STATE_BACKEND_PROVEN` needs every check and `cleanup` `ABSENT`. A remaining bucket is `LEFTOVER`, an unobserved credential expiry or unreadable evidence `UNKNOWN`; either replaces the status, with no retry. Force cancellation or runner loss can bypass cleanup.
+- `STATE_BACKEND_PROVEN` needs every positive check, every negative `REFUSED`, a usable control and `cleanup` `ABSENT` (buckets `ABSENT` and the credential `UNUSABLE_AFTER_TTL`). A remaining bucket is `LEFTOVER`; an unobserved credential end or unreadable evidence is `UNKNOWN`; either replaces the status, with no retry. Force cancellation or runner loss can bypass cleanup. The failure signatures above are to be confirmed by the live run.
 - `checks/test_rent_state_proof.py` proves the gates, order, isolation, redaction, outcome classes, cleanup model and evidence parser against a fake provider; `check` initializes and validates both roots with network access closed and checks Wrangler's `r2 object get --pipe --remote` shape.
 
 Not proven here: any real R2 effect, the parent token's permission (only the first bounded create proves it), R2 lock-file and prefix-scoped temporary-credential behaviour, or production state. The live run needs its own contract.

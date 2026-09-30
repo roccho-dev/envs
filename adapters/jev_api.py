@@ -73,9 +73,20 @@ STATE_LOCK_ERROR = b"Error acquiring the state lock"
 STATE_EVIDENCE_KIND = "envs.rentStateProofCreated.v1"
 STATE_CHECKS = (
     "lock_holder_applied", "lock_contender_rejected", "lock_released", "raw_state_encrypted", "readback_exact",
-    "rotation_rewritten", "rotated_readback", "old_key_refused", "unencrypted_read_refused", "no_credential_refused",
-    "outside_prefix_refused", "decoy_refused", "path_up_after_negatives",
+    "rotation_rewritten", "rotated_readback", "path_up_after_negatives",
 )
+# Each negative is REFUSED only after an adjacent control that differs in that one input succeeds and the negative fails
+# for its own cause; a negative that succeeds is ADMITTED; anything else (transport, 5xx, other cause) is UNKNOWN.
+STATE_NEGATIVES = {
+    "old_key_refused": {"decryption"},
+    "unencrypted_read_refused": {"encryption", "decryption"},
+    "no_credential_refused": {"credential"},
+    "outside_prefix_write_refused": {"access_denied"},
+    "decoy_refused": {"access_denied"},
+}
+STATE_STATUS = re.compile(rb"StatusCode: ([0-9]{3})\b")
+STATE_TRANSIENT = re.compile(rb"(?<![-\w])timeout|timed out|connection (?:refused|reset)|no such host|unexpected EOF",
+                             re.IGNORECASE)
 # WSLC OCI dev target (roccho-dev/adrs#460): the same one-shot Jev source, encrypted to exactly one target recipient.
 # It has no plane state and no handoff; the validated ciphertext at an exact commit is its whole readiness.
 OCI_BINDING = "jev-api.oci-dev"
@@ -1246,9 +1257,51 @@ def encrypted_raw(raw: bytes | None, canary: str) -> bool:
     return isinstance(value, dict) and isinstance(value.get("encrypted_data"), str) and "resources" not in value
 
 
+def failure_cause(result: subprocess.CompletedProcess[bytes]) -> str:
+    # The captured output is classified in memory and never printed. An S3 status wins over wording; 401 is the
+    # credential as a whole, 403 AccessDenied is its scope; transport noise or any other status is UNKNOWN.
+    text = result.stderr + result.stdout
+    statuses = set(STATE_STATUS.findall(text))
+    if STATE_TRANSIENT.search(text) or any(code.startswith(b"5") for code in statuses) or len(statuses) > 1:
+        return "unknown"
+    if statuses == {b"401"}:
+        return "unauthorized"
+    if statuses == {b"403"}:
+        return "access_denied" if b"AccessDenied" in text else "unknown"
+    if statuses:
+        return "unknown"
+    lowered = text.lower()
+    for cause, word in (("decryption", b"decrypt"), ("encryption", b"encrypt"), ("credential", b"credential")):
+        if word in lowered:
+            return cause
+    return "unknown"
+
+
+def refusal(control: bool, attempt: subprocess.CompletedProcess[bytes], causes: set[str]) -> str:
+    if attempt.returncode == 0:
+        return "ADMITTED"
+    return "REFUSED" if control and failure_cause(attempt) in causes else "UNKNOWN"
+
+
+def credential_probe(root: Path, scratch: Path, name: str, tools: Mapping[str, str], account: str, bucket: str,
+                     credentials: Mapping[str, str], encryption: str,
+                     runner: Runner) -> subprocess.CompletedProcess[bytes]:
+    # A fresh directory each time (no cached backend), with the same valid encryption, credential, bucket and an absent
+    # key inside the allowed prefix, so only the credential can decide the outcome.
+    work, home = scratch / name, scratch / f"home-{name}"
+    work.mkdir()
+    home.mkdir(mode=0o700)
+    (work / "main.tf").write_bytes((root / STATE_BACKEND).read_bytes())
+    env = clean_env(tools, {"TF_IN_AUTOMATION": "1", "TF_INPUT": "0", "HOME": str(home),
+                            "AWS_EC2_METADATA_DISABLED": "true", "TF_VAR_account_id": account, "TF_VAR_bucket": bucket,
+                            "TF_VAR_key": STATE_ALLOWED_PREFIX + "credential-probe.tfstate", "TF_ENCRYPTION": encryption,
+                            **credentials})
+    return runner([tools["tofu"], f"-chdir={work}", "init", "-input=false", "-no-color"], None, env)
+
+
 def state_checks(root: Path, scratch: Path, tools: Mapping[str, str], account: str, token: str,
                  names: Mapping[str, str], credentials: Mapping[str, str], runner: Runner, spawn: Spawn,
-                 sleep: Callable[[float], None]) -> dict[str, bool]:
+                 sleep: Callable[[float], None]) -> tuple[dict[str, bool], dict[str, str]]:
     passphrase, rotated = secrets.token_hex(32), secrets.token_hex(32)
     first, second = "canary-" + secrets.token_hex(16), "canary-" + secrets.token_hex(16)
     hold = {"TF_VAR_python": tools["python3"], "TF_VAR_hold_nonce": secrets.token_hex(8),
@@ -1283,17 +1336,18 @@ def state_checks(root: Path, scratch: Path, tools: Mapping[str, str], account: s
         result = run(work, env, "output", "-raw", "canary")
         return result.returncode == 0 and result.stdout == expected.encode()
 
-    def refused(name: str, **options: Any) -> bool:
-        # Refused when OpenTofu can neither read that state nor then take its lock and write.
-        work, env = backend(name, encryption=encryption_config(rotated), **options)
-        return not (ok(work, env, *init) and ok(work, env, *apply))
+    def read_attempt(name: str, **options: Any) -> subprocess.CompletedProcess[bytes]:
+        work, env = backend(name, **options)
+        opened = run(work, env, *init)
+        return opened if opened.returncode != 0 else run(work, env, "output", "-raw", "canary")
 
     checks = dict.fromkeys(STATE_CHECKS, False)
+    negatives = dict.fromkeys(STATE_NEGATIVES, "UNKNOWN")
     current = encryption_config(passphrase)
     holder_work, holder_env = backend("holder", encryption=current)
     contender_work, contender_env = backend("contender", encryption=current)
     if not (ok(holder_work, holder_env, *init) and ok(contender_work, contender_env, *init)):
-        return checks
+        return checks, negatives
     holder = spawn([tools["tofu"], f"-chdir={holder_work}", *apply], holder_env)
     code = None
     try:
@@ -1316,58 +1370,74 @@ def state_checks(root: Path, scratch: Path, tools: Mapping[str, str], account: s
     rewritten = ok(rotate_work, rotate_env, *init) and ok(rotate_work, rotate_env, *apply)
     after = raw_state(tools, scratch, account, token, names["proof"], runner)
     checks["rotation_rewritten"] = rewritten and encrypted_raw(after, second) and after != before
-    checks["rotated_readback"] = reads(*backend("rotated", encryption=encryption_config(rotated)), second)
-    checks["old_key_refused"] = not reads(*backend("old-key", encryption=current), second)
-    checks["unencrypted_read_refused"] = not reads(*backend("no-encryption", encryption=None), second)
-    checks["no_credential_refused"] = not ok(*backend("no-credential", encryption=encryption_config(rotated), creds={}),
-                                             *init)
-    checks["outside_prefix_refused"] = refused("outside-prefix", key=STATE_OUTSIDE_KEY)
-    checks["decoy_refused"] = refused("decoy", bucket=names["decoy"])
+    only_rotated = encryption_config(rotated)
+    checks["rotated_readback"] = reads(*backend("rotated", encryption=only_rotated), second)
+    # Each negative runs right after a control that differs only in the input under test.
+    control = reads(*backend("old-key-control", encryption=only_rotated), second)
+    negatives["old_key_refused"] = refusal(control, read_attempt("old-key", encryption=current),
+                                           STATE_NEGATIVES["old_key_refused"])
+    control = reads(*backend("no-encryption-control", encryption=only_rotated), second)
+    negatives["unencrypted_read_refused"] = refusal(control, read_attempt("no-encryption", encryption=None),
+                                                    STATE_NEGATIVES["unencrypted_read_refused"])
+    control = ok(*backend("no-credential-control", encryption=only_rotated), *init)
+    work, env = backend("no-credential", encryption=only_rotated, creds={})
+    negatives["no_credential_refused"] = refusal(control, run(work, env, *init), STATE_NEGATIVES["no_credential_refused"])
+    # The prefix is tested by OpenTofu's own lock-file write; the control takes and releases the lock inside it.
+    lock = ("plan", "-lock-timeout=0", "-input=false", "-no-color")
+    control_work, control_env = backend("outside-prefix-control", encryption=only_rotated, canary=second)
+    control = ok(control_work, control_env, *init) and ok(control_work, control_env, *lock)
+    work, env = backend("outside-prefix", encryption=only_rotated, key=STATE_OUTSIDE_KEY, canary=second)
+    opened = run(work, env, *init)
+    # An init already refused proves no write denial: the write result stays UNKNOWN.
+    negatives["outside_prefix_write_refused"] = "UNKNOWN" if opened.returncode != 0 else refusal(
+        control, run(work, env, *lock), STATE_NEGATIVES["outside_prefix_write_refused"])
+    control = ok(*backend("decoy-control", encryption=only_rotated), *init)
+    work, env = backend("decoy", encryption=only_rotated, bucket=names["decoy"])
+    negatives["decoy_refused"] = refusal(control, run(work, env, *init), STATE_NEGATIVES["decoy_refused"])
     # The negatives mean something only if the same credential still reads the same state after them.
-    checks["path_up_after_negatives"] = reads(*backend("bracket", encryption=encryption_config(rotated)), second)
-    return checks
+    checks["path_up_after_negatives"] = reads(*backend("bracket", encryption=only_rotated), second)
+    return checks, negatives
 
 
-def state_cleanup(tools: Mapping[str, str], scratch: Path, account: str, token: str, run: Mapping[str, str],
-                  names: Mapping[str, str], outer: Path, outer_env: Mapping[str, str], created: dict[str, str] | None,
-                  issued: float | None, credentials: Mapping[str, str] | None, runner: Runner, api: Api,
+def state_cleanup(root: Path, tools: Mapping[str, str], scratch: Path, account: str, token: str,
+                  run: Mapping[str, str], names: Mapping[str, str], outer: Path, outer_env: Mapping[str, str],
+                  created: dict[str, str] | None, credential: str, control: bool, issued: float | None,
+                  credentials: Mapping[str, str] | None, encryption: str, runner: Runner, api: Api,
                   sleep: Callable[[float], None], clock: Callable[[], float]) -> dict[str, Any]:
-    # Runs once: wait out the temporary credential and observe it refused, delete only the exact expected keys and
-    # only buckets this run provably created, then read both names back. Any doubt is LEFTOVER or UNKNOWN.
-    report: dict[str, Any] = {"credential": "NOT_ISSUED", "owned": [], "cleanup": "UNKNOWN"}
-    try:
-        if issued is not None and credentials is not None:
+    # Runs once: after the TTL, the same credential must be refused 401 in a fresh directory; delete only the exact
+    # expected keys and only buckets this run provably created, then read both names back. Doubt is never ABSENT.
+    report: dict[str, Any] = {"credential": credential, "buckets": "UNKNOWN", "owned": [], "cleanup": "UNKNOWN"}
+    if credential == "ISSUED":
+        report["credential"] = "UNKNOWN"
+        if control and issued is not None and credentials is not None:
             sleep(max(0.0, issued + STATE_CREDENTIAL_TTL + STATE_EXPIRY_GRACE - clock()))
-            work, home = scratch / "expired", scratch / "home-expired"
-            work.mkdir()
-            home.mkdir(mode=0o700)
-            (work / "main.tf").write_bytes((outer.parent / "backend.tf").read_bytes())
-            env = clean_env(tools, {"TF_IN_AUTOMATION": "1", "TF_INPUT": "0", "HOME": str(home),
-                                    "AWS_EC2_METADATA_DISABLED": "true", "TF_VAR_account_id": account,
-                                    "TF_VAR_bucket": names["proof"], "TF_VAR_key": STATE_ALLOWED_PREFIX + "expiry.tfstate",
-                                    **credentials})
-            usable = runner([tools["tofu"], f"-chdir={work}", "init", "-input=false", "-no-color"], None, env).returncode == 0
-            report["credential"] = "STILL_USABLE" if usable else "EXPIRED_OBSERVED"
-        if created is None:
-            return report
-        current = {name: bucket_creation(api, account, token, name) for name in names.values()}
-        owned = owned_buckets(created, current, run)
-        report["owned"] = owned
-        if names["proof"] in owned:
-            env = wrangler_env(tools, scratch, account, token)
-            for key in (STATE_KEY, STATE_KEY + ".tflock"):
-                runner([tools["wrangler"], "r2", "object", "delete", f"{names['proof']}/{key}", "--remote"], None, env)
-        present = {name for name, value in current.items() if value is not None}
-        if present and present <= set(owned):
-            runner([tools["tofu"], f"-chdir={outer}", "destroy", "-input=false", "-auto-approve", "-no-color",
-                    "-var", "decoy=true"], None, outer_env)
-        after = [bucket_creation(api, account, token, name) for name in names.values()]
-        if any(value is not None for value in after):
-            report["cleanup"] = "LEFTOVER"
-        elif report["credential"] in {"NOT_ISSUED", "EXPIRED_OBSERVED"}:
-            report["cleanup"] = "ABSENT"
+            after = credential_probe(root, scratch, "unusable-after-ttl", tools, account, names["proof"], credentials,
+                                     encryption, runner)
+            if after.returncode == 0:
+                report["credential"] = "STILL_USABLE"
+            elif failure_cause(after) == "unauthorized":
+                report["credential"] = "UNUSABLE_AFTER_TTL"
+    try:
+        if created is not None:
+            current = {name: bucket_creation(api, account, token, name) for name in names.values()}
+            owned = owned_buckets(created, current, run)
+            report["owned"] = owned
+            if names["proof"] in owned:
+                env = wrangler_env(tools, scratch, account, token)
+                for key in (STATE_KEY, STATE_KEY + ".tflock"):
+                    runner([tools["wrangler"], "r2", "object", "delete", f"{names['proof']}/{key}", "--remote"], None, env)
+            present = {name for name, value in current.items() if value is not None}
+            if present and present <= set(owned):
+                runner([tools["tofu"], f"-chdir={outer}", "destroy", "-input=false", "-auto-approve", "-no-color",
+                        "-var", "decoy=true"], None, outer_env)
+            after_buckets = [bucket_creation(api, account, token, name) for name in names.values()]
+            report["buckets"] = "LEFTOVER" if any(value is not None for value in after_buckets) else "ABSENT"
     except EnvsError:
-        report["cleanup"] = "UNKNOWN"
+        report["buckets"] = "UNKNOWN"
+    if report["buckets"] == "LEFTOVER":
+        report["cleanup"] = "LEFTOVER"
+    elif report["buckets"] == "ABSENT" and report["credential"] in {"NOT_ATTEMPTED", "UNUSABLE_AFTER_TTL"}:
+        report["cleanup"] = "ABSENT"
     return report
 
 
@@ -1384,8 +1454,9 @@ def state_proof(root: Path = ROOT, *, runner: Runner = default_runner, api: Api 
     names = state_bucket_names(run)
     result: dict[str, Any] = {
         "kind": "envs.rentStateProofResult.v1", "status": "UNKNOWN", "stage": "preflight", "buckets": names,
-        "parent": verify_parent(api, account, token, parent, clock()), "checks": None, "credential": "NOT_ISSUED",
-        "cleanup": "NOT_STARTED", "production_state": "UNTOUCHED", "existing_buckets": "UNTOUCHED",
+        "parent": verify_parent(api, account, token, parent, clock()), "checks": None, "negatives": None,
+        "credential": "NOT_ATTEMPTED", "credential_control": None, "cleanup": "NOT_STARTED",
+        "production_state": "UNTOUCHED", "existing_buckets": "UNTOUCHED",
     }
     for name in names.values():
         require(bucket_creation(api, account, token, name) is None, "a per-run bucket name already exists")
@@ -1395,13 +1466,14 @@ def state_proof(root: Path = ROOT, *, runner: Runner = default_runner, api: Api 
         outer.mkdir()
         home.mkdir(mode=0o700)
         (outer / "main.tf").write_bytes((root / STATE_CONFIG).read_bytes())
-        (scratch / "backend.tf").write_bytes((root / STATE_BACKEND).read_bytes())
         outer_env = clean_env(tools, {"CLOUDFLARE_API_TOKEN": token, "TF_VAR_account_id": account,
                                       "TF_VAR_run": run["scope"], "TF_IN_AUTOMATION": "1", "TF_INPUT": "0",
                                       "HOME": str(home)})
         created: dict[str, str] | None = {}
         issued: float | None = None
         credentials: dict[str, str] | None = None
+        control = False
+        probe_encryption = encryption_config(secrets.token_hex(32))
         try:
             tofu(tools, outer, outer_env, runner, "init", "-input=false", "-no-color")
             result["stage"] = "create"
@@ -1418,19 +1490,36 @@ def state_proof(root: Path = ROOT, *, runner: Runner = default_runner, api: Api 
                 require(applied and created is not None and names["proof"] in created, f"{label} did not succeed")
             require(created is not None and set(created) == set(names.values()), "created bucket set differs")
             result["stage"] = "credential"
-            credentials = temporary_credentials(api, account, token, parent, names["proof"])
+            # Recorded before the one POST: after any failure the provider may still have issued a credential.
+            result["credential"] = "ATTEMPTED"
+            try:
+                credentials = temporary_credentials(api, account, token, parent, names["proof"])
+            except EnvsError:
+                result["credential"] = "ISSUANCE_UNKNOWN"
+                raise
             issued = clock()
             result["credential"] = "ISSUED"
+            opened = credential_probe(root, scratch, "usable-control", tools, account, names["proof"], credentials,
+                                      probe_encryption, runner)
+            control = opened.returncode == 0
+            result["credential_control"] = "USABLE" if control else "UNKNOWN"
             result["stage"] = "proof"
-            checks = state_checks(root, scratch, tools, account, token, names, credentials, runner, spawn, sleep)
-            result["checks"] = checks
-            result["status"] = "STATE_BACKEND_PROVEN" if all(checks.values()) else "STATE_BACKEND_RED"
+            checks, negatives = state_checks(root, scratch, tools, account, token, names, credentials, runner, spawn,
+                                             sleep)
+            result["checks"], result["negatives"] = checks, negatives
+            if not all(checks.values()) or "ADMITTED" in negatives.values():
+                result["status"] = "STATE_BACKEND_RED"
+            elif control and set(negatives.values()) == {"REFUSED"}:
+                result["status"] = "STATE_BACKEND_PROVEN"
+            else:
+                result["status"] = "UNKNOWN"
         except EnvsError as exc:
             result["error"] = str(exc)
             result["status"] = "STATE_BACKEND_RED"
         finally:
-            result.update(state_cleanup(tools, scratch, account, token, run, names, outer, outer_env, created,
-                                        issued, credentials, runner, api, sleep, clock))
+            result.update(state_cleanup(root, tools, scratch, account, token, run, names, outer, outer_env, created,
+                                        result["credential"], control, issued, credentials, probe_encryption, runner,
+                                        api, sleep, clock))
     if result["cleanup"] != "ABSENT":
         # Resources or a usable credential may remain: no proof outcome stands as the status.
         result["status"] = result["cleanup"]

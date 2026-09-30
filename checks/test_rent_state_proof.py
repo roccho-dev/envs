@@ -33,6 +33,16 @@ RUN = jev.run_identity(RUN_ENV)
 NAMES = jev.state_bucket_names(RUN)
 NOW = 1_800_000_000.0
 PASSPHRASE = re.compile(r'key_provider "pbkdf2" "(current|previous)" \{\n  passphrase = "([0-9a-f]+)"')
+# OpenTofu/AWS SDK-shaped failures; only their class matters, and the adapter never prints them.
+DENIED = b"operation error S3: ListObjectsV2, https response error StatusCode: 403, RequestID: r, api error AccessDenied: Access Denied"
+LOCK_DENIED = (b"Error acquiring the state lock\n\nError message: operation error S3: PutObject, https response error "
+               b"StatusCode: 403, RequestID: r, api error AccessDenied: Access Denied")
+UNAUTHORIZED = b"operation error S3: ListObjectsV2, https response error StatusCode: 401, RequestID: r, api error Unauthorized"
+UNAVAILABLE = b"operation error S3: GetObject, https response error StatusCode: 503, RequestID: r, api error ServiceUnavailable"
+NO_METHOD = b"Error: state encryption is enforced, but no encryption method is configured"
+NO_CREDENTIAL = b"Error: No valid credential sources found"
+UNDECRYPTABLE = b"Error: decryption failed for all provided methods"
+NEGATIVES = dict.fromkeys(jev.STATE_NEGATIVES, "REFUSED")
 
 
 def iso(seconds: float) -> str:
@@ -66,11 +76,15 @@ class World:
     """A fake R2/Cloudflare/OpenTofu/Wrangler world: buckets, objects, one lock file and the temporary credential."""
 
     def __init__(self, *, verify=None, present=(), fail=(), unknown=(), lock_ignored=False, plaintext=False,
-                 never_expire=False, redated=()) -> None:
+                 never_expire=False, redated=(), issuance=None, transient=(), admit=(), outside_init_denied=False,
+                 expiry=UNAUTHORIZED, decoy=DENIED) -> None:
         self.verify = {"id": PARENT_ID, "status": "active", "not_before": iso(NOW - 3600),
                        "expires_on": iso(NOW + 86400), **(verify or {})}
         self.fail, self.unknown, self.redated = set(fail), set(unknown), set(redated)
         self.lock_ignored, self.plaintext, self.never_expire = lock_ignored, plaintext, never_expire
+        self.issuance, self.transient, self.admit = issuance, set(transient), set(admit)
+        self.outside_init_denied, self.expiry, self.decoy = outside_init_denied, expiry, decoy
+        self.issuances = 0
         self.clock = NOW
         self.buckets = {name: "2026-01-01T00:00:00.000Z" for name in present}
         self.state: dict[str, str] = {}
@@ -99,6 +113,16 @@ class World:
             assert method == "POST" and body == {
                 "bucket": NAMES["proof"], "parentAccessKeyId": PARENT_ID, "permission": "object-read-write",
                 "ttlSeconds": jev.STATE_CREDENTIAL_TTL, "prefixes": ["state/"]}, body
+            self.issuances += 1
+            # Every failure shape: the provider may still have issued a credential the adapter never saw.
+            if self.issuance == "transport":
+                raise jev.EnvsError("Cloudflare request outcome is UNKNOWN")
+            if self.issuance == "5xx":
+                return 503, {"success": False}
+            if self.issuance == "malformed":
+                return 200, {"success": True, "result": {"accessKeyId": TEMPORARY["accessKeyId"]}}
+            if self.issuance == "4xx":
+                return 403, {"success": False, "errors": [{"code": 10000}]}
             self.issued = self.clock
             return 200, {"success": True, "result": dict(TEMPORARY)}
         name = path.rsplit("/", 1)[1]
@@ -171,13 +195,28 @@ class World:
             and env.get("AWS_SESSION_TOKEN") == TEMPORARY["sessionToken"]
         expired = self.issued is not None and not self.never_expire and self.clock >= self.issued + jev.STATE_CREDENTIAL_TTL
         bucket, key = env["TF_VAR_bucket"], env["TF_VAR_key"]
-        allowed = valid and not expired and bucket == NAMES["proof"] and bucket in self.buckets and key.startswith("state/")
+        inside = key.startswith("state/")
         stored = self.objects.get((bucket, key))
         readable = stored is not None and stored["key"] in {current, previous} - {None}
-        if not allowed:
-            return self.done(argv, 1)
-        if command == "init":
+        if work in self.transient:
+            return self.done(argv, 1, stderr=UNAVAILABLE)
+        if work in self.admit:
             return self.done(argv)
+        # Enforced encryption without a method, a missing credential, then S3 auth: 401 for the credential as a
+        # whole (invalid or expired), 403 AccessDenied for a bucket or prefix outside its scope.
+        if "TF_ENCRYPTION" not in env:
+            return self.done(argv, 1, stderr=NO_METHOD)
+        if "AWS_SECRET_ACCESS_KEY" not in env:
+            return self.done(argv, 1, stderr=NO_CREDENTIAL)
+        if not valid or expired:
+            return self.done(argv, 1, stderr=self.expiry)
+        if bucket != NAMES["proof"] or bucket not in self.buckets:
+            return self.done(argv, 1, stderr=self.decoy)
+        if command == "init":
+            return self.done(argv, 1, stderr=DENIED) if not inside and self.outside_init_denied else self.done(argv)
+        if not inside:
+            # The first write outside the prefix is OpenTofu's own lock file.
+            return self.done(argv, 1, stderr=LOCK_DENIED)
         if command == "plan":
             if self.lock_held and not self.lock_ignored:
                 return self.done(argv, 1, stderr=b"Error acquiring the state lock\nLock Info: fixture")
@@ -191,7 +230,7 @@ class World:
             self.objects[(bucket, key)] = {"key": current, "canary": env["TF_VAR_canary"], "version": version}
             return self.done(argv)
         if command == "output":
-            return self.done(argv, 0, str(stored["canary"]).encode()) if readable else self.done(argv, 1)
+            return self.done(argv, 0, str(stored["canary"]).encode()) if readable else self.done(argv, 1, stderr=UNDECRYPTABLE)
         raise AssertionError(argv)
 
     def wrangler(self, argv, env):
@@ -226,7 +265,7 @@ def no_secret_escapes(world: World, result: dict) -> None:
     # encryption text only the backend root; the parent token ID and account only the environment and URLs.
     text = json.dumps(result) + world.stderr.getvalue()
     passphrases = {value for _, env in world.calls for _, value in PASSPHRASE.findall(env.get("TF_ENCRYPTION", ""))}
-    assert len(passphrases) == 2
+    assert len(passphrases) == 3, "state key, rotated key and credential-probe key"
     for value in (PARENT_TOKEN, PARENT_ID, ACCOUNT_ID, *TEMPORARY.values(), *passphrases):
         assert value not in text, "a secret or pinned ID reached the result or a log line"
         for argv, _ in world.calls:
@@ -256,8 +295,18 @@ def test_state_pass(root: Path) -> None:
     world = World()
     result = world.prove(root)
     assert result["status"] == "STATE_BACKEND_PROVEN" and result["cleanup"] == "ABSENT", result
-    assert result["checks"] == dict.fromkeys(jev.STATE_CHECKS, True) and len(jev.STATE_CHECKS) == 13
-    assert result["credential"] == "EXPIRED_OBSERVED" and result["owned"] == sorted(NAMES.values())
+    assert result["checks"] == dict.fromkeys(jev.STATE_CHECKS, True) and len(jev.STATE_CHECKS) == 8
+    assert result["negatives"] == NEGATIVES and len(NEGATIVES) == 5
+    assert result["credential"] == "UNUSABLE_AFTER_TTL" and result["credential_control"] == "USABLE"
+    assert result["buckets"] == "ABSENT" and result["owned"] == sorted(NAMES.values())
+    # The post-TTL test runs in its own fresh directory, never the control's cached one, and after the TTL.
+    assert world.tofu("usable-control") == [["init", "-input=false", "-no-color"]]
+    assert world.tofu("unusable-after-ttl") == [["init", "-input=false", "-no-color"]]
+    # Each negative has its adjacent control; the prefix write is OpenTofu's own lock, after an accepted init.
+    for name in ("old-key", "no-encryption", "no-credential", "outside-prefix", "decoy"):
+        assert world.tofu(f"{name}-control") and world.tofu(name), name
+    assert [args[0] for args in world.tofu("outside-prefix")] == ["init", "plan"]
+    assert "-lock-timeout=0" in world.tofu("outside-prefix")[1]
     assert result["parent"] == {"id": "MATCHED", "status": "ACTIVE", "expiry": "COVERS_WINDOW"}
     assert world.buckets == {} and world.objects == {} and not world.lock_held
     # The first bounded create comes before the decoy, the credential and any state operation.
@@ -306,7 +355,7 @@ def test_first_create_is_the_only_probe(root: Path) -> None:
     assert result["status"] == "STATE_BACKEND_RED" and result["cleanup"] == "ABSENT", result
     assert "first bounded bucket create" in result["error"] and PARENT_TOKEN not in result["error"]
     assert [args[0] for args in world.tofu("outer")] == ["init", "apply", "show"]
-    assert ("POST", "temporary") not in world.api_calls and result["credential"] == "NOT_ISSUED"
+    assert ("POST", "temporary") not in world.api_calls and result["credential"] == "NOT_ATTEMPTED"
     assert not world.holders and world.slept == []
     no_red_leak(world, result)
 
@@ -325,12 +374,15 @@ def test_proof_failures(root: Path) -> None:
         assert result["status"] == "STATE_BACKEND_RED" and result["checks"][check] is False, result
         assert result["cleanup"] == "ABSENT" and world.buckets == {}
         no_secret_escapes(world, result)
-    # Issuance UNKNOWN: nothing is retried, and cleanup still removes exactly the created buckets.
-    world = World(unknown={"temporary"})
-    result = world.prove(root)
-    assert result["status"] == "STATE_BACKEND_RED" and result["credential"] == "NOT_ISSUED" and result["cleanup"] == "ABSENT"
-    assert world.buckets == {} and sum(1 for call in world.api_calls if call[1] == "temporary") == 1
-    no_red_leak(world, result)
+    # Any issuance failure may still have issued a credential: one POST, no retry, the buckets are removed, but the
+    # credential and cleanup stay UNKNOWN; nothing infers that no credential exists.
+    for mode in ("transport", "5xx", "malformed", "4xx"):
+        world = World(issuance=mode)
+        result = world.prove(root)
+        assert result["credential"] == "ISSUANCE_UNKNOWN" and result["buckets"] == "ABSENT", (mode, result)
+        assert result["cleanup"] == "UNKNOWN" and result["status"] == "UNKNOWN" and world.issuances == 1
+        assert world.buckets == {} and not world.holders and world.slept == []
+        no_red_leak(world, result)
 
 
 @with_root
@@ -338,8 +390,8 @@ def test_cleanup_is_evidence_bound(root: Path) -> None:
     # Destroy failed: the buckets remain and LEFTOVER replaces the proven status.
     world = World(fail={"destroy"})
     result = world.prove(root)
-    assert result["status"] == "LEFTOVER" and result["cleanup"] == "LEFTOVER" and result["checks"]["decoy_refused"]
-    assert set(world.buckets) == set(NAMES.values())
+    assert result["status"] == "LEFTOVER" and result["cleanup"] == "LEFTOVER" and result["buckets"] == "LEFTOVER"
+    assert result["negatives"]["decoy_refused"] == "REFUSED" and set(world.buckets) == set(NAMES.values())
     # A current creation_date differing from this run's evidence is not owned: no destroy at all, LEFTOVER.
     world = World(redated={NAMES["decoy"]})
     result = world.prove(root)
@@ -349,12 +401,60 @@ def test_cleanup_is_evidence_bound(root: Path) -> None:
     world = World(never_expire=True)
     result = world.prove(root)
     assert result["cleanup"] == "UNKNOWN" and result["status"] == "UNKNOWN" and result["credential"] == "STILL_USABLE"
+    # Only a 401 for the same credential in a fresh directory after the TTL, with a usable control before it, counts;
+    # a 403, a 5xx or a failed control leaves the credential UNKNOWN and the buckets are still removed.
+    for world in (World(expiry=DENIED), World(transient={"unusable-after-ttl"}), World(transient={"usable-control"})):
+        result = world.prove(root)
+        assert result["credential"] == "UNKNOWN" and result["buckets"] == "ABSENT", result
+        assert result["cleanup"] == "UNKNOWN" and result["status"] == "UNKNOWN" and world.buckets == {}
+    assert result["credential_control"] == "UNKNOWN" and not world.tofu("unusable-after-ttl")
     # A readback that cannot be completed is UNKNOWN, never ABSENT.
     world = World(unknown={"bucket-after"})
     result = world.prove(root)
     assert result["cleanup"] == "UNKNOWN" and result["status"] == "UNKNOWN"
     for item in (World(fail={"destroy"}), World(never_expire=True)):
         no_secret_escapes(item, item.prove(root))
+
+
+@with_root
+def test_negative_classes(root: Path) -> None:
+    # A negative that succeeds is ADMITTED and RED; one failing for another cause, or behind a failed control, is
+    # UNKNOWN; an outside-prefix init already refused proves no write denial.
+    for world, name, label, status in (
+        (World(admit={"outside-prefix"}), "outside_prefix_write_refused", "ADMITTED", "STATE_BACKEND_RED"),
+        (World(admit={"old-key"}), "old_key_refused", "ADMITTED", "STATE_BACKEND_RED"),
+        (World(transient={"decoy"}), "decoy_refused", "UNKNOWN", "UNKNOWN"),
+        (World(decoy=UNAUTHORIZED), "decoy_refused", "UNKNOWN", "UNKNOWN"),
+        (World(outside_init_denied=True), "outside_prefix_write_refused", "UNKNOWN", "UNKNOWN"),
+        (World(transient={"no-credential-control"}), "no_credential_refused", "UNKNOWN", "UNKNOWN"),
+        (World(transient={"no-encryption"}), "unencrypted_read_refused", "UNKNOWN", "UNKNOWN"),
+    ):
+        result = world.prove(root)
+        assert result["negatives"][name] == label and result["status"] == status, (name, result)
+        assert result["cleanup"] == "ABSENT" and {key: value for key, value in result["negatives"].items()
+                                                   if key != name} == {key: "REFUSED" for key in NEGATIVES if key != name}
+        if world.outside_init_denied:
+            assert [args[0] for args in world.tofu("outside-prefix")] == ["init"], "no write was attempted"
+
+
+def test_failure_cause() -> None:
+    def result(stderr: bytes, code: int = 1, stdout: bytes = b"") -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(["tofu"], code, stdout=stdout, stderr=stderr)
+
+    for stderr, cause in (
+        (UNAUTHORIZED, "unauthorized"), (DENIED, "access_denied"), (LOCK_DENIED, "access_denied"),
+        (b"https response error StatusCode: 403, api error SignatureDoesNotMatch", "unknown"),
+        (UNAVAILABLE, "unknown"), (DENIED + b"\n" + UNAUTHORIZED, "unknown"),
+        (b"dial tcp: lookup example: no such host", "unknown"), (b"i/o timeout", "unknown"),
+        (DENIED + b" (retry with -lock-timeout)", "access_denied"),
+        # Enforced encryption without a method is not an authentication refusal: the old expiry probe's false positive.
+        (NO_METHOD, "encryption"), (UNDECRYPTABLE, "decryption"), (NO_CREDENTIAL, "credential"), (b"exit 1", "unknown"),
+    ):
+        assert jev.failure_cause(result(stderr)) == cause, (stderr, cause)
+    assert jev.refusal(True, result(b"", 0), {"access_denied"}) == "ADMITTED"
+    assert jev.refusal(False, result(DENIED), {"access_denied"}) == "UNKNOWN"
+    assert jev.refusal(True, result(UNAUTHORIZED), {"access_denied"}) == "UNKNOWN"
+    assert jev.refusal(True, result(DENIED), {"access_denied"}) == "REFUSED"
 
 
 def expect_input_red(values: dict[str, str], mutate=None) -> None:
@@ -434,6 +534,8 @@ def main() -> None:
         test_first_create_is_the_only_probe()
         test_proof_failures()
         test_cleanup_is_evidence_bound()
+        test_negative_classes()
+        test_failure_cause()
         test_state_red_inputs()
         test_recovery_input()
         test_encryption_config()
