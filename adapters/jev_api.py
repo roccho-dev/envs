@@ -1819,7 +1819,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 result["status"] == "TOKEN_REACHED_NEGATIVES_REFUSED" and result.get("cleanup") == "ABSENT")
             return 0 if passed else 1
         elif args.command == "rent-state-proof":
-            result = state_proof(root)
+            # Its failure line names only a closed kind; no exception text, class name or traceback reaches the log.
+            try:
+                result = state_proof(root)
+            except Exception as exc:
+                kind = failure_class(exc) if isinstance(exc, STATE_FAILURES) else "other"
+                print(f"RENT_STATE_PROOF=RED: {kind}", file=sys.stderr)
+                return 1
             print(json.dumps(result, indent=2, sort_keys=True))
             return 0 if result["status"] == "STATE_BACKEND_PROVEN" and result["cleanup"] == "ABSENT" else 1
         else:

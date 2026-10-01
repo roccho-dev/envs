@@ -610,6 +610,44 @@ def test_diagnostics_closed() -> None:
         assert not jev.diagnostics_finite(bad), bad
 
 
+class MarkerFailure(Exception):
+    pass
+
+
+def state_command(root: Path) -> tuple[int, str]:
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = jev.main(["--root", str(root), "rent-state-proof"])
+    return code, out.getvalue() + err.getvalue()
+
+
+def test_state_command_red_line() -> None:
+    # The state command's failure line carries only a closed kind: never exception text, a class name or a
+    # traceback, even for an unexpected exception; it still fails closed.
+    secret = f"{MARKER}-{TEMPORARY['secretAccessKey']}"
+    original = jev.state_proof
+    try:
+        for error, kind in ((jev.EnvsError(secret), "envs"), (OSError(secret), "os"),
+                            (subprocess.SubprocessError(secret), "subprocess"), (MarkerFailure(secret), "other"),
+                            (KeyError(secret), "other")):
+            def failing(root: Path, error: Exception = error) -> dict:
+                raise error
+            jev.state_proof = failing
+            code, text = state_command(ROOT)
+            assert code == 1 and text == f"RENT_STATE_PROOF=RED: {kind}\n", (kind, text)
+            assert MARKER not in text and type(error).__name__ not in text and "Traceback" not in text
+    finally:
+        jev.state_proof = original
+    # A real preflight refusal (a missing secret input) reads the same way.
+    root = fixtures.copy_root()
+    try:
+        with fixtures.environment(state_env(R2_PARENT_API_TOKEN="")):
+            code, text = state_command(root)
+        assert code == 1 and text == "RENT_STATE_PROOF=RED: envs\n", text
+    finally:
+        shutil.rmtree(root.parent, ignore_errors=True)
+
+
 def test_failure_cause() -> None:
     def result(stderr: bytes, code: int = 1, stdout: bytes = b"") -> subprocess.CompletedProcess[bytes]:
         return subprocess.CompletedProcess(["tofu"], code, stdout=stdout, stderr=stderr)
@@ -812,6 +850,7 @@ def main() -> None:
         test_negative_classes()
         test_branch_evidence()
         test_diagnostics_closed()
+        test_state_command_red_line()
         test_failure_cause()
         test_state_red_inputs()
         test_recovery_input()
