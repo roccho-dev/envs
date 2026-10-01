@@ -314,6 +314,14 @@ def main() -> None:
     expect_red(replace_text("flake.nix", 'tofu = "${opentofu}/bin/tofu";', 'tofu = "/usr/bin/tofu";'))
     expect_red(replace_text(check, "HTTPS_PROXY=http://127.0.0.1:9 HTTP_PROXY=http://127.0.0.1:9 ", ""))
     expect_red(replace_text(check, ' --real-ssh "$tool"', ""))
+    # The state proof job enters only for the dispatched expected SHA on attempt 1; the input stays required.
+    state = ".github/workflows/probe-dev-rent-state.yml"
+    expect_red(replace_text(state, " && github.sha == inputs.expected_source_sha", ""))
+    expect_red(replace_text(state, " && github.run_attempt == '1'", ""))
+    expect_red(replace_text(state, "github.sha == inputs.expected_source_sha", "github.sha != inputs.expected_source_sha"))
+    expect_red(replace_text(state, "        required: true\n", "        required: false\n"))
+    expect_red(replace_text(state, "    inputs:\n      expected_source_sha:\n", "    inputs:\n      source_sha:\n"))
+    expect_red(replace_text(state, "    timeout-minutes:", "    if: always()\n    timeout-minutes:"))
     # The state proof's native OpenTofu rotation regression is mandatory in check, not an optional local run.
     expect_red(replace_text(check, ' --real-tofu "$tool/tofu"', ""))
     # So is the real closure curl against the signed loopback fixture, its closure membership and the marker argv.

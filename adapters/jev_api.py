@@ -1647,9 +1647,12 @@ def state_cleanup(tools: Mapping[str, str], scratch: Path, account: str, token: 
         report["buckets"] = "LEFTOVER" if any(value is not None for value in after_buckets) else "ABSENT"
     except STATE_FAILURES:
         report["buckets"] = "UNKNOWN"
+    # Absence means only what this run saw: every bucket its create evidence names was read back present and owned
+    # before it went; a 404 for a bucket never seen present is doubt, not ABSENT.
     if report["buckets"] == "LEFTOVER":
         report["cleanup"] = "LEFTOVER"
-    elif report["buckets"] == "ABSENT" and report["credential"] in {"NOT_ATTEMPTED", "UNUSABLE_AFTER_TTL"}:
+    elif report["buckets"] == "ABSENT" and set(owned) == set(created) \
+            and report["credential"] in {"NOT_ATTEMPTED", "UNUSABLE_AFTER_TTL"}:
         report["cleanup"] = "ABSENT"
     return report
 
@@ -1748,9 +1751,17 @@ def state_proof(root: Path = ROOT, *, runner: Runner = default_runner, api: Api 
                                    result["credential"], control, issued, s3, attempted, runner, api, sleep, clock)
             result["diagnostics"]["credential_probe"] = report.pop("credential_probe")
             result.update(report)
-    if not diagnostics_finite(result["diagnostics"]):
-        # A value outside the closed sets is never emitted; the labels above stand unchanged.
+    # Absent negatives or entries are fine for a run that stopped early; a proof needs every negative's evidence and
+    # the observed post-TTL 401, all inside the closed sets. A proof without its evidence is not a proof.
+    diagnostics = result["diagnostics"]
+    finite = diagnostics_finite(diagnostics)
+    complete = finite and isinstance(diagnostics["negatives"], dict) and None not in diagnostics["negatives"].values() \
+        and diagnostics["credential_probe"]["status"] == "401"
+    if not finite:
+        # A value outside the closed sets is never emitted.
         result["diagnostics"] = None
+    if result["status"] == "STATE_BACKEND_PROVEN" and not complete:
+        result["status"] = "UNKNOWN"
     if result["cleanup"] != "ABSENT":
         # Resources or a usable credential may remain: no proof outcome stands as the status.
         result["status"] = result["cleanup"]

@@ -104,7 +104,9 @@ class World:
 
     def __init__(self, *, verify=None, present=(), fail=(), unknown=(), lock_ignored=False, plaintext=False,
                  never_expire=False, redated=(), issuance=None, transient=(), admit=(), expiry=UNAUTHORIZED,
-                 raising=None, plain_phase="init", plain_error=ENCRYPTED_NO_CONFIG, s3=None) -> None:
+                 raising=None, plain_phase="init", plain_error=ENCRYPTED_NO_CONFIG, s3=None, blind=False) -> None:
+        # blind: once a create happened, every bucket GET answers 404 although the buckets exist.
+        self.blind = blind
         # plain_phase/plain_error: where and how a root with no encryption configuration refuses the state; both
         # phases are exercised because which one S3 uses is not observed.
         self.plain_phase, self.plain_error, self.roots = plain_phase, plain_error, {}
@@ -166,7 +168,7 @@ class World:
             return 200, {"success": True, "result": dict(TEMPORARY)}
         name = path.rsplit("/", 1)[1]
         assert method == "GET" and not name.startswith("windows-rent-state/"), path
-        if name not in self.buckets:
+        if name not in self.buckets or (self.blind and self.created):
             return 404, {"success": False, "errors": [{"code": 10006}]}
         created = self.buckets[name] if name not in self.redated else "2026-02-02T00:00:00.000Z"
         return 200, {"success": True, "result": {"name": name, "creation_date": created}}
@@ -450,6 +452,37 @@ def test_state_pass(root: Path) -> None:
     assert all(not holder.stopped for holder in world.holders) and len(world.holders) == 1
     assert "windows-rent-state" not in [name for name in NAMES.values()] and result["production_state"] == "UNTOUCHED"
     no_secret_escapes(world, result)
+    # The same proven run whose branch evidence leaves the closed sets: the evidence is dropped and so is the proof.
+    original = jev.s3_evidence
+    jev.s3_evidence = lambda control, phase, operation: {**original(control, phase, operation), "phase": "unrecorded"}
+    try:
+        world = World()
+        with contextlib.redirect_stderr(world.stderr):
+            dropped = jev.state_proof(root, runner=world.run, api=world.api, spawn=world.spawn, sleep=world.sleep,
+                                      clock=world.now)
+    finally:
+        jev.s3_evidence = original
+    assert dropped["diagnostics"] is None and dropped["status"] == "UNKNOWN", dropped
+    assert dropped["checks"] == result["checks"] and dropped["negatives"] == NEGATIVES and dropped["cleanup"] == "ABSENT"
+    # Finite yet incomplete: shapes a run that stopped early may carry (no entry for a negative, no negatives at all,
+    # no post-TTL probe) leave the labels proven but cannot leave the status proven.
+    checks_of, probe_of = jev.state_checks, jev.probe_evidence
+    for name, attribute, replacement in (
+        ("entry", "s3_evidence", lambda control, phase, operation: None),
+        ("negatives", "state_checks", lambda *args: (*checks_of(*args)[:2], None)),
+        ("probe", "probe_evidence", lambda probe, operation=None, error=None: probe_of("not_run")),
+    ):
+        original = getattr(jev, attribute)
+        setattr(jev, attribute, replacement)
+        try:
+            world = World()
+            with contextlib.redirect_stderr(world.stderr):
+                missing = jev.state_proof(root, runner=world.run, api=world.api, spawn=world.spawn, sleep=world.sleep,
+                                          clock=world.now)
+        finally:
+            setattr(jev, attribute, original)
+        assert jev.diagnostics_finite(missing["diagnostics"]) and missing["negatives"] == NEGATIVES, (name, missing)
+        assert missing["status"] == "UNKNOWN" and missing["cleanup"] == "ABSENT", (name, missing)
 
 
 def expect_preflight_red(world: World, root: Path) -> None:
@@ -553,6 +586,17 @@ def test_cleanup_is_evidence_bound(root: Path) -> None:
     world = World(unknown={"bucket-after"})
     result = world.prove(root)
     assert result["cleanup"] == "UNKNOWN" and result["status"] == "UNKNOWN"
+    # A readback that 404s buckets this run created is not their absence: nothing is owned or deleted, both names read
+    # back 404, yet without ownership of every created bucket the run is UNKNOWN, never ABSENT or PROVEN.
+    world = World(blind=True)
+    result = world.prove(root)
+    assert result["owned"] == [] and result["buckets"] == "ABSENT" and result["credential"] == "UNUSABLE_AFTER_TTL"
+    assert result["cleanup"] == "UNKNOWN" and result["status"] == "UNKNOWN", result
+    assert set(world.buckets) == set(NAMES.values()) and "destroy" not in [args[0] for args in world.tofu("outer")]
+    # Only the proof bucket was created: owning exactly it is complete ownership, so its absence stays ABSENT.
+    world = World(fail={("apply", True)})
+    result = world.prove(root)
+    assert result["owned"] == [NAMES["proof"]] and result["cleanup"] == "ABSENT" and result["status"] == "STATE_BACKEND_RED"
     for item in (World(fail={"destroy"}), World(never_expire=True)):
         no_secret_escapes(item, item.prove(root))
 
