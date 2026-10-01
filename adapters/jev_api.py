@@ -1261,30 +1261,81 @@ def encrypted_raw(raw: bytes | None, canary: str) -> bool:
     return isinstance(value, dict) and isinstance(value.get("encrypted_data"), str) and "resources" not in value
 
 
-def failure_cause(result: subprocess.CompletedProcess[bytes]) -> str:
-    # The captured output is classified in memory and never printed. An S3 status wins over wording; 401 is the
-    # credential as a whole, 403 AccessDenied is its scope; transport noise or any other status is UNKNOWN.
+def failure_facts(result: subprocess.CompletedProcess[bytes]) -> dict[str, Any]:
+    # The captured output is classified in memory and never printed: only these finite facts leave this function.
     text = result.stderr + result.stdout
     statuses = set(STATE_STATUS.findall(text))
-    if STATE_TRANSIENT.search(text) or any(code.startswith(b"5") for code in statuses) or len(statuses) > 1:
-        return "unknown"
-    if statuses == {b"401"}:
-        return "unauthorized"
-    if statuses == {b"403"}:
-        return "access_denied" if b"AccessDenied" in text else "unknown"
-    if statuses:
-        return "unknown"
+    code = next(iter(statuses)) if len(statuses) == 1 else None
+    status = "none" if not statuses else "multiple" if code is None else code.decode() if code in {b"401", b"403"} \
+        else "5xx" if code.startswith(b"5") else "other"
     lowered = text.lower()
-    for cause, word in (("decryption", b"decrypt"), ("encryption", b"encrypt"), ("credential", b"credential")):
-        if word in lowered:
-            return cause
-    return "unknown"
+    word = next((word for word in ("decrypt", "encrypt", "credential") if word.encode() in lowered), "none")
+    return {"status": status, "access_denied": b"AccessDenied" in text,
+            "transient": STATE_TRANSIENT.search(text) is not None, "word": word}
+
+
+def failure_cause(result: subprocess.CompletedProcess[bytes]) -> str:
+    # An S3 status wins over wording; 401 is the credential as a whole, 403 AccessDenied is its scope; transport
+    # noise or any other status is UNKNOWN.
+    facts = failure_facts(result)
+    if facts["transient"] or facts["status"] in {"5xx", "multiple", "other"}:
+        return "unknown"
+    if facts["status"] == "401":
+        return "unauthorized"
+    if facts["status"] == "403":
+        return "access_denied" if facts["access_denied"] else "unknown"
+    return {"decrypt": "decryption", "encrypt": "encryption", "credential": "credential"}.get(facts["word"], "unknown")
 
 
 def refusal(control: bool, attempt: subprocess.CompletedProcess[bytes], causes: set[str]) -> str:
     if attempt.returncode == 0:
         return "ADMITTED"
     return "REFUSED" if control and failure_cause(attempt) in causes else "UNKNOWN"
+
+
+# Branch evidence for the receipt: every value comes from these closed sets, so no captured output, status body,
+# key, credential or exception text can reach it. It explains an UNKNOWN; it never changes a label or PASS.
+STATE_DIAGNOSTIC_VALUES: dict[str, tuple[Any, ...]] = {
+    "control": (True, False),
+    "phase": ("admitted", "init", "read", "lock"),
+    "probe": ("not_run", "admitted", "refused", "local_failure"),
+    "status": ("none", "401", "403", "5xx", "other", "multiple"),
+    "access_denied": (True, False),
+    "transient": (True, False),
+    "word": ("decrypt", "encrypt", "credential", "none"),
+    "local": ("none", "envs", "os", "subprocess"),
+}
+NO_FAILURE_FACTS = {"status": "none", "access_denied": False, "transient": False, "word": "none"}
+
+
+def negative_evidence(control: bool, phase: str, attempt: subprocess.CompletedProcess[bytes]) -> dict[str, Any]:
+    # phase is where the attempt stopped: admitted, or refused at init, read (output) or lock (the lock-file write).
+    facts = NO_FAILURE_FACTS if attempt.returncode == 0 else failure_facts(attempt)
+    return {"control": control, "phase": "admitted" if attempt.returncode == 0 else phase, **facts}
+
+
+def probe_evidence(probe: str, attempt: subprocess.CompletedProcess[bytes] | None = None,
+                   error: BaseException | None = None) -> dict[str, Any]:
+    local = "none" if error is None else "envs" if isinstance(error, EnvsError) \
+        else "subprocess" if isinstance(error, subprocess.SubprocessError) else "os"
+    facts = failure_facts(attempt) if attempt is not None and attempt.returncode != 0 else NO_FAILURE_FACTS
+    return {"probe": probe, **facts, "local": local}
+
+
+def diagnostics_finite(diagnostics: Any) -> bool:
+    # Only known keys with values from their closed set; anything else is never emitted.
+    def entry(value: Any, keys: set[str]) -> bool:
+        return isinstance(value, dict) and set(value) == keys and all(
+            any(type(item) is type(allowed) and item == allowed for allowed in STATE_DIAGNOSTIC_VALUES[key])
+            for key, item in value.items())
+
+    if not isinstance(diagnostics, dict) or set(diagnostics) != {"negatives", "credential_probe"}:
+        return False
+    negatives = diagnostics["negatives"]
+    negative_keys = {"control", "phase", *NO_FAILURE_FACTS}
+    return (negatives is None or (isinstance(negatives, dict) and set(negatives) == set(STATE_NEGATIVES) and all(
+        item is None or entry(item, negative_keys) for item in negatives.values()))) and entry(
+        diagnostics["credential_probe"], {"probe", "local", *NO_FAILURE_FACTS})
 
 
 def credential_probe(root: Path, scratch: Path, name: str, tools: Mapping[str, str], account: str, bucket: str,
@@ -1305,7 +1356,7 @@ def credential_probe(root: Path, scratch: Path, name: str, tools: Mapping[str, s
 
 def state_checks(root: Path, scratch: Path, tools: Mapping[str, str], account: str, token: str,
                  names: Mapping[str, str], credentials: Mapping[str, str], runner: Runner, spawn: Spawn,
-                 sleep: Callable[[float], None]) -> tuple[dict[str, bool], dict[str, str]]:
+                 sleep: Callable[[float], None]) -> tuple[dict[str, bool], dict[str, str], dict[str, Any]]:
     passphrase, rotated = secrets.token_hex(32), secrets.token_hex(32)
     first, second = "canary-" + secrets.token_hex(16), "canary-" + secrets.token_hex(16)
     hold = {"TF_VAR_python": tools["python3"], "TF_VAR_hold_nonce": secrets.token_hex(8),
@@ -1340,18 +1391,23 @@ def state_checks(root: Path, scratch: Path, tools: Mapping[str, str], account: s
         result = run(work, env, "output", "-raw", "canary")
         return result.returncode == 0 and result.stdout == expected.encode()
 
-    def read_attempt(name: str, **options: Any) -> subprocess.CompletedProcess[bytes]:
+    def read_attempt(name: str, **options: Any) -> tuple[str, subprocess.CompletedProcess[bytes]]:
         work, env = backend(name, **options)
         opened = run(work, env, *init)
-        return opened if opened.returncode != 0 else run(work, env, "output", "-raw", "canary")
+        return ("init", opened) if opened.returncode != 0 else ("read", run(work, env, "output", "-raw", "canary"))
+
+    def negative(name: str, control: bool, phase: str, attempt: subprocess.CompletedProcess[bytes]) -> None:
+        negatives[name] = refusal(control, attempt, STATE_NEGATIVES[name])
+        evidence[name] = negative_evidence(control, phase, attempt)
 
     checks = dict.fromkeys(STATE_CHECKS, False)
     negatives = dict.fromkeys(STATE_NEGATIVES, "UNKNOWN")
+    evidence: dict[str, Any] = dict.fromkeys(STATE_NEGATIVES)
     current = encryption_config("k0", passphrase)
     holder_work, holder_env = backend("holder", encryption=current)
     contender_work, contender_env = backend("contender", encryption=current)
     if not (ok(holder_work, holder_env, *init) and ok(contender_work, contender_env, *init)):
-        return checks, negatives
+        return checks, negatives, evidence
     holder = spawn([tools["tofu"], f"-chdir={holder_work}", *apply], holder_env)
     code = None
     try:
@@ -1379,29 +1435,29 @@ def state_checks(root: Path, scratch: Path, tools: Mapping[str, str], account: s
     checks["rotated_readback"] = reads(*backend("rotated", encryption=only_rotated), second)
     # Each negative runs right after a control that differs only in the input under test.
     control = reads(*backend("old-key-control", encryption=only_rotated), second)
-    negatives["old_key_refused"] = refusal(control, read_attempt("old-key", encryption=current),
-                                           STATE_NEGATIVES["old_key_refused"])
+    negative("old_key_refused", control, *read_attempt("old-key", encryption=current))
     control = reads(*backend("no-encryption-control", encryption=only_rotated), second)
-    negatives["unencrypted_read_refused"] = refusal(control, read_attempt("no-encryption", encryption=None),
-                                                    STATE_NEGATIVES["unencrypted_read_refused"])
+    negative("unencrypted_read_refused", control, *read_attempt("no-encryption", encryption=None))
     control = ok(*backend("no-credential-control", encryption=only_rotated), *init)
     work, env = backend("no-credential", encryption=only_rotated, creds={})
-    negatives["no_credential_refused"] = refusal(control, run(work, env, *init), STATE_NEGATIVES["no_credential_refused"])
+    negative("no_credential_refused", control, "init", run(work, env, *init))
     # The prefix is tested by OpenTofu's own lock-file write; the control takes and releases the lock inside it.
     lock = ("plan", "-lock-timeout=0", "-input=false", "-no-color")
     control_work, control_env = backend("outside-prefix-control", encryption=only_rotated, canary=second)
     control = ok(control_work, control_env, *init) and ok(control_work, control_env, *lock)
     work, env = backend("outside-prefix", encryption=only_rotated, key=STATE_OUTSIDE_KEY, canary=second)
     opened = run(work, env, *init)
-    # An init already refused proves no write denial: the write result stays UNKNOWN.
-    negatives["outside_prefix_write_refused"] = "UNKNOWN" if opened.returncode != 0 else refusal(
-        control, run(work, env, *lock), STATE_NEGATIVES["outside_prefix_write_refused"])
+    if opened.returncode != 0:
+        # An init already refused proves no write denial: the write result stays UNKNOWN; its phase says so.
+        evidence["outside_prefix_write_refused"] = negative_evidence(control, "init", opened)
+    else:
+        negative("outside_prefix_write_refused", control, "lock", run(work, env, *lock))
     control = ok(*backend("decoy-control", encryption=only_rotated), *init)
     work, env = backend("decoy", encryption=only_rotated, bucket=names["decoy"])
-    negatives["decoy_refused"] = refusal(control, run(work, env, *init), STATE_NEGATIVES["decoy_refused"])
+    negative("decoy_refused", control, "init", run(work, env, *init))
     # The negatives mean something only if the same credential still reads the same state after them.
     checks["path_up_after_negatives"] = reads(*backend("bracket", encryption=only_rotated), second)
-    return checks, negatives
+    return checks, negatives, evidence
 
 
 def state_cleanup(root: Path, tools: Mapping[str, str], scratch: Path, account: str, token: str,
@@ -1411,7 +1467,8 @@ def state_cleanup(root: Path, tools: Mapping[str, str], scratch: Path, account: 
                   sleep: Callable[[float], None], clock: Callable[[], float]) -> dict[str, Any]:
     # Runs once: after the TTL, the same credential must be refused 401 in a fresh directory; delete only the exact
     # expected keys and only buckets this run provably created, then read both names back. Doubt is never ABSENT.
-    report: dict[str, Any] = {"credential": credential, "buckets": "UNKNOWN", "owned": [], "cleanup": "UNKNOWN"}
+    report: dict[str, Any] = {"credential": credential, "buckets": "UNKNOWN", "owned": [], "cleanup": "UNKNOWN",
+                              "credential_probe": probe_evidence("not_run")}
     if credential == "ISSUED":
         report["credential"] = "UNKNOWN"
         try:
@@ -1419,13 +1476,15 @@ def state_cleanup(root: Path, tools: Mapping[str, str], scratch: Path, account: 
                 sleep(max(0.0, issued + STATE_CREDENTIAL_TTL + STATE_EXPIRY_GRACE - clock()))
                 after = credential_probe(root, scratch, "unusable-after-ttl", tools, account, names["proof"],
                                          credentials, encryption, runner)
+                report["credential_probe"] = probe_evidence("admitted" if after.returncode == 0 else "refused", after)
                 if after.returncode == 0:
                     report["credential"] = "STILL_USABLE"
                 elif failure_cause(after) == "unauthorized":
                     report["credential"] = "UNUSABLE_AFTER_TTL"
-        except STATE_FAILURES:
+        except STATE_FAILURES as exc:
             # A probe that could not run observes nothing: the credential stays UNKNOWN and cleanup still proceeds.
             report["credential"] = "UNKNOWN"
+            report["credential_probe"] = probe_evidence("local_failure", error=exc)
     if created is None:
         return report
     # Phase 1: ownership needs a complete current readback; without it nothing is deleted.
@@ -1481,6 +1540,7 @@ def state_proof(root: Path = ROOT, *, runner: Runner = default_runner, api: Api 
         "parent": verify_parent(api, account, token, parent, clock()), "checks": None, "negatives": None,
         "credential": "NOT_ATTEMPTED", "credential_control": None, "cleanup": "NOT_STARTED",
         "production_state": "UNTOUCHED", "existing_buckets": "UNTOUCHED",
+        "diagnostics": {"negatives": None, "credential_probe": probe_evidence("not_run")},
     }
     for name in names.values():
         require(bucket_creation(api, account, token, name) is None, "a per-run bucket name already exists")
@@ -1528,9 +1588,10 @@ def state_proof(root: Path = ROOT, *, runner: Runner = default_runner, api: Api 
             control = opened.returncode == 0
             result["credential_control"] = "USABLE" if control else "UNKNOWN"
             result["stage"] = "proof"
-            checks, negatives = state_checks(root, scratch, tools, account, token, names, credentials, runner, spawn,
-                                             sleep)
+            checks, negatives, evidence = state_checks(root, scratch, tools, account, token, names, credentials,
+                                                       runner, spawn, sleep)
             result["checks"], result["negatives"] = checks, negatives
+            result["diagnostics"]["negatives"] = evidence
             if not all(checks.values()) or "ADMITTED" in negatives.values():
                 result["status"] = "STATE_BACKEND_RED"
             elif control and set(negatives.values()) == {"REFUSED"}:
@@ -1545,9 +1606,14 @@ def state_proof(root: Path = ROOT, *, runner: Runner = default_runner, api: Api 
             result["error"] = type(exc).__name__
             result["status"] = "UNKNOWN"
         finally:
-            result.update(state_cleanup(root, tools, scratch, account, token, run, names, outer, outer_env, created,
-                                        result["credential"], control, issued, credentials, probe_encryption, runner,
-                                        api, sleep, clock))
+            report = state_cleanup(root, tools, scratch, account, token, run, names, outer, outer_env, created,
+                                   result["credential"], control, issued, credentials, probe_encryption, runner,
+                                   api, sleep, clock)
+            result["diagnostics"]["credential_probe"] = report.pop("credential_probe")
+            result.update(report)
+    if not diagnostics_finite(result["diagnostics"]):
+        # A value outside the closed sets is never emitted; the labels above stand unchanged.
+        result["diagnostics"] = None
     if result["cleanup"] != "ABSENT":
         # Resources or a usable credential may remain: no proof outcome stands as the status.
         result["status"] = result["cleanup"]
