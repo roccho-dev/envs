@@ -1314,10 +1314,15 @@ def negative_evidence(control: bool, phase: str, attempt: subprocess.CompletedPr
     return {"control": control, "phase": "admitted" if attempt.returncode == 0 else phase, **facts}
 
 
+def failure_class(error: BaseException) -> str:
+    # One of the state proof's handled failure kinds, never its message or class name.
+    return "envs" if isinstance(error, EnvsError) else "subprocess" if isinstance(error, subprocess.SubprocessError) \
+        else "os"
+
+
 def probe_evidence(probe: str, attempt: subprocess.CompletedProcess[bytes] | None = None,
                    error: BaseException | None = None) -> dict[str, Any]:
-    local = "none" if error is None else "envs" if isinstance(error, EnvsError) \
-        else "subprocess" if isinstance(error, subprocess.SubprocessError) else "os"
+    local = "none" if error is None else failure_class(error)
     facts = failure_facts(attempt) if attempt is not None and attempt.returncode != 0 else NO_FAILURE_FACTS
     return {"probe": probe, **facts, "local": local}
 
@@ -1599,11 +1604,12 @@ def state_proof(root: Path = ROOT, *, runner: Runner = default_runner, api: Api 
             else:
                 result["status"] = "UNKNOWN"
         except EnvsError as exc:
-            result["error"] = str(exc)
+            # The stage says where; the receipt carries only the closed failure kind, never exception text.
+            result["error"] = failure_class(exc)
             result["status"] = "STATE_BACKEND_RED"
         except (OSError, subprocess.SubprocessError) as exc:
-            # A local launch or storage failure proves nothing about R2: UNKNOWN, named by class only (no paths).
-            result["error"] = type(exc).__name__
+            # A local launch or storage failure proves nothing about R2: UNKNOWN, named by its closed kind only.
+            result["error"] = failure_class(exc)
             result["status"] = "UNKNOWN"
         finally:
             report = state_cleanup(root, tools, scratch, account, token, run, names, outer, outer_env, created,

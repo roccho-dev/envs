@@ -268,8 +268,9 @@ class World:
         with contextlib.redirect_stderr(self.stderr):
             result = jev.state_proof(root, runner=self.run, api=self.api, spawn=self.spawn, sleep=self.sleep,
                                      clock=self.now)
-        # Every scenario's branch evidence is finite and agrees with its unchanged labels.
+        # Every scenario's branch evidence is finite and agrees with its unchanged labels; an error is only its kind.
         assert jev.diagnostics_finite(result["diagnostics"]), result["diagnostics"]
+        assert result.get("error", "envs") in {"envs", "os", "subprocess"} and type(result.get("error", "")) is str, result
         if result["negatives"] is not None:
             assert result["negatives"] == {name: label_from(name, entry)
                                            for name, entry in result["diagnostics"]["negatives"].items()}, result
@@ -373,7 +374,8 @@ def test_first_create_is_the_only_probe(root: Path) -> None:
     world = World(fail={("apply", False)})
     result = world.prove(root)
     assert result["status"] == "STATE_BACKEND_RED" and result["cleanup"] == "ABSENT", result
-    assert "first bounded bucket create" in result["error"] and PARENT_TOKEN not in result["error"]
+    # The stage names where it failed; the receipt carries only the closed failure kind, no exception text.
+    assert result["stage"] == "create" and result["error"] == "envs", result
     assert [args[0] for args in world.tofu("outer")] == ["init", "apply", "show"]
     assert ("POST", "temporary") not in world.api_calls and result["credential"] == "NOT_ATTEMPTED"
     assert not world.holders and world.slept == []
@@ -466,13 +468,14 @@ def test_cleanup_survives_local_failures(root: Path) -> None:
     assert result["buckets"] == "UNKNOWN" and result["cleanup"] == "UNKNOWN" and result["owned"] == []
     assert "destroy" not in outer_commands(world) and set(world.buckets) == set(NAMES.values())
     assert not [argv for argv, _ in world.calls if argv[0] == TOOLS["wrangler"] and argv[3] == "delete"]
-    # A local failure inside the proof is UNKNOWN (class name only), the result is still returned after cleanup.
-    world = World(raising={"readback": OSError})
-    result = world.prove(root)
-    assert result["status"] == "UNKNOWN" and result["error"] == "OSError" and result["checks"] is None, result
-    assert result["cleanup"] == "ABSENT" and result["credential"] == "UNUSABLE_AFTER_TTL" and world.buckets == {}
-    assert str(Path.home()) not in json.dumps(result)
-    no_red_leak(world, result)
+    # A local failure inside the proof is UNKNOWN (closed kind only), the result is still returned after cleanup.
+    for error, kind in ((OSError, "os"), (subprocess.SubprocessError, "subprocess"), (PermissionError, "os")):
+        world = World(raising={"readback": error})
+        result = world.prove(root)
+        assert result["status"] == "UNKNOWN" and result["error"] == kind and result["checks"] is None, result
+        assert result["cleanup"] == "ABSENT" and result["credential"] == "UNUSABLE_AFTER_TTL" and world.buckets == {}
+        assert str(Path.home()) not in json.dumps(result)
+        no_red_leak(world, result)
 
 
 @with_root
