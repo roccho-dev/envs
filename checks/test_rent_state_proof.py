@@ -44,6 +44,8 @@ LOCK_DENIED = (b"Error acquiring the state lock\n\nError message: operation erro
                b"StatusCode: 403, RequestID: r, api error AccessDenied: Access Denied")
 UNAUTHORIZED = b"operation error S3: ListObjectsV2, https response error StatusCode: 401, RequestID: r, api error Unauthorized"
 UNAVAILABLE = b"operation error S3: GetObject, https response error StatusCode: 503, RequestID: r, api error ServiceUnavailable"
+# A fake shape only: native OpenTofu 1.12.3 rejects an enforced root without a method at init as a configuration
+# error before reading any state (real_tofu records that as a guard); this fixture is not evidence of real output.
 NO_METHOD = b"Error: state encryption is enforced, but no encryption method is configured"
 NO_CREDENTIAL = b"Error: No valid credential sources found"
 UNDECRYPTABLE = b"Error: decryption failed for all provided methods"
@@ -266,8 +268,15 @@ class World:
 
     def prove(self, root: Path) -> dict:
         with contextlib.redirect_stderr(self.stderr):
-            return jev.state_proof(root, runner=self.run, api=self.api, spawn=self.spawn, sleep=self.sleep,
-                                   clock=self.now)
+            result = jev.state_proof(root, runner=self.run, api=self.api, spawn=self.spawn, sleep=self.sleep,
+                                     clock=self.now)
+        # Every scenario's branch evidence is finite and agrees with its unchanged labels; an error is only its kind.
+        assert jev.diagnostics_finite(result["diagnostics"]), result["diagnostics"]
+        assert result.get("error", "envs") in {"envs", "os", "subprocess"} and type(result.get("error", "")) is str, result
+        if result["negatives"] is not None:
+            assert result["negatives"] == {name: label_from(name, entry)
+                                           for name, entry in result["diagnostics"]["negatives"].items()}, result
+        return result
 
     def tofu(self, work: str) -> list[list[str]]:
         return [argv[2:] for argv, _ in self.calls
@@ -367,7 +376,8 @@ def test_first_create_is_the_only_probe(root: Path) -> None:
     world = World(fail={("apply", False)})
     result = world.prove(root)
     assert result["status"] == "STATE_BACKEND_RED" and result["cleanup"] == "ABSENT", result
-    assert "first bounded bucket create" in result["error"] and PARENT_TOKEN not in result["error"]
+    # The stage names where it failed; the receipt carries only the closed failure kind, no exception text.
+    assert result["stage"] == "create" and result["error"] == "envs", result
     assert [args[0] for args in world.tofu("outer")] == ["init", "apply", "show"]
     assert ("POST", "temporary") not in world.api_calls and result["credential"] == "NOT_ATTEMPTED"
     assert not world.holders and world.slept == []
@@ -460,13 +470,14 @@ def test_cleanup_survives_local_failures(root: Path) -> None:
     assert result["buckets"] == "UNKNOWN" and result["cleanup"] == "UNKNOWN" and result["owned"] == []
     assert "destroy" not in outer_commands(world) and set(world.buckets) == set(NAMES.values())
     assert not [argv for argv, _ in world.calls if argv[0] == TOOLS["wrangler"] and argv[3] == "delete"]
-    # A local failure inside the proof is UNKNOWN (class name only), the result is still returned after cleanup.
-    world = World(raising={"readback": OSError})
-    result = world.prove(root)
-    assert result["status"] == "UNKNOWN" and result["error"] == "OSError" and result["checks"] is None, result
-    assert result["cleanup"] == "ABSENT" and result["credential"] == "UNUSABLE_AFTER_TTL" and world.buckets == {}
-    assert str(Path.home()) not in json.dumps(result)
-    no_red_leak(world, result)
+    # A local failure inside the proof is UNKNOWN (closed kind only), the result is still returned after cleanup.
+    for error, kind in ((OSError, "os"), (subprocess.SubprocessError, "subprocess"), (PermissionError, "os")):
+        world = World(raising={"readback": error})
+        result = world.prove(root)
+        assert result["status"] == "UNKNOWN" and result["error"] == kind and result["checks"] is None, result
+        assert result["cleanup"] == "ABSENT" and result["credential"] == "UNUSABLE_AFTER_TTL" and world.buckets == {}
+        assert str(Path.home()) not in json.dumps(result)
+        no_red_leak(world, result)
 
 
 @with_root
@@ -488,6 +499,155 @@ def test_negative_classes(root: Path) -> None:
                                                    if key != name} == {key: "REFUSED" for key in NEGATIVES if key != name}
         if world.outside_init_denied:
             assert [args[0] for args in world.tofu("outside-prefix")] == ["init"], "no write was attempted"
+
+
+MARKER = "fixture-marker-" + secrets.token_hex(8)
+# A 403 without AccessDenied (for example a body-less HEAD) whose text also carries a marker that must never escape.
+FORBIDDEN = f"operation error S3: HeadBucket, https response error StatusCode: 403, RequestID: r, {MARKER}".encode()
+PHASES = {"old_key_refused": "read", "unencrypted_read_refused": "init", "no_credential_refused": "init",
+          "outside_prefix_write_refused": "lock", "decoy_refused": "init"}
+
+
+def label_from(name: str, entry: dict | None) -> str:
+    # The pre-registered reading: each label follows from its evidence by the unchanged refusal rule.
+    if entry is None:
+        return "UNKNOWN"
+    if entry["phase"] == "admitted":
+        return "ADMITTED"
+    if name == "outside_prefix_write_refused" and entry["phase"] == "init":
+        return "UNKNOWN"
+    facts = {key: entry[key] for key in jev.NO_FAILURE_FACTS}
+    cause = "unknown" if facts["transient"] or facts["status"] in {"5xx", "multiple", "other"} else \
+        "unauthorized" if facts["status"] == "401" else \
+        ("access_denied" if facts["access_denied"] else "unknown") if facts["status"] == "403" else \
+        {"decrypt": "decryption", "encrypt": "encryption", "credential": "credential"}.get(facts["word"], "unknown")
+    return "REFUSED" if entry["control"] and cause in jev.STATE_NEGATIVES[name] else "UNKNOWN"
+
+
+def diagnostics_hold(world: World, result: dict) -> dict:
+    # Finite values only, consistent with the unchanged labels, and no captured output in the receipt.
+    diagnostics = result["diagnostics"]
+    assert jev.diagnostics_finite(diagnostics), diagnostics
+    if result["negatives"] is not None:
+        for name, entry in diagnostics["negatives"].items():
+            assert result["negatives"][name] == label_from(name, entry), (name, entry, result["negatives"])
+    probe = diagnostics["credential_probe"]
+    if result["credential"] == "STILL_USABLE":
+        assert probe["probe"] == "admitted"
+    if result["credential"] == "UNUSABLE_AFTER_TTL":
+        assert probe["probe"] == "refused" and probe["status"] == "401"
+    text = json.dumps(result)
+    assert MARKER not in text and "StatusCode" not in text and "operation error" not in text
+    no_red_leak(world, result)
+    return diagnostics
+
+
+@with_root
+def test_branch_evidence(root: Path) -> None:
+    # A proven run: every negative refused at its own phase with its own cause, after a successful control.
+    world = World()
+    result = world.prove(root)
+    diagnostics = diagnostics_hold(world, result)
+    negatives = diagnostics["negatives"]
+    assert {name: entry["phase"] for name, entry in negatives.items()} == PHASES
+    assert all(entry["control"] for entry in negatives.values())
+    assert negatives["old_key_refused"]["word"] == "decrypt" and negatives["unencrypted_read_refused"]["word"] == "encrypt"
+    assert negatives["no_credential_refused"]["word"] == "credential"
+    for name in ("outside_prefix_write_refused", "decoy_refused"):
+        assert negatives[name]["status"] == "403" and negatives[name]["access_denied"] is True
+    assert diagnostics["credential_probe"] == {"probe": "refused", "status": "401", "access_denied": False,
+                                               "transient": False, "word": "none", "local": "none"}
+    # Each UNKNOWN or ADMITTED branch is told apart by finite evidence, with the label unchanged.
+    for world, name, expected in (
+        (World(outside_init_denied=True), "outside_prefix_write_refused",
+         {"control": True, "phase": "init", "status": "403", "access_denied": True}),
+        (World(admit={"outside-prefix"}), "outside_prefix_write_refused", {"phase": "admitted", "status": "none"}),
+        (World(transient={"no-credential-control"}), "no_credential_refused", {"control": False, "phase": "init"}),
+        (World(transient={"no-encryption"}), "unencrypted_read_refused", {"phase": "init", "status": "5xx"}),
+        (World(decoy=UNAUTHORIZED), "decoy_refused", {"control": True, "status": "401"}),
+        (World(decoy=FORBIDDEN), "decoy_refused", {"control": True, "status": "403", "access_denied": False}),
+        (World(decoy=DENIED + b"\n" + UNAUTHORIZED), "decoy_refused", {"status": "multiple"}),
+        (World(decoy=b"dial tcp: i/o timeout"), "decoy_refused", {"status": "none", "transient": True}),
+    ):
+        result = world.prove(root)
+        entry = diagnostics_hold(world, result)["negatives"][name]
+        assert {key: entry[key] for key in expected} == expected, (name, entry)
+        assert result["negatives"][name] in {"UNKNOWN", "ADMITTED"}, (name, result["negatives"])
+    # The post-TTL probe: admitted, refused for another cause, not run behind a failed control, or a local failure
+    # named only by its closed class.
+    for world, credential, expected in (
+        (World(never_expire=True), "STILL_USABLE", {"probe": "admitted", "status": "none", "local": "none"}),
+        (World(expiry=DENIED), "UNKNOWN", {"probe": "refused", "status": "403", "access_denied": True}),
+        (World(transient={"unusable-after-ttl"}), "UNKNOWN", {"probe": "refused", "status": "5xx"}),
+        (World(transient={"usable-control"}), "UNKNOWN", {"probe": "not_run", "local": "none"}),
+        (World(raising={"unusable-after-ttl": OSError}), "UNKNOWN", {"probe": "local_failure", "local": "os"}),
+        (World(raising={"unusable-after-ttl": subprocess.SubprocessError}), "UNKNOWN",
+         {"probe": "local_failure", "local": "subprocess"}),
+        (World(issuance="5xx"), "ISSUANCE_UNKNOWN", {"probe": "not_run"}),
+    ):
+        result = world.prove(root)
+        probe = diagnostics_hold(world, result)["credential_probe"]
+        assert result["credential"] == credential and {key: probe[key] for key in expected} == expected, (probe, result)
+    # No negative ran: the evidence says so instead of inventing a branch.
+    world = World(issuance="transport")
+    assert diagnostics_hold(world, result := world.prove(root))["negatives"] is None and result["negatives"] is None
+
+
+def test_diagnostics_closed() -> None:
+    good = {"negatives": None, "credential_probe": jev.probe_evidence("not_run")}
+    assert jev.diagnostics_finite(good)
+    entry = {"control": True, "phase": "init", **jev.NO_FAILURE_FACTS}
+    assert jev.diagnostics_finite({**good, "negatives": {name: entry for name in jev.STATE_NEGATIVES}})
+    for bad in (
+        {**good, "extra": 1},
+        {**good, "credential_probe": {**good["credential_probe"], "local": "KeyError"}},
+        {**good, "credential_probe": {**good["credential_probe"], "status": "403 AccessDenied: denied"}},
+        {**good, "credential_probe": {**good["credential_probe"], "word": TEMPORARY["sessionToken"]}},
+        {**good, "credential_probe": {**good["credential_probe"], "detail": "x"}},
+        {**good, "negatives": {name: {**entry, "control": 1} for name in jev.STATE_NEGATIVES}},
+        {**good, "negatives": {name: {**entry, "phase": "plan"} for name in jev.STATE_NEGATIVES}},
+        {**good, "negatives": {"old_key_refused": entry}},
+        None,
+    ):
+        assert not jev.diagnostics_finite(bad), bad
+
+
+class MarkerFailure(Exception):
+    pass
+
+
+def state_command(root: Path) -> tuple[int, str]:
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = jev.main(["--root", str(root), "rent-state-proof"])
+    return code, out.getvalue() + err.getvalue()
+
+
+def test_state_command_red_line() -> None:
+    # The state command's failure line carries only a closed kind: never exception text, a class name or a
+    # traceback, even for an unexpected exception; it still fails closed.
+    secret = f"{MARKER}-{TEMPORARY['secretAccessKey']}"
+    original = jev.state_proof
+    try:
+        for error, kind in ((jev.EnvsError(secret), "envs"), (OSError(secret), "os"),
+                            (subprocess.SubprocessError(secret), "subprocess"), (MarkerFailure(secret), "other"),
+                            (KeyError(secret), "other")):
+            def failing(root: Path, error: Exception = error) -> dict:
+                raise error
+            jev.state_proof = failing
+            code, text = state_command(ROOT)
+            assert code == 1 and text == f"RENT_STATE_PROOF=RED: {kind}\n", (kind, text)
+            assert MARKER not in text and type(error).__name__ not in text and "Traceback" not in text
+    finally:
+        jev.state_proof = original
+    # A real preflight refusal (a missing secret input) reads the same way.
+    root = fixtures.copy_root()
+    try:
+        with fixtures.environment(state_env(R2_PARENT_API_TOKEN="")):
+            code, text = state_command(root)
+        assert code == 1 and text == "RENT_STATE_PROOF=RED: envs\n", text
+    finally:
+        shutil.rmtree(root.parent, ignore_errors=True)
 
 
 def test_failure_cause() -> None:
@@ -583,11 +743,7 @@ def test_encryption_config() -> None:
 
 
 # The backend root's encryption and canary on a local backend: OpenTofu's own encryption metadata, without S3 or R2.
-NATIVE_ROOT = """terraform {
-  backend "local" {
-    path = "%s"
-  }
-  encryption {
+NATIVE_ENCRYPTION = """  encryption {
     state {
       enforced = true
     }
@@ -595,7 +751,12 @@ NATIVE_ROOT = """terraform {
       enforced = true
     }
   }
-}
+"""
+NATIVE_ROOT = """terraform {
+  backend "local" {
+    path = "%s"
+  }
+""" + NATIVE_ENCRYPTION + """}
 
 variable "canary" {
   type    = string
@@ -610,6 +771,10 @@ output "canary" {
   value = terraform_data.canary.output
 }
 """
+# The same root with no encryption block at all: OpenTofu then has no encryption configuration. It is only ever
+# initialized and read, never planned or applied, so it cannot write the state.
+NATIVE_PLAIN_ROOT = NATIVE_ROOT.replace(NATIVE_ENCRYPTION, "")
+assert NATIVE_PLAIN_ROOT != NATIVE_ROOT and "encryption" not in NATIVE_PLAIN_ROOT
 
 
 def real_tofu(tofu: str) -> None:
@@ -624,15 +789,18 @@ def real_tofu(tofu: str) -> None:
     first, second = secrets.token_hex(32), secrets.token_hex(32)
     old, new = "canary-" + secrets.token_hex(16), "canary-" + secrets.token_hex(16)
 
-    def run(name: str, encryption: str, canary: str, *args: str) -> subprocess.CompletedProcess[bytes]:
+    def run(name: str, encryption: str | None, canary: str, *args: str,
+            root: str = NATIVE_ROOT) -> subprocess.CompletedProcess[bytes]:
         directory, home = work / name, work / f"home-{name}"
         if not directory.exists():
             directory.mkdir()
             home.mkdir()
-            (directory / "main.tf").write_text(NATIVE_ROOT % state.as_posix(), encoding="utf-8")
+            (directory / "main.tf").write_text(root % state.as_posix(), encoding="utf-8")
         env = {"PATH": os.path.dirname(tofu), "HOME": str(home), "TF_IN_AUTOMATION": "1", "TF_INPUT": "0",
                "HTTPS_PROXY": "http://127.0.0.1:9", "HTTP_PROXY": "http://127.0.0.1:9", "CHECKPOINT_DISABLE": "1",
-               "TF_ENCRYPTION": encryption, "TF_VAR_canary": canary}
+               "TF_VAR_canary": canary}
+        if encryption is not None:
+            env["TF_ENCRYPTION"] = encryption
         return subprocess.run([tofu, f"-chdir={directory}", *args], env=env, capture_output=True, timeout=300,
                               check=False)
 
@@ -658,6 +826,22 @@ def real_tofu(tofu: str) -> None:
     after = state.read_bytes() if state.is_file() else None
     outcome["raw_rewritten"] = jev.encrypted_raw(after, new) and after != before
     outcome["new_key_read"] = reads("new-key", jev.encryption_config("k1", second), new)
+    # Right after that control, only the encryption configuration differs: a root with no encryption block reads the
+    # same encrypted state (init and output only) and must be refused for the adapter's own qualifying cause.
+    held = state.read_bytes() if state.is_file() else None
+    phase, cause = "admitted", "ok"
+    for name, command in (("init", ("init", "-input=false", "-no-color")), ("read", ("output", "-raw", "canary"))):
+        result = run("no-config", None, "", *command, root=NATIVE_PLAIN_ROOT)
+        if result.returncode != 0:
+            phase, cause = name, jev.failure_cause(result)
+            break
+    qualifying = jev.STATE_NEGATIVES["unencrypted_read_refused"]
+    outcome["no_config_read_refused"] = (phase != "admitted" and cause in qualifying, cause, phase)
+    # A guard, not a read refusal: the enforced root without TF_ENCRYPTION is rejected at init by its own
+    # configuration (no method), before any state is read; only that refusal is recorded, not its cause.
+    guard = run("enforced-no-key", None, "", "init", "-input=false", "-no-color")
+    outcome["enforced_init_refused"] = guard.returncode != 0
+    outcome["no_config_state_unchanged"] = held is not None and state.read_bytes() == held
     refused, cause = reads("old-key", jev.encryption_config("k0", first), new)
     outcome["old_key_refused"] = (not refused and cause == "decryption", cause)
     passed = all(value[0] if isinstance(value, tuple) else value for value in outcome.values())
@@ -678,6 +862,9 @@ def main() -> None:
         test_cleanup_is_evidence_bound()
         test_cleanup_survives_local_failures()
         test_negative_classes()
+        test_branch_evidence()
+        test_diagnostics_closed()
+        test_state_command_red_line()
         test_failure_cause()
         test_state_red_inputs()
         test_recovery_input()
