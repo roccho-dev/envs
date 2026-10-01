@@ -326,11 +326,12 @@ def expected_inputs() -> dict[str, dict[str, list[dict[str, str]]]]:
             ),
         },
         STATE_PLANE: {
-            "required_secrets": entries(("R2_PARENT_API_TOKEN", "opaque", "finite_expiry")),
-            "required_variables": entries(
-                ("CLOUDFLARE_ACCOUNT_ID", "cloudflare_account_id", "persistent"),
+            # The parent token ID is non-secret but a GitHub variable is printed in the public step log, so it is a secret.
+            "required_secrets": entries(
+                ("R2_PARENT_API_TOKEN", "opaque", "finite_expiry"),
                 ("R2_PARENT_ACCESS_KEY_ID", "cloudflare_api_token_id", "finite_expiry"),
             ),
+            "required_variables": entries(("CLOUDFLARE_ACCOUNT_ID", "cloudflare_account_id", "persistent")),
         },
     }
 
@@ -1470,7 +1471,9 @@ def state_proof(root: Path = ROOT, *, runner: Runner = default_runner, api: Api 
     inputs = gate(root, contracts, STATE_PLANE)
     token, account, parent = (inputs[name] for name in ("R2_PARENT_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID",
                                                         "R2_PARENT_ACCESS_KEY_ID"))
+    # Secrets are not covered by the gate's Variable check: a token or its ID already in Git is RED before any call.
     reject_live_values(root, "R2_PARENT_API_TOKEN", [token])
+    reject_live_values(root, "R2_PARENT_ACCESS_KEY_ID", [parent])
     run = run_identity(os.environ)
     names = state_bucket_names(run)
     result: dict[str, Any] = {

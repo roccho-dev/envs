@@ -148,7 +148,7 @@ jobs:
           "$tool/wrangler" r2 object get --help >"$RUNNER_TEMP/r2-object-get.help" 2>&1 || true
           grep -qF -- --pipe "$RUNNER_TEMP/r2-object-get.help"
           grep -qF -- --remote "$RUNNER_TEMP/r2-object-get.help"
-          "$tool/python3" -I checks/test_rent_state_proof.py
+          "$tool/python3" -I checks/test_rent_state_proof.py --real-tofu "$tool/tofu"
 
       - name: Test Jev adapter on the toolchain interpreter
         run: '"$RUNNER_TEMP/envs-effect/bin/python3" -I checks/test_jev_api.py'
