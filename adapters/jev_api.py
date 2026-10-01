@@ -1359,6 +1359,21 @@ def credential_probe(root: Path, scratch: Path, name: str, tools: Mapping[str, s
     return runner([tools["tofu"], f"-chdir={work}", "init", "-input=false", "-no-color"], None, env)
 
 
+# The backend root's one enforced encryption block. Only the no-encryption negative removes it, so that OpenTofu has
+# no encryption configuration at all; a method-less enforced block is a configuration error, not a ciphertext read.
+STATE_ENCRYPTION_BLOCK = ("  encryption {\n    state {\n      enforced = true\n    }\n"
+                          "    plan {\n      enforced = true\n    }\n  }\n")
+ENCRYPTION_BLOCK_START = re.compile(r"(?m)^\s*encryption\s*\{")
+
+
+def without_encryption(text: str) -> str | None:
+    # Exactly one exact block is removed; a missing, differing or repeated block yields None (fail closed).
+    if text.count(STATE_ENCRYPTION_BLOCK) != 1:
+        return None
+    plain = text.replace(STATE_ENCRYPTION_BLOCK, "")
+    return None if ENCRYPTION_BLOCK_START.search(plain) else plain
+
+
 def state_checks(root: Path, scratch: Path, tools: Mapping[str, str], account: str, token: str,
                  names: Mapping[str, str], credentials: Mapping[str, str], runner: Runner, spawn: Spawn,
                  sleep: Callable[[float], None]) -> tuple[dict[str, bool], dict[str, str], dict[str, Any]]:
@@ -1370,13 +1385,15 @@ def state_checks(root: Path, scratch: Path, tools: Mapping[str, str], account: s
     apply = ("apply", "-input=false", "-auto-approve", "-no-color")
 
     def backend(name: str, *, encryption: str | None, creds: Mapping[str, str] = credentials,
-                bucket: str = names["proof"], key: str = STATE_KEY, canary: str = first) -> tuple[Path, dict[str, str]]:
+                bucket: str = names["proof"], key: str = STATE_KEY, canary: str = first,
+                root_text: str | None = None) -> tuple[Path, dict[str, str]]:
         # Every OpenTofu process gets its own directory and empty HOME; only this run's temporary credential and
-        # encryption text reach it, never the parent token.
+        # encryption text reach it, never the parent token. root_text replaces the backend root for that one directory.
         work, home = scratch / name, scratch / f"home-{name}"
         work.mkdir()
         home.mkdir(mode=0o700)
-        (work / "main.tf").write_bytes((root / STATE_BACKEND).read_bytes())
+        (work / "main.tf").write_bytes((root / STATE_BACKEND).read_bytes() if root_text is None
+                                       else root_text.encode("utf-8"))
         extra = {"TF_IN_AUTOMATION": "1", "TF_INPUT": "0", "HOME": str(home), "AWS_EC2_METADATA_DISABLED": "true",
                  "TF_VAR_account_id": account, "TF_VAR_bucket": bucket, "TF_VAR_key": key, "TF_VAR_canary": canary,
                  **hold, **creds}
@@ -1441,8 +1458,13 @@ def state_checks(root: Path, scratch: Path, tools: Mapping[str, str], account: s
     # Each negative runs right after a control that differs only in the input under test.
     control = reads(*backend("old-key-control", encryption=only_rotated), second)
     negative("old_key_refused", control, *read_attempt("old-key", encryption=current))
-    control = reads(*backend("no-encryption-control", encryption=only_rotated), second)
-    negative("unencrypted_read_refused", control, *read_attempt("no-encryption", encryption=None))
+    # No encryption configuration at all: a temporary copy of the root without its enforced block, used only by
+    # read_attempt (init and output). If that block cannot be removed exactly, the negative is not attempted.
+    plain = without_encryption((root / STATE_BACKEND).read_text(encoding="utf-8"))
+    if plain is not None:
+        control = reads(*backend("no-encryption-control", encryption=only_rotated), second)
+        negative("unencrypted_read_refused", control,
+                 *read_attempt("no-encryption", encryption=None, root_text=plain))
     control = ok(*backend("no-credential-control", encryption=only_rotated), *init)
     work, env = backend("no-credential", encryption=only_rotated, creds={})
     negative("no_credential_refused", control, "init", run(work, env, *init))
