@@ -68,8 +68,6 @@ STATE_OUTSIDE_MARKER_KEY = "outside/boundary-probe"
 STATE_MARKER = b"envs-r2-boundary-probe-v1"
 S3_TIMEOUT = 30
 S3_BODY_LIMIT = 65536
-# curl exits where no definite answer arrived: resolve, connect, timeout, TLS or receive failures.
-CURL_TRANSIENT = {5, 6, 7, 28, 35, 52, 55, 56}
 # The workflow's timeout-minutes (the repository check requires equality) bounds the whole run, including the
 # temporary-credential wait; the parent token must outlive it by the margin before anything is created.
 STATE_JOB_MINUTES = 45
@@ -1369,10 +1367,14 @@ def s3_object(tools: Mapping[str, str], runner: Runner, endpoint: str, credentia
     result = runner([tools["curl"], "-q", "--config", "-"], ("\n".join(lines) + "\n").encode("utf-8"), clean_env(tools, {}))
     written = result.stderr.strip()
     code = int(written) if re.fullmatch(rb"[0-9]{3}", written) else 0
-    ok = result.returncode == 0 and 200 <= code < 300
+    # Any nonzero curl exit is an incomplete transfer (timeout, connection, partial body...): whatever status or body
+    # arrived, it is transient and never a completed reply, so it can be neither ADMITTED, REFUSED nor a 401 expiry.
+    complete = result.returncode == 0
+    ok = complete and 200 <= code < 300
     status = "none" if ok or code == 0 else str(code) if code in (401, 403) else "5xx" if code >= 500 else "other"
-    return {"ok": ok, "status": status, "access_denied": status == "403" and s3_error_code(result.stdout) == "AccessDenied",
-            "transient": result.returncode in CURL_TRANSIENT, "body": result.stdout if ok else None}
+    return {"ok": ok, "status": status,
+            "access_denied": complete and status == "403" and s3_error_code(result.stdout) == "AccessDenied",
+            "transient": not complete, "body": result.stdout if ok else None}
 
 
 def s3_facts(operation: Mapping[str, Any]) -> dict[str, Any]:

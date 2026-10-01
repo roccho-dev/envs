@@ -349,10 +349,11 @@ class World:
             stored = self.markers.get((bucket, key))
             reply = (401, b"") if not valid or expired else (403, ACCESS_DENIED_XML) if label in {"outside", "decoy"} \
                 else (200, b"") if method == "PUT" else (200, stored) if stored is not None else (404, NO_SUCH_KEY_XML)
-        status, content = reply
+        status, content, *rest = reply
+        exit_code = rest[0] if rest else 0
         if 200 <= status < 300 and method == "PUT":
             self.markers[(bucket, key)] = body
-        return self.done(argv, 0, content, f"{status:03d}".encode())
+        return self.done(argv, exit_code, content, f"{status:03d}".encode())
 
     def prove(self, root: Path) -> dict:
         with contextlib.redirect_stderr(self.stderr):
@@ -525,7 +526,7 @@ def test_cleanup_is_evidence_bound(root: Path) -> None:
     # counts; a 403 (even AccessDenied), a timeout or a failed control leaves the credential UNKNOWN and the buckets
     # are still removed.
     for world in (World(s3={"post-ttl": (403, ACCESS_DENIED_XML)}), World(s3={"post-ttl": "timeout"}),
-                  World(s3={"proof-get": (503, b"")})):
+                  World(s3={"post-ttl": (401, b"", 18)}), World(s3={"proof-get": (503, b"")})):
         result = world.prove(root)
         assert result["credential"] == "UNKNOWN" and result["buckets"] == "ABSENT", result
         assert result["cleanup"] == "UNKNOWN" and result["status"] == "UNKNOWN" and world.buckets == {}
@@ -603,6 +604,9 @@ def test_negative_classes(root: Path) -> None:
         (World(s3={"decoy": (403, b"")}), "decoy_refused", "UNKNOWN", "UNKNOWN"),
         (World(s3={"outside": (403, SIGNATURE_XML)}), "outside_prefix_write_refused", "UNKNOWN", "UNKNOWN"),
         (World(s3={"decoy": (404, NO_SUCH_KEY_XML)}), "decoy_refused", "UNKNOWN", "UNKNOWN"),
+        # A nonzero curl exit (18: partial transfer) is never a completed reply, whatever status or body arrived.
+        (World(s3={"outside": (403, ACCESS_DENIED_XML, 18)}), "outside_prefix_write_refused", "UNKNOWN", "UNKNOWN"),
+        (World(s3={"decoy": (200, jev.STATE_MARKER, 18)}), "decoy_refused", "UNKNOWN", "UNKNOWN"),
         (World(transient={"no-credential-control"}), "no_credential_refused", "UNKNOWN", "UNKNOWN"),
         (World(transient={"no-encryption"}), "unencrypted_read_refused", "UNKNOWN", "UNKNOWN"),
     ):
@@ -1022,9 +1026,11 @@ class FixtureS3(http.server.BaseHTTPRequestHandler):
         time.sleep(delay)
         try:
             self.send_response(status)
+            # An extra Content-Length larger than the body delivered makes the transfer partial (curl exit 18).
             for name, value in extra.items():
                 self.send_header(name, value)
-            self.send_header("Content-Length", str(len(content)))
+            if "Content-Length" not in extra:
+                self.send_header("Content-Length", str(len(content)))
             self.end_headers()
             self.wfile.write(content)
         except OSError:
@@ -1052,12 +1058,15 @@ def real_s3(curl: str) -> None:
     credentials = {"AWS_ACCESS_KEY_ID": "AKIA" + secrets.token_hex(8).upper(), "AWS_SECRET_ACCESS_KEY": secrets.token_hex(20),
                    "AWS_SESSION_TOKEN": secrets.token_urlsafe(48)}
     launched: list[tuple[list[str], dict[str, str]]] = []
+    exits: list[int] = []
 
     def runner(argv, input_data, env):
         # A dead proxy in the environment proves the request goes direct.
         env = {**env, "http_proxy": "http://127.0.0.1:9", "HTTP_PROXY": "http://127.0.0.1:9", "ALL_PROXY": "http://127.0.0.1:9"}
         launched.append((list(argv), dict(env)))
-        return jev.default_runner(argv, input_data, env)
+        result = jev.default_runner(argv, input_data, env)
+        exits.append(result.returncode)
+        return result
 
     def request(method, key, reply, body=None, timeout=jev.S3_TIMEOUT, bucket="proof-bucket"):
         status, content, *rest = reply
@@ -1112,6 +1121,17 @@ def real_s3(curl: str) -> None:
         operation, seen = request("GET", jev.STATE_MARKER_KEY, (200, jev.STATE_MARKER, 4), timeout=2)
         assert len(seen) == 1 and not operation["ok"] and operation["transient"] and operation["status"] == "none"
         outcome["timeout"] = jev.s3_refusal(True, operation, causes)
+        # A partial transfer (more Content-Length than delivered) with a parsable reply: curl exits nonzero, so neither
+        # the XML 403 AccessDenied, the 401 nor the exact marker bytes count as a completed reply.
+        for name, (status, content) in (("partial_access_denied", (403, ACCESS_DENIED_XML)),
+                                        ("partial_unauthorized", (401, b"")),
+                                        ("partial_marker", (200, jev.STATE_MARKER))):
+            operation, seen = request("GET", jev.STATE_MARKER_KEY,
+                                      (status, content, 0, {"Content-Length": str(len(content) + 64)}), timeout=5)
+            assert exits[-1] == 18, (name, "the transfer was not partial")
+            assert len(seen) == 1 and not operation["ok"] and operation["transient"] and not operation["access_denied"]
+            assert jev.s3_cause(operation) == "unknown" and operation["body"] is None, (name, jev.s3_facts(operation))
+            outcome[name] = jev.s3_refusal(True, operation, causes)
         assert all(value == "UNKNOWN" for name, value in outcome.items()
                    if name not in {"payload_hash", "control", "xml_access_denied"}), outcome
         # The credential and session token never reach argv or the environment; only finite facts leave.
