@@ -44,9 +44,13 @@ LOCK_DENIED = (b"Error acquiring the state lock\n\nError message: operation erro
                b"StatusCode: 403, RequestID: r, api error AccessDenied: Access Denied")
 UNAUTHORIZED = b"operation error S3: ListObjectsV2, https response error StatusCode: 401, RequestID: r, api error Unauthorized"
 UNAVAILABLE = b"operation error S3: GetObject, https response error StatusCode: 503, RequestID: r, api error ServiceUnavailable"
-# A fake shape only: native OpenTofu 1.12.3 rejects an enforced root without a method at init as a configuration
-# error before reading any state (real_tofu records that as a guard); this fixture is not evidence of real output.
+# Synthetic classifier input only (the word "encryption" classifies as encryption); not an OpenTofu message.
 NO_METHOD = b"Error: state encryption is enforced, but no encryption method is configured"
+# Shaped after OpenTofu 1.12.3: an enforced block without a method is an HCL configuration error naming no encryption
+# word, so it never qualifies; a root with no encryption configuration refuses the encrypted state it reads.
+INVALID_EXPRESSION = b"Error: Invalid expression\n\nA single static variable reference is required."
+ENCRYPTED_NO_CONFIG = (b"Error: Unsupported state file format\n\nThis state file is encrypted and can not be read "
+                       b"without an encryption configuration")
 NO_CREDENTIAL = b"Error: No valid credential sources found"
 UNDECRYPTABLE = b"Error: decryption failed for all provided methods"
 NEGATIVES = dict.fromkeys(jev.STATE_NEGATIVES, "REFUSED")
@@ -84,7 +88,11 @@ class World:
 
     def __init__(self, *, verify=None, present=(), fail=(), unknown=(), lock_ignored=False, plaintext=False,
                  never_expire=False, redated=(), issuance=None, transient=(), admit=(), outside_init_denied=False,
-                 expiry=UNAUTHORIZED, decoy=DENIED, raising=None) -> None:
+                 expiry=UNAUTHORIZED, decoy=DENIED, raising=None, plain_phase="init",
+                 plain_error=ENCRYPTED_NO_CONFIG) -> None:
+        # plain_phase/plain_error: where and how a root with no encryption configuration refuses the state; both
+        # phases are exercised because which one S3 uses is not observed.
+        self.plain_phase, self.plain_error, self.roots = plain_phase, plain_error, {}
         # raising: a work directory, "wrangler-delete", "outer-destroy" or "api-current" -> a local exception type.
         self.raising = dict(raising or {})
         self.verify = {"id": PARENT_ID, "status": "active", "not_before": iso(NOW - 3600),
@@ -157,6 +165,7 @@ class World:
             raise self.raising.get(work, self.raising.get("outer-destroy"))("fixture launch failure")
         if work == "outer":
             return self.outer(argv, env)
+        self.roots[work] = (Path(argv[1].split("=", 1)[1]) / "main.tf").read_text(encoding="utf-8")
         return self.inner(work, argv[2], argv, env)
 
     def spawn(self, argv, env):
@@ -218,10 +227,16 @@ class World:
             return self.done(argv, 1, stderr=UNAVAILABLE)
         if work in self.admit:
             return self.done(argv)
-        # Enforced encryption without a method, a missing credential, then S3 auth: 401 for the credential as a
-        # whole (invalid or expired), 403 AccessDenied for a bucket or prefix outside its scope.
+        # Encryption configuration, a missing credential, then S3 auth: 401 for the credential as a whole (invalid or
+        # expired), 403 AccessDenied for a bucket or prefix outside its scope.
         if "TF_ENCRYPTION" not in env:
-            return self.done(argv, 1, stderr=NO_METHOD)
+            if jev.ENCRYPTION_BLOCK_START.search(self.roots[work]):
+                # The enforced block without a method: a configuration error, not a ciphertext read refusal.
+                return self.done(argv, 1, stderr=INVALID_EXPRESSION)
+            assert command in {"init", "output"}, "the configuration-free root ran a mutating command"
+            if command == self.plain_phase or command == "output":
+                return self.done(argv, 1, stderr=self.plain_error)
+            return self.done(argv)
         if "AWS_SECRET_ACCESS_KEY" not in env:
             return self.done(argv, 1, stderr=NO_CREDENTIAL)
         if not valid or expired:
@@ -501,6 +516,57 @@ def test_negative_classes(root: Path) -> None:
             assert [args[0] for args in world.tofu("outside-prefix")] == ["init"], "no write was attempted"
 
 
+def test_without_encryption() -> None:
+    # Exactly the one enforced block goes; anything else is refused rather than rewritten.
+    text = (ROOT / jev.STATE_BACKEND).read_text(encoding="utf-8")
+    plain = jev.without_encryption(text)
+    assert plain is not None and plain == text.replace(jev.STATE_ENCRYPTION_BLOCK, "")
+    assert not jev.ENCRYPTION_BLOCK_START.search(plain) and 'backend "s3"' in plain and "use_lockfile" in plain
+    block = jev.STATE_ENCRYPTION_BLOCK
+    for bad in (text.replace(block, ""), text.replace(block, block.replace("enforced = true", "enforced = false", 1)),
+                text.replace(block, block + block), text.replace(block, block + "  encryption {\n  }\n")):
+        assert jev.without_encryption(bad) is None, bad
+
+
+@with_root
+def test_no_encryption_root(root: Path) -> None:
+    backend = (root / jev.STATE_BACKEND).read_text(encoding="utf-8")
+    # The configuration-free root is the exact transform, only for that negative, and only init/output run in it;
+    # its control and every other directory keep the unchanged enforced root.
+    for phase, commands, diagnostic in (("init", ["init"], "init"), ("output", ["init", "output"], "read")):
+        world = World(plain_phase=phase)
+        result = world.prove(root)
+        assert result["status"] == "STATE_BACKEND_PROVEN" and result["negatives"] == NEGATIVES, result
+        assert world.roots["no-encryption"] == jev.without_encryption(backend)
+        assert all(text == backend for work, text in world.roots.items() if work != "no-encryption")
+        assert [args[0] for args in world.tofu("no-encryption")] == commands
+        entry = result["diagnostics"]["negatives"]["unencrypted_read_refused"]
+        assert entry["phase"] == diagnostic and entry["word"] == "encrypt" and entry["control"] is True, entry
+    # A configuration error, a failed paired control or an admitted read never counts as a refusal.
+    for world, label, status in ((World(plain_error=INVALID_EXPRESSION), "UNKNOWN", "UNKNOWN"),
+                                 (World(transient={"no-encryption-control"}), "UNKNOWN", "UNKNOWN"),
+                                 (World(admit={"no-encryption"}), "ADMITTED", "STATE_BACKEND_RED")):
+        result = world.prove(root)
+        assert result["negatives"]["unencrypted_read_refused"] == label and result["status"] == status, result
+    # The old shape, the enforced root without TF_ENCRYPTION, is a configuration error and stays UNKNOWN.
+    assert jev.refusal(True, World.done(["tofu"], 1, stderr=INVALID_EXPRESSION),
+                       jev.STATE_NEGATIVES["unencrypted_read_refused"]) == "UNKNOWN"
+    # A missing, differing or repeated block: the negative is not attempted (UNKNOWN, no evidence); nothing else moves.
+    block = jev.STATE_ENCRYPTION_BLOCK
+    for bad in (backend.replace(block, ""), backend.replace(block, block.replace("enforced = true", "enforced = false", 1)),
+                backend.replace(block, block + block)):
+        (root / jev.STATE_BACKEND).write_text(bad, encoding="utf-8")
+        world = World()
+        result = world.prove(root)
+        assert result["negatives"]["unencrypted_read_refused"] == "UNKNOWN" and result["status"] == "UNKNOWN", result
+        assert result["diagnostics"]["negatives"]["unencrypted_read_refused"] is None
+        assert not world.tofu("no-encryption") and not world.tofu("no-encryption-control")
+        assert {key: value for key, value in result["negatives"].items() if key != "unencrypted_read_refused"} == \
+            {key: "REFUSED" for key in NEGATIVES if key != "unencrypted_read_refused"}
+        assert result["cleanup"] == "ABSENT" and all(result["checks"].values())
+    (root / jev.STATE_BACKEND).write_text(backend, encoding="utf-8")
+
+
 MARKER = "fixture-marker-" + secrets.token_hex(8)
 # A 403 without AccessDenied (for example a body-less HEAD) whose text also carries a marker that must never escape.
 FORBIDDEN = f"operation error S3: HeadBucket, https response error StatusCode: 403, RequestID: r, {MARKER}".encode()
@@ -662,6 +728,7 @@ def test_failure_cause() -> None:
         (DENIED + b" (retry with -lock-timeout)", "access_denied"),
         # Enforced encryption without a method is not an authentication refusal: the old expiry probe's false positive.
         (NO_METHOD, "encryption"), (UNDECRYPTABLE, "decryption"), (NO_CREDENTIAL, "credential"), (b"exit 1", "unknown"),
+        (INVALID_EXPRESSION, "unknown"), (ENCRYPTED_NO_CONFIG, "encryption"),
     ):
         assert jev.failure_cause(result(stderr)) == cause, (stderr, cause)
     assert jev.refusal(True, result(b"", 0), {"access_denied"}) == "ADMITTED"
@@ -743,15 +810,7 @@ def test_encryption_config() -> None:
 
 
 # The backend root's encryption and canary on a local backend: OpenTofu's own encryption metadata, without S3 or R2.
-NATIVE_ENCRYPTION = """  encryption {
-    state {
-      enforced = true
-    }
-    plan {
-      enforced = true
-    }
-  }
-"""
+NATIVE_ENCRYPTION = jev.STATE_ENCRYPTION_BLOCK
 NATIVE_ROOT = """terraform {
   backend "local" {
     path = "%s"
@@ -773,8 +832,9 @@ output "canary" {
 """
 # The same root with no encryption block at all: OpenTofu then has no encryption configuration. It is only ever
 # initialized and read, never planned or applied, so it cannot write the state.
-NATIVE_PLAIN_ROOT = NATIVE_ROOT.replace(NATIVE_ENCRYPTION, "")
-assert NATIVE_PLAIN_ROOT != NATIVE_ROOT and "encryption" not in NATIVE_PLAIN_ROOT
+# It is made by the adapter's own transform, the one the live no-encryption negative uses.
+NATIVE_PLAIN_ROOT = jev.without_encryption(NATIVE_ROOT)
+assert NATIVE_PLAIN_ROOT is not None and NATIVE_PLAIN_ROOT != NATIVE_ROOT and "encryption" not in NATIVE_PLAIN_ROOT
 
 
 def real_tofu(tofu: str) -> None:
@@ -862,6 +922,8 @@ def main() -> None:
         test_cleanup_is_evidence_bound()
         test_cleanup_survives_local_failures()
         test_negative_classes()
+        test_without_encryption()
+        test_no_encryption_root()
         test_branch_evidence()
         test_diagnostics_closed()
         test_state_command_red_line()
