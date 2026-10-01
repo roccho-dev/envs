@@ -11,7 +11,8 @@
       # provider in its closure, so a run acquires nothing from a registry.
       cloudflared = assert pkgs.cloudflared.version == "2026.6.1"; pkgs.cloudflared;
       opentofu = pkgs.opentofu.withPlugins (p: [ p.cloudflare_cloudflare ]);
-      packages = with pkgs; [ python3 sops wrangler git gh openssh ] ++ [ cloudflared opentofu ];
+      # curl signs the state proof's scoped S3 object requests with the temporary credential (aws:amz:auto:s3).
+      packages = with pkgs; [ python3 sops wrangler git gh openssh curl ] ++ [ cloudflared opentofu ];
       # The exact committed source this artifact is built from; a dirty tree cannot produce one.
       rev = self.rev or (throw "envs effect artifact requires a clean committed source");
 
@@ -27,6 +28,7 @@
         ssh = "${pkgs.openssh}/bin/ssh";
         sshd = "${pkgs.openssh}/bin/sshd";
         ssh_keygen = "${pkgs.openssh}/bin/ssh-keygen";
+        curl = "${pkgs.curl}/bin/curl";
       };
       manifest = pkgs.writeText "envs-effect-toolchain.json" (builtins.toJSON {
         kind = "envs.effectToolchain.v1";

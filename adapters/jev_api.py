@@ -15,6 +15,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import xml.etree.ElementTree as ElementTree
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -28,7 +29,7 @@ HANDOFF = Path("handoffs/dev-jev-api.json")
 FLAKE_LOCK = Path("flake.lock")
 RECEIPT_KIND = "envs.projectionReceipt.v1"
 TOOLCHAIN_KIND = "envs.effectToolchain.v1"
-TOOLCHAIN_TOOLS = ("python3", "sops", "wrangler", "git", "gh", "tofu", "cloudflared", "ssh", "sshd", "ssh_keygen")
+TOOLCHAIN_TOOLS = ("python3", "sops", "wrangler", "git", "gh", "tofu", "cloudflared", "ssh", "sshd", "ssh_keygen", "curl")
 STORE = Path("/nix/store")
 # Rent tunnel (windows #14): a provider-issued Named Tunnel token, encrypted to exactly one target age recipient.
 RENT_PLANE = "dev.rent-tunnel"
@@ -60,7 +61,15 @@ STATE_BUCKET_PREFIX = "windows-rent-state-proof-"
 STATE_RESERVED_BUCKET = "windows-rent-state"
 STATE_ALLOWED_PREFIX = "state/"
 STATE_KEY = "state/proof.tfstate"
-STATE_OUTSIDE_KEY = "outside/proof.tfstate"
+# Fixed non-secret boundary objects: a known marker inside the prefix of each owned bucket, and the same bytes written
+# outside it. Every key a PUT is attempted for is deleted by cleanup, even when the response is unknown.
+STATE_MARKER_KEY = STATE_ALLOWED_PREFIX + "boundary-probe"
+STATE_OUTSIDE_MARKER_KEY = "outside/boundary-probe"
+STATE_MARKER = b"envs-r2-boundary-probe-v1"
+S3_TIMEOUT = 30
+S3_BODY_LIMIT = 65536
+# curl exits where no definite answer arrived: resolve, connect, timeout, TLS or receive failures.
+CURL_TRANSIENT = {5, 6, 7, 28, 35, 52, 55, 56}
 # The workflow's timeout-minutes (the repository check requires equality) bounds the whole run, including the
 # temporary-credential wait; the parent token must outlive it by the margin before anything is created.
 STATE_JOB_MINUTES = 45
@@ -1297,7 +1306,7 @@ def refusal(control: bool, attempt: subprocess.CompletedProcess[bytes], causes: 
 # key, credential or exception text can reach it. It explains an UNKNOWN; it never changes a label or PASS.
 STATE_DIAGNOSTIC_VALUES: dict[str, tuple[Any, ...]] = {
     "control": (True, False),
-    "phase": ("admitted", "init", "read", "lock"),
+    "phase": ("admitted", "init", "read", "lock", "write"),
     "probe": ("not_run", "admitted", "refused", "local_failure"),
     "status": ("none", "401", "403", "5xx", "other", "multiple"),
     "access_denied": (True, False),
@@ -1314,16 +1323,93 @@ def negative_evidence(control: bool, phase: str, attempt: subprocess.CompletedPr
     return {"control": control, "phase": "admitted" if attempt.returncode == 0 else phase, **facts}
 
 
+def r2_endpoint(account: str) -> str:
+    return f"https://{account}.r2.cloudflarestorage.com"
+
+
+def curl_value(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def s3_error_code(body: bytes) -> str | None:
+    # Only an actual S3 XML error document names a code; a substring, a bodyless reply or malformed XML names none.
+    if not body or len(body) > S3_BODY_LIMIT:
+        return None
+    try:
+        document = ElementTree.fromstring(body)
+    except ElementTree.ParseError:
+        return None
+    code = document.find("Code") if document.tag == "Error" else None
+    return code.text.strip() if code is not None and code.text else None
+
+
+def s3_object(tools: Mapping[str, str], runner: Runner, endpoint: str, credentials: Mapping[str, str], method: str,
+              bucket: str, key: str, body: bytes | None = None, timeout: int = S3_TIMEOUT) -> dict[str, Any]:
+    # One path-style request signed by the locked curl (aws:amz:auto:s3) with the temporary credential. The credential
+    # and session token reach curl only through its stdin config, with its default config disabled: never argv, a
+    # file or a log. No proxy, redirect or retry. The reply stays in this process and leaves only as finite facts.
+    scheme = endpoint.split("://", 1)[0]
+    lines = [
+        f"url = {curl_value(f'{endpoint}/{bucket}/{key}')}",
+        f"request = {curl_value(method)}",
+        'aws-sigv4 = "aws:amz:auto:s3"',
+        f"user = {curl_value(credentials['AWS_ACCESS_KEY_ID'] + ':' + credentials['AWS_SECRET_ACCESS_KEY'])}",
+        f"header = {curl_value('x-amz-security-token: ' + credentials['AWS_SESSION_TOKEN'])}",
+        f"proto = {curl_value('=' + scheme)}",
+        'noproxy = "*"',
+        "silent",
+        f'connect-timeout = "{min(timeout, 10)}"',
+        f'max-time = "{timeout}"',
+        'write-out = "%{stderr}%{http_code}"',
+    ]
+    if os.environ.get("SSL_CERT_FILE") and scheme == "https":
+        lines.append(f"cacert = {curl_value(os.environ['SSL_CERT_FILE'])}")
+    if body is not None:
+        lines += [f"data-binary = {curl_value(body.decode('ascii'))}", 'header = "Content-Type: application/octet-stream"']
+    result = runner([tools["curl"], "-q", "--config", "-"], ("\n".join(lines) + "\n").encode("utf-8"), clean_env(tools, {}))
+    written = result.stderr.strip()
+    code = int(written) if re.fullmatch(rb"[0-9]{3}", written) else 0
+    ok = result.returncode == 0 and 200 <= code < 300
+    status = "none" if ok or code == 0 else str(code) if code in (401, 403) else "5xx" if code >= 500 else "other"
+    return {"ok": ok, "status": status, "access_denied": status == "403" and s3_error_code(result.stdout) == "AccessDenied",
+            "transient": result.returncode in CURL_TRANSIENT, "body": result.stdout if ok else None}
+
+
+def s3_facts(operation: Mapping[str, Any]) -> dict[str, Any]:
+    if operation["ok"]:
+        return dict(NO_FAILURE_FACTS)
+    return {"status": operation["status"], "access_denied": operation["access_denied"],
+            "transient": operation["transient"], "word": "none"}
+
+
+def s3_cause(operation: Mapping[str, Any]) -> str:
+    # The same rule as failure_cause: 401 is the credential as a whole, 403 with a parsed AccessDenied its scope.
+    facts = s3_facts(operation)
+    if operation["ok"] or facts["transient"] or facts["status"] not in {"401", "403"}:
+        return "unknown"
+    return "unauthorized" if facts["status"] == "401" else "access_denied" if facts["access_denied"] else "unknown"
+
+
+def s3_refusal(control: bool, operation: Mapping[str, Any], causes: set[str]) -> str:
+    if operation["ok"]:
+        return "ADMITTED"
+    return "REFUSED" if control and s3_cause(operation) in causes else "UNKNOWN"
+
+
+def s3_evidence(control: bool, phase: str, operation: Mapping[str, Any]) -> dict[str, Any]:
+    return {"control": control, "phase": "admitted" if operation["ok"] else phase, **s3_facts(operation)}
+
+
 def failure_class(error: BaseException) -> str:
     # One of the state proof's handled failure kinds, never its message or class name.
     return "envs" if isinstance(error, EnvsError) else "subprocess" if isinstance(error, subprocess.SubprocessError) \
         else "os"
 
 
-def probe_evidence(probe: str, attempt: subprocess.CompletedProcess[bytes] | None = None,
+def probe_evidence(probe: str, operation: Mapping[str, Any] | None = None,
                    error: BaseException | None = None) -> dict[str, Any]:
     local = "none" if error is None else failure_class(error)
-    facts = failure_facts(attempt) if attempt is not None and attempt.returncode != 0 else NO_FAILURE_FACTS
+    facts = s3_facts(operation) if operation is not None else NO_FAILURE_FACTS
     return {"probe": probe, **facts, "local": local}
 
 
@@ -1343,20 +1429,31 @@ def diagnostics_finite(diagnostics: Any) -> bool:
         diagnostics["credential_probe"], {"probe", "local", *NO_FAILURE_FACTS})
 
 
-def credential_probe(root: Path, scratch: Path, name: str, tools: Mapping[str, str], account: str, bucket: str,
-                     credentials: Mapping[str, str], encryption: str,
-                     runner: Runner) -> subprocess.CompletedProcess[bytes]:
-    # A fresh directory each time (no cached backend), with the same valid encryption, credential, bucket and an absent
-    # key inside the allowed prefix, so only the credential can decide the outcome.
-    work, home = scratch / name, scratch / f"home-{name}"
-    work.mkdir()
-    home.mkdir(mode=0o700)
-    (work / "main.tf").write_bytes((root / STATE_BACKEND).read_bytes())
-    env = clean_env(tools, {"TF_IN_AUTOMATION": "1", "TF_INPUT": "0", "HOME": str(home),
-                            "AWS_EC2_METADATA_DISABLED": "true", "TF_VAR_account_id": account, "TF_VAR_bucket": bucket,
-                            "TF_VAR_key": STATE_ALLOWED_PREFIX + "credential-probe.tfstate", "TF_ENCRYPTION": encryption,
-                            **credentials})
-    return runner([tools["tofu"], f"-chdir={work}", "init", "-input=false", "-no-color"], None, env)
+S3 = Callable[..., dict[str, Any]]
+
+
+def marker_written(s3: S3, bucket: str, attempted: dict[str, set[str]], key: str = STATE_MARKER_KEY) -> dict[str, Any]:
+    # Recorded before it is sent: an ambiguous PUT may still have written the object, so cleanup deletes the key.
+    attempted.setdefault(bucket, set()).add(key)
+    return s3("PUT", bucket, key, STATE_MARKER)
+
+
+def marker_read(s3: S3, bucket: str) -> bool:
+    operation = s3("GET", bucket, STATE_MARKER_KEY)
+    return operation["ok"] and operation["body"] == STATE_MARKER
+
+
+def decoy_seeded(tools: Mapping[str, str], scratch: Path, account: str, token: str, bucket: str, runner: Runner,
+                 attempted: dict[str, set[str]]) -> bool:
+    # The parent token writes the known decoy marker and reads its exact bytes back, so a refused read cannot be a
+    # missing object masked as a denial.
+    attempted.setdefault(bucket, set()).add(STATE_MARKER_KEY)
+    env = wrangler_env(tools, scratch, account, token)
+    path = f"{bucket}/{STATE_MARKER_KEY}"
+    if runner([tools["wrangler"], "r2", "object", "put", path, "--remote", "--pipe"], STATE_MARKER, env).returncode != 0:
+        return False
+    read = runner([tools["wrangler"], "r2", "object", "get", path, "--remote", "--pipe"], None, env)
+    return read.returncode == 0 and read.stdout == STATE_MARKER
 
 
 # The backend root's one enforced encryption block. Only the no-encryption negative removes it, so that OpenTofu has
@@ -1376,7 +1473,8 @@ def without_encryption(text: str) -> str | None:
 
 def state_checks(root: Path, scratch: Path, tools: Mapping[str, str], account: str, token: str,
                  names: Mapping[str, str], credentials: Mapping[str, str], runner: Runner, spawn: Spawn,
-                 sleep: Callable[[float], None]) -> tuple[dict[str, bool], dict[str, str], dict[str, Any]]:
+                 sleep: Callable[[float], None], s3: S3,
+                 attempted: dict[str, set[str]]) -> tuple[dict[str, bool], dict[str, str], dict[str, Any]]:
     passphrase, rotated = secrets.token_hex(32), secrets.token_hex(32)
     first, second = "canary-" + secrets.token_hex(16), "canary-" + secrets.token_hex(16)
     hold = {"TF_VAR_python": tools["python3"], "TF_VAR_hold_nonce": secrets.token_hex(8),
@@ -1468,45 +1566,45 @@ def state_checks(root: Path, scratch: Path, tools: Mapping[str, str], account: s
     control = ok(*backend("no-credential-control", encryption=only_rotated), *init)
     work, env = backend("no-credential", encryption=only_rotated, creds={})
     negative("no_credential_refused", control, "init", run(work, env, *init))
-    # The prefix is tested by OpenTofu's own lock-file write; the control takes and releases the lock inside it.
-    lock = ("plan", "-lock-timeout=0", "-input=false", "-no-color")
-    control_work, control_env = backend("outside-prefix-control", encryption=only_rotated, canary=second)
-    control = ok(control_work, control_env, *init) and ok(control_work, control_env, *lock)
-    work, env = backend("outside-prefix", encryption=only_rotated, key=STATE_OUTSIDE_KEY, canary=second)
-    opened = run(work, env, *init)
-    if opened.returncode != 0:
-        # An init already refused proves no write denial: the write result stays UNKNOWN; its phase says so.
-        evidence["outside_prefix_write_refused"] = negative_evidence(control, "init", opened)
-    else:
-        negative("outside_prefix_write_refused", control, "lock", run(work, env, *lock))
-    control = ok(*backend("decoy-control", encryption=only_rotated), *init)
-    work, env = backend("decoy", encryption=only_rotated, bucket=names["decoy"])
-    negative("decoy_refused", control, "init", run(work, env, *init))
+    # Object boundaries, by the locked curl and the same temporary credential: OpenTofu reads its state key (HEAD)
+    # before any write, so its init cannot isolate a prefix write or a bucket read. Each attempt follows a control
+    # that differs only in the key or the bucket.
+    write_control = marker_written(s3, names["proof"], attempted)["ok"]
+    outside = marker_written(s3, names["proof"], attempted, STATE_OUTSIDE_MARKER_KEY)
+    negatives["outside_prefix_write_refused"] = s3_refusal(write_control, outside,
+                                                           STATE_NEGATIVES["outside_prefix_write_refused"])
+    evidence["outside_prefix_write_refused"] = s3_evidence(write_control, "write", outside)
+    # The decoy read needs a known object there; without a verified marker the negative is not attempted.
+    if decoy_seeded(tools, scratch, account, token, names["decoy"], runner, attempted):
+        read_control = marker_read(s3, names["proof"])
+        decoy = s3("GET", names["decoy"], STATE_MARKER_KEY)
+        negatives["decoy_refused"] = s3_refusal(read_control, decoy, STATE_NEGATIVES["decoy_refused"])
+        evidence["decoy_refused"] = s3_evidence(read_control, "read", decoy)
     # The negatives mean something only if the same credential still reads the same state after them.
     checks["path_up_after_negatives"] = reads(*backend("bracket", encryption=only_rotated), second)
     return checks, negatives, evidence
 
 
-def state_cleanup(root: Path, tools: Mapping[str, str], scratch: Path, account: str, token: str,
+def state_cleanup(tools: Mapping[str, str], scratch: Path, account: str, token: str,
                   run: Mapping[str, str], names: Mapping[str, str], outer: Path, outer_env: Mapping[str, str],
                   created: dict[str, str] | None, credential: str, control: bool, issued: float | None,
-                  credentials: Mapping[str, str] | None, encryption: str, runner: Runner, api: Api,
+                  s3: S3 | None, attempted: Mapping[str, set[str]], runner: Runner, api: Api,
                   sleep: Callable[[float], None], clock: Callable[[], float]) -> dict[str, Any]:
-    # Runs once: after the TTL, the same credential must be refused 401 in a fresh directory; delete only the exact
-    # expected keys and only buckets this run provably created, then read both names back. Doubt is never ABSENT.
+    # Runs once: after the TTL, the same credential must be refused 401 reading the same verified marker; delete only
+    # the exact expected and attempted keys and only buckets this run provably created, then read both names back.
+    # Doubt is never ABSENT.
     report: dict[str, Any] = {"credential": credential, "buckets": "UNKNOWN", "owned": [], "cleanup": "UNKNOWN",
                               "credential_probe": probe_evidence("not_run")}
     if credential == "ISSUED":
         report["credential"] = "UNKNOWN"
         try:
-            if control and issued is not None and credentials is not None:
+            if control and issued is not None and s3 is not None:
                 sleep(max(0.0, issued + STATE_CREDENTIAL_TTL + STATE_EXPIRY_GRACE - clock()))
-                after = credential_probe(root, scratch, "unusable-after-ttl", tools, account, names["proof"],
-                                         credentials, encryption, runner)
-                report["credential_probe"] = probe_evidence("admitted" if after.returncode == 0 else "refused", after)
-                if after.returncode == 0:
+                after = s3("GET", names["proof"], STATE_MARKER_KEY)
+                report["credential_probe"] = probe_evidence("admitted" if after["ok"] else "refused", after)
+                if after["ok"]:
                     report["credential"] = "STILL_USABLE"
-                elif failure_cause(after) == "unauthorized":
+                elif s3_cause(after) == "unauthorized":
                     report["credential"] = "UNUSABLE_AFTER_TTL"
         except STATE_FAILURES as exc:
             # A probe that could not run observes nothing: the credential stays UNKNOWN and cleanup still proceeds.
@@ -1521,14 +1619,18 @@ def state_cleanup(root: Path, tools: Mapping[str, str], scratch: Path, account: 
         return report
     owned = owned_buckets(created, current, run)
     report["owned"] = owned
-    # Phase 2: delete only the exact keys, then only owned buckets; a failure here is settled by the readback below.
-    try:
-        if names["proof"] in owned:
-            env = wrangler_env(tools, scratch, account, token)
-            for key in (STATE_KEY, STATE_KEY + ".tflock"):
-                runner([tools["wrangler"], "r2", "object", "delete", f"{names['proof']}/{key}", "--remote"], None, env)
-    except STATE_FAILURES:
-        pass
+    # Phase 2: delete only the exact keys (state, lock and every attempted marker), then only owned buckets; a failure
+    # here is settled by the readback below. A delete is never a write retry.
+    for bucket in names.values():
+        if bucket not in owned:
+            continue
+        keys = [STATE_KEY, STATE_KEY + ".tflock"] if bucket == names["proof"] else []
+        for key in keys + sorted(attempted.get(bucket, set()) - set(keys)):
+            try:
+                runner([tools["wrangler"], "r2", "object", "delete", f"{bucket}/{key}", "--remote"], None,
+                       wrangler_env(tools, scratch, account, token))
+            except STATE_FAILURES:
+                pass
     try:
         present = {name for name, value in current.items() if value is not None}
         if present and present <= set(owned):
@@ -1583,8 +1685,9 @@ def state_proof(root: Path = ROOT, *, runner: Runner = default_runner, api: Api 
         created: dict[str, str] | None = {}
         issued: float | None = None
         credentials: dict[str, str] | None = None
+        s3: S3 | None = None
+        attempted: dict[str, set[str]] = {name: set() for name in names.values()}
         control = False
-        probe_encryption = encryption_config("probe", secrets.token_hex(32))
         try:
             tofu(tools, outer, outer_env, runner, "init", "-input=false", "-no-color")
             result["stage"] = "create"
@@ -1610,13 +1713,17 @@ def state_proof(root: Path = ROOT, *, runner: Runner = default_runner, api: Api 
                 raise
             issued = clock()
             result["credential"] = "ISSUED"
-            opened = credential_probe(root, scratch, "usable-control", tools, account, names["proof"], credentials,
-                                      probe_encryption, runner)
-            control = opened.returncode == 0
+            endpoint, issued_credentials = r2_endpoint(account), credentials
+
+            def s3(method: str, bucket: str, key: str, body: bytes | None = None) -> dict[str, Any]:
+                return s3_object(tools, runner, endpoint, issued_credentials, method, bucket, key, body)
+
+            # The credential control: the proof marker written and read back exactly; the post-TTL probe reads it again.
+            control = marker_written(s3, names["proof"], attempted)["ok"] and marker_read(s3, names["proof"])
             result["credential_control"] = "USABLE" if control else "UNKNOWN"
             result["stage"] = "proof"
             checks, negatives, evidence = state_checks(root, scratch, tools, account, token, names, credentials,
-                                                       runner, spawn, sleep)
+                                                       runner, spawn, sleep, s3, attempted)
             result["checks"], result["negatives"] = checks, negatives
             result["diagnostics"]["negatives"] = evidence
             if not all(checks.values()) or "ADMITTED" in negatives.values():
@@ -1634,9 +1741,8 @@ def state_proof(root: Path = ROOT, *, runner: Runner = default_runner, api: Api 
             result["error"] = failure_class(exc)
             result["status"] = "UNKNOWN"
         finally:
-            report = state_cleanup(root, tools, scratch, account, token, run, names, outer, outer_env, created,
-                                   result["credential"], control, issued, credentials, probe_encryption, runner,
-                                   api, sleep, clock)
+            report = state_cleanup(tools, scratch, account, token, run, names, outer, outer_env, created,
+                                   result["credential"], control, issued, s3, attempted, runner, api, sleep, clock)
             result["diagnostics"]["credential_probe"] = report.pop("credential_probe")
             result.update(report)
     if not diagnostics_finite(result["diagnostics"]):

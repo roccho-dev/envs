@@ -281,7 +281,8 @@ def main() -> None:
     expect_red(replace_text(check, "run: python3 checks/test_rent_tunnel.py\n", "run: 'true'\n"))
     expect_red(replace_text(check, 'if grep -qxF "$age" "$RUNNER_TEMP/provided.list"; then', "if false; then"))
     expect_red(replace_text(check, '          grep -qxF "$sops" "$RUNNER_TEMP/provided.list"\n', ""))
-    expect_red(replace_text("flake.nix", "[ python3 sops wrangler git gh openssh ]", "[ python3 sops wrangler git gh openssh age ]"))
+    expect_red(replace_text("flake.nix", "[ python3 sops wrangler git gh openssh curl ]",
+                            "[ python3 sops wrangler git gh openssh curl age ]"))
     expect_red(replace_text("flake.nix", "        check-age = pkgs.age;\n", ""))
     expect_red(replace_text("flake.nix", "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt", "/etc/ssl/certs/ca-certificates.crt"))
 
@@ -315,6 +316,12 @@ def main() -> None:
     expect_red(replace_text(check, ' --real-ssh "$tool"', ""))
     # The state proof's native OpenTofu rotation regression is mandatory in check, not an optional local run.
     expect_red(replace_text(check, ' --real-tofu "$tool/tofu"', ""))
+    # So is the real closure curl against the signed loopback fixture, its closure membership and the marker argv.
+    expect_red(replace_text(check, ' --real-s3 "$tool/curl"', ""))
+    expect_red(replace_text(check, 'grep -qxF "$curl" "$RUNNER_TEMP/provided.list"', "true"))
+    expect_red(replace_text(check, 'grep -qF -- --pipe "$RUNNER_TEMP/r2-object-put.help"', "true"))
+    expect_red(replace_text("flake.nix", 'curl = "${pkgs.curl}/bin/curl";', 'curl = "/usr/bin/curl";'))
+    expect_red(replace_text("flake.nix", "openssh curl ]", "openssh ]"))
     expect_red(replace_text(check, 'grep -qF "cloudflared version 2026.6.1 "', 'grep -qF "cloudflared version"'))
     expect_red(replace_text(check, "run: python3 checks/test_rent_access_probe.py\n", "run: 'true'\n"))
     expect_red(replace_text("README.md", "name lookup locates candidates and never proves ownership", "name lookup finds ours"))
