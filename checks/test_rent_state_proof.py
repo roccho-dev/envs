@@ -333,8 +333,13 @@ class World:
         expired = self.issued is not None and not self.never_expire and self.clock >= self.issued + jev.STATE_CREDENTIAL_TTL
         label = "post-ttl" if expired else "decoy" if bucket == NAMES["decoy"] else \
             "outside" if not key.startswith("state/") else f"proof-{method.lower()}"
-        assert (method, key) in {("PUT", jev.STATE_MARKER_KEY), ("PUT", jev.STATE_OUTSIDE_MARKER_KEY),
-                                 ("GET", jev.STATE_MARKER_KEY)}, (method, key)
+        # Each label has exactly one method and path-style target; a misrouted request fails, whatever it is answered.
+        assert (method, bucket, key) == {"proof-put": ("PUT", NAMES["proof"], jev.STATE_MARKER_KEY),
+                                         "proof-get": ("GET", NAMES["proof"], jev.STATE_MARKER_KEY),
+                                         "outside": ("PUT", NAMES["proof"], jev.STATE_OUTSIDE_MARKER_KEY),
+                                         "decoy": ("GET", NAMES["decoy"], jev.STATE_MARKER_KEY),
+                                         "post-ttl": ("GET", NAMES["proof"], jev.STATE_MARKER_KEY)}[label], \
+            (label, method, bucket, key)
         body = config.get("data-binary", "").encode()
         assert (method == "PUT") == bool(body) and (not body or body == jev.STATE_MARKER)
         self.s3_calls.append(label)
@@ -1071,37 +1076,65 @@ def real_s3(curl: str) -> None:
         exits.append(result.returncode)
         return result
 
-    def request(method, key, reply, body=None, timeout=jev.S3_TIMEOUT, bucket="proof-bucket"):
-        status, content, *rest = reply
-        server.replies.append((status, content, rest[0] if rest else 0, rest[1] if len(rest) > 1 else {}))
-        before = len(server.seen)
-        operation = jev.s3_object({"curl": curl}, runner, endpoint, credentials, method, bucket, key, body, timeout)
-        return operation, server.seen[before:]
+    proof, decoy = "proof-bucket", "proof-bucket-decoy"
+    expected: list[tuple[str, str, str, bytes | None]] = []
 
-    outcome: dict[str, object] = {}
-    try:
-        put, seen = request("PUT", jev.STATE_MARKER_KEY, (200, b""), jev.STATE_MARKER)
-        assert put["ok"] and len(seen) == 1, (put, len(seen))
-        sent = seen[0]
+    def mismatch(sent, method, bucket, key, body):
+        # Every field the fixture observed against the one request the test expects; the scripted reply plays no part.
         headers = sent["headers"]
         signed = SIGNED.fullmatch(headers.get("authorization", ""))
-        assert sent["method"] == "PUT" and sent["path"] == f"/proof-bucket/{jev.STATE_MARKER_KEY}" and sent["body"] == jev.STATE_MARKER
-        assert headers.get("host") == host and headers.get("content-type") == "application/octet-stream"
-        assert signed is not None and signed.group(1) == credentials["AWS_ACCESS_KEY_ID"], "SigV4 credential scope differs"
-        assert signed.group(2) == headers.get("x-amz-date", "")[:8], "SigV4 scope date differs from x-amz-date"
-        names = signed.group(3).split(";")
-        assert {"host", "x-amz-date", "x-amz-security-token", "x-amz-content-sha256"} <= set(names), names
-        assert headers.get("x-amz-security-token") == credentials["AWS_SESSION_TOKEN"]
-        payload = headers.get("x-amz-content-sha256")
+        payload = body or b""
+        fields = {
+            "method": sent["method"] == method,
+            "target": sent["path"] == f"/{bucket}/{key}",
+            "host": headers.get("host") == host,
+            "payload": sent["body"] == payload,
+            "content_type": (headers.get("content-type") == "application/octet-stream") == (method == "PUT"),
+            "scope": signed is not None and signed.group(1) == credentials["AWS_ACCESS_KEY_ID"]
+            and signed.group(2) == headers.get("x-amz-date", "")[:8],
+            "signed_headers": signed is not None and {"host", "x-amz-date", "x-amz-security-token",
+                                                      "x-amz-content-sha256"} <= set(signed.group(3).split(";")),
+            "token": headers.get("x-amz-security-token") == credentials["AWS_SESSION_TOKEN"],
+            "payload_hash": headers.get("x-amz-content-sha256") in {hashlib.sha256(payload).hexdigest(),
+                                                                    "UNSIGNED-PAYLOAD"},
+        }
+        return sorted(name for name, good in fields.items() if not good)
+
+    def script(reply, method, bucket, key, body=None):
+        status, content, *rest = reply
+        server.replies.append((status, content, rest[0] if rest else 0, rest[1] if len(rest) > 1 else {}))
+        expected.append((method, bucket, key, body))
+
+    def send(method, bucket, key, body=None, timeout=jev.S3_TIMEOUT):
+        before = len(server.seen)
+        operation = jev.s3_object({"curl": curl}, runner, endpoint, credentials, method, bucket, key, body, timeout)
+        seen = server.seen[before:]
+        assert len(seen) == 1, (method, bucket, key, "a request was retried, a redirect followed or none was sent")
+        return operation, seen[0], expected.pop(0)
+
+    def s3(method, bucket, key, body=None, timeout=jev.S3_TIMEOUT):
+        # The adapter's S3 callable: each request must be exactly the scripted one before its reply is used.
+        operation, sent, want = send(method, bucket, key, body, timeout)
+        wrong = mismatch(sent, *want)
+        assert not wrong, (want[:3], wrong)
+        return operation
+
+    outcome: dict[str, object] = {}
+    attempted: dict[str, set[str]] = {}
+    try:
+        # The credential control, the adapter's own marker write and exact read.
+        script((200, b""), "PUT", proof, jev.STATE_MARKER_KEY, jev.STATE_MARKER)
+        assert jev.marker_written(s3, proof, attempted)["ok"]
+        payload = server.seen[-1]["headers"].get("x-amz-content-sha256")
         outcome["payload_hash"] = "sha256" if payload == hashlib.sha256(jev.STATE_MARKER).hexdigest() else \
             "unsigned" if payload == "UNSIGNED-PAYLOAD" else "other"
         assert outcome["payload_hash"] in {"sha256", "unsigned"}
-        got, seen = request("GET", jev.STATE_MARKER_KEY, (200, jev.STATE_MARKER))
-        assert got["ok"] and got["body"] == jev.STATE_MARKER and seen[0]["method"] == "GET" and seen[0]["body"] == b""
-        assert "x-amz-security-token" in SIGNED.fullmatch(seen[0]["headers"]["authorization"]).group(3).split(";")
+        script((200, jev.STATE_MARKER), "GET", proof, jev.STATE_MARKER_KEY)
+        assert jev.marker_read(s3, proof)
         outcome["control"] = True
         causes = jev.STATE_NEGATIVES["outside_prefix_write_refused"]
         # Only a 403 whose XML error document says AccessDenied is the scope refusal; 401 is the credential itself.
+        # Each outside attempt follows its write control, both by the adapter's marker write.
         for name, reply, cause, status in (
             ("xml_access_denied", (403, ACCESS_DENIED_XML), "access_denied", "403"),
             ("bodyless_403", (403, b""), "unknown", "403"),
@@ -1114,30 +1147,69 @@ def real_s3(curl: str) -> None:
             ("server_error", (500, s3_error("InternalError")), "unknown", "5xx"),
             ("redirect", (301, b"", 0, {"Location": f"{endpoint}/elsewhere"}), "unknown", "other"),
         ):
-            operation, seen = request("PUT", jev.STATE_OUTSIDE_MARKER_KEY, reply, jev.STATE_MARKER)
-            assert len(seen) == 1, (name, "a request was retried or a redirect followed")
+            script((200, b""), "PUT", proof, jev.STATE_MARKER_KEY, jev.STATE_MARKER)
+            control = jev.marker_written(s3, proof, attempted)["ok"]
+            script(reply, "PUT", proof, jev.STATE_OUTSIDE_MARKER_KEY, jev.STATE_MARKER)
+            operation = jev.marker_written(s3, proof, attempted, jev.STATE_OUTSIDE_MARKER_KEY)
             assert not operation["ok"] and operation["status"] == status and jev.s3_cause(operation) == cause, (name, operation)
             assert operation["body"] is None
-            outcome[name] = jev.s3_refusal(True, operation, causes)
-        assert outcome["xml_access_denied"] == "REFUSED" and jev.s3_refusal(False, request(
-            "GET", jev.STATE_MARKER_KEY, (403, ACCESS_DENIED_XML))[0], causes) == "UNKNOWN", "a failed control qualified"
+            outcome[name] = jev.s3_refusal(control, operation, causes)
+        assert attempted == {proof: {jev.STATE_MARKER_KEY, jev.STATE_OUTSIDE_MARKER_KEY}}, attempted
+        # The decoy read follows its read control (the proof marker's exact bytes) and is a real GET of the decoy bucket.
+        decoy_causes = jev.STATE_NEGATIVES["decoy_refused"]
+        for name, reply, verdict in (("decoy_access_denied", (403, ACCESS_DENIED_XML), "REFUSED"),
+                                     ("decoy_bodyless_403", (403, b""), "UNKNOWN")):
+            script((200, jev.STATE_MARKER), "GET", proof, jev.STATE_MARKER_KEY)
+            control = jev.marker_read(s3, proof)
+            script(reply, "GET", decoy, jev.STATE_MARKER_KEY)
+            operation = s3("GET", decoy, jev.STATE_MARKER_KEY)
+            outcome[name] = jev.s3_refusal(control, operation, decoy_causes)
+            assert control and outcome[name] == verdict and operation["body"] is None, (name, operation)
+        script((403, ACCESS_DENIED_XML), "GET", proof, jev.STATE_MARKER_KEY)
+        refused = s3("GET", proof, jev.STATE_MARKER_KEY)
+        assert outcome["xml_access_denied"] == "REFUSED" and refused["access_denied"] and \
+            jev.s3_refusal(False, refused, causes) == "UNKNOWN", "a failed control qualified"
+        # The post-TTL probe is the same exact GET of the proof marker; only a completed 401 is expiry.
+        script((401, b""), "GET", proof, jev.STATE_MARKER_KEY)
+        after = s3("GET", proof, jev.STATE_MARKER_KEY)
+        assert not after["ok"] and after["status"] == "401" and jev.s3_cause(after) == "unauthorized", after
+        outcome["post_ttl"] = jev.s3_cause(after)
         # No reply within the bound: transient, never retried, never a refusal.
-        operation, seen = request("GET", jev.STATE_MARKER_KEY, (200, jev.STATE_MARKER, 4), timeout=2)
-        assert len(seen) == 1 and not operation["ok"] and operation["transient"] and operation["status"] == "none"
+        script((200, jev.STATE_MARKER, 4), "GET", proof, jev.STATE_MARKER_KEY)
+        operation = s3("GET", proof, jev.STATE_MARKER_KEY, timeout=2)
+        assert not operation["ok"] and operation["transient"] and operation["status"] == "none"
         outcome["timeout"] = jev.s3_refusal(True, operation, causes)
         # A partial transfer (more Content-Length than delivered) with a parsable reply: curl exits nonzero, so neither
         # the XML 403 AccessDenied, the 401 nor the exact marker bytes count as a completed reply.
         for name, (status, content) in (("partial_access_denied", (403, ACCESS_DENIED_XML)),
                                         ("partial_unauthorized", (401, b"")),
                                         ("partial_marker", (200, jev.STATE_MARKER))):
-            operation, seen = request("GET", jev.STATE_MARKER_KEY,
-                                      (status, content, 0, {"Content-Length": str(len(content) + 64)}), timeout=5)
+            script((status, content, 0, {"Content-Length": str(len(content) + 64)}), "GET", proof, jev.STATE_MARKER_KEY)
+            operation = s3("GET", proof, jev.STATE_MARKER_KEY, timeout=5)
             assert exits[-1] == 18, (name, "the transfer was not partial")
-            assert len(seen) == 1 and not operation["ok"] and operation["transient"] and not operation["access_denied"]
+            assert not operation["ok"] and operation["transient"] and not operation["access_denied"]
             assert jev.s3_cause(operation) == "unknown" and operation["body"] is None, (name, jev.s3_facts(operation))
             outcome[name] = jev.s3_refusal(True, operation, causes)
-        assert all(value == "UNKNOWN" for name, value in outcome.items()
-                   if name not in {"payload_hash", "control", "xml_access_denied"}), outcome
+        # A misrouted request answered with the qualifying XML 403 would classify as REFUSED, so only the observed
+        # method, target and payload keep it out: each wrong request differs from the expected one in those fields.
+        caught = {}
+        for name, want, sent in (
+            ("decoy_as_put", ("GET", decoy, jev.STATE_MARKER_KEY, None), ("PUT", decoy, jev.STATE_MARKER_KEY, jev.STATE_MARKER)),
+            ("decoy_in_proof", ("GET", decoy, jev.STATE_MARKER_KEY, None), ("GET", proof, jev.STATE_MARKER_KEY, None)),
+            ("outside_in_prefix", ("PUT", proof, jev.STATE_OUTSIDE_MARKER_KEY, jev.STATE_MARKER),
+             ("PUT", proof, jev.STATE_MARKER_KEY, jev.STATE_MARKER)),
+            ("outside_as_get", ("PUT", proof, jev.STATE_OUTSIDE_MARKER_KEY, jev.STATE_MARKER),
+             ("GET", proof, jev.STATE_OUTSIDE_MARKER_KEY, None)),
+        ):
+            script((403, ACCESS_DENIED_XML), *want)
+            operation, seen, expect = send(*sent)
+            assert expect == want and jev.s3_refusal(True, operation, causes) == "REFUSED", (name, operation)
+            caught[name] = mismatch(seen, *want)
+            assert caught[name], (name, "a misrouted request matched the expected one")
+        outcome["misroute"] = caught
+        assert all(value == "UNKNOWN" for name, value in outcome.items() if name not in {
+            "payload_hash", "control", "xml_access_denied", "decoy_access_denied", "post_ttl", "misroute"}), outcome
+        assert expected == [] and attempted == {proof: {jev.STATE_MARKER_KEY, jev.STATE_OUTSIDE_MARKER_KEY}}, attempted
         # The credential and session token never reach argv or the environment; only finite facts leave.
         assert len(server.seen) == len(launched) and server.replies == []
         for argv, env in launched:
