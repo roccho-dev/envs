@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import contextlib
 import hashlib
 import importlib.util
 import io
 import json
+import os
 import re
 import secrets
 import shutil
 import subprocess
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -32,7 +35,9 @@ RUN_ENV = {"GITHUB_RUN_ID": "36700000001", "GITHUB_RUN_ATTEMPT": "2", "GITHUB_SH
 RUN = jev.run_identity(RUN_ENV)
 NAMES = jev.state_bucket_names(RUN)
 NOW = 1_800_000_000.0
-PASSPHRASE = re.compile(r'key_provider "pbkdf2" "(current|previous)" \{\n  passphrase = "([0-9a-f]+)"')
+PASSPHRASE = re.compile(r'key_provider "pbkdf2" "(\w+)" \{\n  passphrase = "([0-9a-f]+)"')
+# The state method and its optional fallback, by key name: like OpenTofu, the fake binds stored state to that name.
+METHODS = re.compile(r'(?m)^state \{\n  method = method\.aes_gcm\.(\w+)\n(?:  fallback \{\n    method = method\.aes_gcm\.(\w+)\n)?')
 # OpenTofu/AWS SDK-shaped failures; only their class matters, and the adapter never prints them.
 DENIED = b"operation error S3: ListObjectsV2, https response error StatusCode: 403, RequestID: r, api error AccessDenied: Access Denied"
 LOCK_DENIED = (b"Error acquiring the state lock\n\nError message: operation error S3: PutObject, https response error "
@@ -197,8 +202,9 @@ class World:
 
     def inner(self, work, command, argv, env):
         assert "CLOUDFLARE_API_TOKEN" not in env and PARENT_TOKEN not in env.values(), "the parent token reached the backend"
-        keys = dict(PASSPHRASE.findall(env.get("TF_ENCRYPTION", "")))
-        current, previous = keys.get("current"), keys.get("previous")
+        text = env.get("TF_ENCRYPTION", "")
+        keys, methods = dict(PASSPHRASE.findall(text)), METHODS.search(text)
+        current, previous = ((name, keys[name]) if name else None for name in (methods.groups() if methods else (None, None)))
         valid = env.get("AWS_SECRET_ACCESS_KEY") == TEMPORARY["secretAccessKey"] \
             and env.get("AWS_SESSION_TOKEN") == TEMPORARY["sessionToken"]
         expired = self.issued is not None and not self.never_expire and self.clock >= self.issued + jev.STATE_CREDENTIAL_TTL
@@ -563,17 +569,106 @@ def test_recovery_input() -> None:
 
 
 def test_encryption_config() -> None:
-    single = jev.encryption_config("a" * 64)
-    rotated = jev.encryption_config("b" * 64, "a" * 64)
-    assert dict(PASSPHRASE.findall(single)) == {"current": "a" * 64} and "fallback" not in single
-    assert dict(PASSPHRASE.findall(rotated)) == {"current": "b" * 64, "previous": "a" * 64}
-    assert rotated.count("fallback {\n    method = method.aes_gcm.previous\n  }") == 2
+    single = jev.encryption_config("k0", "a" * 64)
+    rotated = jev.encryption_config("k1", "b" * 64, ("k0", "a" * 64))
+    assert dict(PASSPHRASE.findall(single)) == {"k0": "a" * 64} and "fallback" not in single
+    assert METHODS.search(single).groups() == ("k0", None)
+    # The old key keeps the name it was written under; the new key gets its own.
+    assert dict(PASSPHRASE.findall(rotated)) == {"k1": "b" * 64, "k0": "a" * 64}
+    assert METHODS.search(rotated).groups() == ("k1", "k0")
+    assert rotated.count("fallback {\n    method = method.aes_gcm.k0\n  }") == 2
     assert jev.encrypted_raw(b'{"encrypted_data":"x","serial":1}', "canary-1")
     for raw in (None, b'{"encrypted_data":"canary-1"}', b'{"resources":[],"encrypted_data":"x"}', b"not json"):
         assert not jev.encrypted_raw(raw, "canary-1")
 
 
+# The backend root's encryption and canary on a local backend: OpenTofu's own encryption metadata, without S3 or R2.
+NATIVE_ROOT = """terraform {
+  backend "local" {
+    path = "%s"
+  }
+  encryption {
+    state {
+      enforced = true
+    }
+    plan {
+      enforced = true
+    }
+  }
+}
+
+variable "canary" {
+  type    = string
+  default = ""
+}
+
+resource "terraform_data" "canary" {
+  input = var.canary
+}
+
+output "canary" {
+  value = terraform_data.canary.output
+}
+"""
+
+
+def real_tofu(tofu: str) -> None:
+    # The pinned closure OpenTofu writes, rotates and reads one synthetic state with the adapter's own encryption text,
+    # each step from a fresh directory, network closed. Only stage outcomes are printed, never a canary or a key.
+    # The work directory is a fresh empty path that is never deleted here: recursive deletion is not allowed in an
+    # automated check, and its synthetic, encrypted state is left to the ephemeral runner.
+    assert os.path.isfile(tofu) and os.access(tofu, os.X_OK), "native OpenTofu cannot run"
+    work = Path(tempfile.mkdtemp(prefix="envs-native-tofu-"))
+    assert not any(work.iterdir()), "native OpenTofu work directory is not empty"
+    state = work / "state.tfstate"
+    first, second = secrets.token_hex(32), secrets.token_hex(32)
+    old, new = "canary-" + secrets.token_hex(16), "canary-" + secrets.token_hex(16)
+
+    def run(name: str, encryption: str, canary: str, *args: str) -> subprocess.CompletedProcess[bytes]:
+        directory, home = work / name, work / f"home-{name}"
+        if not directory.exists():
+            directory.mkdir()
+            home.mkdir()
+            (directory / "main.tf").write_text(NATIVE_ROOT % state.as_posix(), encoding="utf-8")
+        env = {"PATH": os.path.dirname(tofu), "HOME": str(home), "TF_IN_AUTOMATION": "1", "TF_INPUT": "0",
+               "HTTPS_PROXY": "http://127.0.0.1:9", "HTTP_PROXY": "http://127.0.0.1:9", "CHECKPOINT_DISABLE": "1",
+               "TF_ENCRYPTION": encryption, "TF_VAR_canary": canary}
+        return subprocess.run([tofu, f"-chdir={directory}", *args], env=env, capture_output=True, timeout=300,
+                              check=False)
+
+    def step(name: str, encryption: str, canary: str, *args: str) -> tuple[bool, str]:
+        for command in (("init", "-input=false", "-no-color"), args):
+            result = run(name, encryption, canary, *command)
+            if result.returncode != 0:
+                return False, jev.failure_cause(result)
+        return True, "ok"
+
+    def reads(name: str, encryption: str, expected: str) -> tuple[bool, str]:
+        ok, cause = step(name, encryption, "", "output", "-raw", "canary")
+        if not ok:
+            return False, cause
+        return run(name, encryption, "", "output", "-raw", "canary").stdout == expected.encode(), "ok"
+
+    apply = ("apply", "-input=false", "-auto-approve", "-no-color")
+    outcome: dict[str, object] = {}
+    outcome["write"] = step("write", jev.encryption_config("k0", first), old, *apply)
+    before = state.read_bytes() if state.is_file() else None
+    outcome["raw_encrypted"] = jev.encrypted_raw(before, old)
+    outcome["rotate"] = step("rotate", jev.encryption_config("k1", second, ("k0", first)), new, *apply)
+    after = state.read_bytes() if state.is_file() else None
+    outcome["raw_rewritten"] = jev.encrypted_raw(after, new) and after != before
+    outcome["new_key_read"] = reads("new-key", jev.encryption_config("k1", second), new)
+    refused, cause = reads("old-key", jev.encryption_config("k0", first), new)
+    outcome["old_key_refused"] = (not refused and cause == "decryption", cause)
+    passed = all(value[0] if isinstance(value, tuple) else value for value in outcome.values())
+    print("native OpenTofu rotation:", json.dumps(outcome, sort_keys=True), "PASS" if passed else "RED")
+    assert passed, "native OpenTofu rotation regression failed"
+
+
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--real-tofu", metavar="TOFU")
+    args = parser.parse_args()
     try:
         jev.validate_contracts(ROOT)
         test_state_pass()
@@ -587,6 +682,10 @@ def main() -> None:
         test_state_red_inputs()
         test_recovery_input()
         test_encryption_config()
+        if args.real_tofu is None:
+            print("native OpenTofu rotation: NOT RUN (the check workflow runs it with --real-tofu)")
+        else:
+            real_tofu(args.real_tofu)
     finally:
         shutil.rmtree(fixtures.STORE, ignore_errors=True)
     print("state proof adapter self-test: PASS")

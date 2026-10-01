@@ -116,7 +116,7 @@ STATE_TOOL_CHECKS = (
     '"$tool/tofu" -chdir="$state/backend" validate -no-color',
     'grep -qF -- --pipe "$RUNNER_TEMP/r2-object-get.help"',
     'grep -qF -- --remote "$RUNNER_TEMP/r2-object-get.help"',
-    '"$tool/python3" -I checks/test_rent_state_proof.py',
+    '"$tool/python3" -I checks/test_rent_state_proof.py --real-tofu "$tool/tofu"',
 )
 # check proves the probe tools from the built closure: exact client version, its token flags, and an OpenTofu
 # init/validate of the provider declaration with every network route closed.

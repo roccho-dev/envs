@@ -313,6 +313,8 @@ def main() -> None:
     expect_red(replace_text("flake.nix", 'tofu = "${opentofu}/bin/tofu";', 'tofu = "/usr/bin/tofu";'))
     expect_red(replace_text(check, "HTTPS_PROXY=http://127.0.0.1:9 HTTP_PROXY=http://127.0.0.1:9 ", ""))
     expect_red(replace_text(check, ' --real-ssh "$tool"', ""))
+    # The state proof's native OpenTofu rotation regression is mandatory in check, not an optional local run.
+    expect_red(replace_text(check, ' --real-tofu "$tool/tofu"', ""))
     expect_red(replace_text(check, 'grep -qF "cloudflared version 2026.6.1 "', 'grep -qF "cloudflared version"'))
     expect_red(replace_text(check, "run: python3 checks/test_rent_access_probe.py\n", "run: 'true'\n"))
     expect_red(replace_text("README.md", "name lookup locates candidates and never proves ownership", "name lookup finds ours"))

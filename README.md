@@ -64,7 +64,7 @@ THIRD_PARTY_NOTICES.md
 | `dev-rent-access-probe/CLOUDFLARE_ACCOUNT_ID` | variable | cloudflare_account_id | persistent |
 | `dev-rent-access-probe/CLOUDFLARE_ZONE_ID` | variable | cloudflare_zone_id | persistent |
 | `dev-rent-access-probe/R2_PARENT_API_TOKEN` | secret | opaque | finite_expiry |
-| `dev-rent-access-probe/R2_PARENT_ACCESS_KEY_ID` | variable | cloudflare_api_token_id | finite_expiry |
+| `dev-rent-access-probe/R2_PARENT_ACCESS_KEY_ID` | secret | cloudflare_api_token_id | finite_expiry |
 | `stg-projection/JEV_API_KEY` | secret | opaque | persistent |
 | `stg-projection/CLOUDFLARE_API_TOKEN` | secret | opaque | persistent |
 | `stg-projection/CLOUDFLARE_ACCOUNT_ID` | variable | cloudflare_account_id | persistent |
@@ -187,6 +187,8 @@ dev-rent-access-probe/R2_PARENT_API_TOKEN, R2_PARENT_ACCESS_KEY_ID, CLOUDFLARE_A
 - Right after each create the run emits one evidence line per bucket (`envs.rentStateProofCreated.v1`: bucket, provider `creation_date`, run ID, attempt, head). Cleanup deletes only a bucket whose evidence and current `creation_date` match; a bucket name alone never authorizes deletion. The same parser reads those lines from a job log as recovery input for a later exact contract.
 - `STATE_BACKEND_PROVEN` needs every positive check, every negative `REFUSED`, a usable control and `cleanup` `ABSENT` (buckets `ABSENT` and the credential `UNUSABLE_AFTER_TTL`). A remaining bucket is `LEFTOVER`; an unobserved credential end or unreadable evidence is `UNKNOWN`; either replaces the status, with no retry. Force cancellation or runner loss can bypass cleanup. The failure signatures above are to be confirmed by the live run.
 - `checks/test_rent_state_proof.py` proves the gates, order, isolation, redaction, outcome classes, cleanup model and evidence parser against a fake provider; `check` initializes and validates both roots with network access closed and checks Wrangler's `r2 object get --pipe --remote` shape.
+- `check` also runs it with `--real-tofu "$tool/tofu"`: the pinned closure OpenTofu writes, rotates and reads one synthetic state through a local backend with network access closed, using the adapter's own encryption configuration. It needs the new key to read, the old key alone to fail by decryption, and the raw state to be rewritten without the canary. It prints only the stage outcomes, fails if the tool cannot run, and leaves its fresh work directory to the ephemeral runner rather than deleting it. It proves OpenTofu's encryption metadata behaviour, not R2 or S3.
+- `R2_PARENT_ACCESS_KEY_ID` is a secret input: as a variable its value was printed in the public step log (run 36797154456). The GitHub Environment still registers it as a variable; moving it is a later owner action. Until then the adapter's input gate rejects the missing secret before any provider call; that is source behaviour, not yet observed on a runner.
 
 Not proven here: any real R2 effect, the parent token's permission (only the first bounded create proves it), R2 lock-file and prefix-scoped temporary-credential behaviour, or production state. The live run needs its own contract.
 

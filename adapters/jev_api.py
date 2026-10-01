@@ -326,11 +326,12 @@ def expected_inputs() -> dict[str, dict[str, list[dict[str, str]]]]:
             ),
         },
         STATE_PLANE: {
-            "required_secrets": entries(("R2_PARENT_API_TOKEN", "opaque", "finite_expiry")),
-            "required_variables": entries(
-                ("CLOUDFLARE_ACCOUNT_ID", "cloudflare_account_id", "persistent"),
+            # The parent token ID is non-secret but a GitHub variable is printed in the public step log, so it is a secret.
+            "required_secrets": entries(
+                ("R2_PARENT_API_TOKEN", "opaque", "finite_expiry"),
                 ("R2_PARENT_ACCESS_KEY_ID", "cloudflare_api_token_id", "finite_expiry"),
             ),
+            "required_variables": entries(("CLOUDFLARE_ACCOUNT_ID", "cloudflare_account_id", "persistent")),
         },
     }
 
@@ -1225,16 +1226,15 @@ def owned_buckets(evidence: Mapping[str, str], current: Mapping[str, str | None]
                   if name in evidence and current.get(name) is not None and current[name] == evidence[name])
 
 
-def encryption_config(current: str, previous: str | None = None) -> str:
+def encryption_config(name: str, passphrase: str, fallback: tuple[str, str] | None = None) -> str:
     # TF_ENCRYPTION text with per-run pbkdf2 passphrases; it reaches OpenTofu only through the process environment.
-    blocks = [f'key_provider "pbkdf2" "current" {{\n  passphrase = "{current}"\n}}\n',
-              'method "aes_gcm" "current" {\n  keys = key_provider.pbkdf2.current\n}\n']
-    fallback = ""
-    if previous is not None:
-        blocks += [f'key_provider "pbkdf2" "previous" {{\n  passphrase = "{previous}"\n}}\n',
-                   'method "aes_gcm" "previous" {\n  keys = key_provider.pbkdf2.previous\n}\n']
-        fallback = "  fallback {\n    method = method.aes_gcm.previous\n  }\n"
-    blocks += [f"{target} {{\n  method = method.aes_gcm.current\n{fallback}}}\n" for target in ("state", "plan")]
+    # OpenTofu binds encrypted metadata to the key provider and method names, so a key keeps its name for life: a
+    # rotation adds a new name and keeps the old key under its original name as the fallback.
+    blocks = [f'key_provider "pbkdf2" "{key}" {{\n  passphrase = "{value}"\n}}\n'
+              f'method "aes_gcm" "{key}" {{\n  keys = key_provider.pbkdf2.{key}\n}}\n'
+              for key, value in [(name, passphrase), *([fallback] if fallback else [])]]
+    tail = f"  fallback {{\n    method = method.aes_gcm.{fallback[0]}\n  }}\n" if fallback else ""
+    blocks += [f"{target} {{\n  method = method.aes_gcm.{name}\n{tail}}}\n" for target in ("state", "plan")]
     return "".join(blocks)
 
 
@@ -1347,7 +1347,7 @@ def state_checks(root: Path, scratch: Path, tools: Mapping[str, str], account: s
 
     checks = dict.fromkeys(STATE_CHECKS, False)
     negatives = dict.fromkeys(STATE_NEGATIVES, "UNKNOWN")
-    current = encryption_config(passphrase)
+    current = encryption_config("k0", passphrase)
     holder_work, holder_env = backend("holder", encryption=current)
     contender_work, contender_env = backend("contender", encryption=current)
     if not (ok(holder_work, holder_env, *init) and ok(contender_work, contender_env, *init)):
@@ -1370,11 +1370,12 @@ def state_checks(root: Path, scratch: Path, tools: Mapping[str, str], account: s
     before = raw_state(tools, scratch, account, token, names["proof"], runner)
     checks["raw_state_encrypted"] = encrypted_raw(before, first)
     checks["readback_exact"] = reads(*backend("readback", encryption=current), first)
-    rotate_work, rotate_env = backend("rotate", encryption=encryption_config(rotated, passphrase), canary=second)
+    rotate_work, rotate_env = backend("rotate", encryption=encryption_config("k1", rotated, ("k0", passphrase)),
+                                     canary=second)
     rewritten = ok(rotate_work, rotate_env, *init) and ok(rotate_work, rotate_env, *apply)
     after = raw_state(tools, scratch, account, token, names["proof"], runner)
     checks["rotation_rewritten"] = rewritten and encrypted_raw(after, second) and after != before
-    only_rotated = encryption_config(rotated)
+    only_rotated = encryption_config("k1", rotated)
     checks["rotated_readback"] = reads(*backend("rotated", encryption=only_rotated), second)
     # Each negative runs right after a control that differs only in the input under test.
     control = reads(*backend("old-key-control", encryption=only_rotated), second)
@@ -1470,7 +1471,9 @@ def state_proof(root: Path = ROOT, *, runner: Runner = default_runner, api: Api 
     inputs = gate(root, contracts, STATE_PLANE)
     token, account, parent = (inputs[name] for name in ("R2_PARENT_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID",
                                                         "R2_PARENT_ACCESS_KEY_ID"))
+    # Secrets are not covered by the gate's Variable check: a token or its ID already in Git is RED before any call.
     reject_live_values(root, "R2_PARENT_API_TOKEN", [token])
+    reject_live_values(root, "R2_PARENT_ACCESS_KEY_ID", [parent])
     run = run_identity(os.environ)
     names = state_bucket_names(run)
     result: dict[str, Any] = {
@@ -1494,7 +1497,7 @@ def state_proof(root: Path = ROOT, *, runner: Runner = default_runner, api: Api 
         issued: float | None = None
         credentials: dict[str, str] | None = None
         control = False
-        probe_encryption = encryption_config(secrets.token_hex(32))
+        probe_encryption = encryption_config("probe", secrets.token_hex(32))
         try:
             tofu(tools, outer, outer_env, runner, "init", "-input=false", "-no-color")
             result["stage"] = "create"
