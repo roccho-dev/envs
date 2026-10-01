@@ -214,7 +214,7 @@ jobs:
             echo "check-only age is in the provided artifact" >&2
             exit 1
           fi
-          echo "provided artifact: sops and curl present, age absent; $(stat -c %s "$RUNNER_TEMP/provide/envs-effect.tar") bytes"
+          echo "provided artifact: sops and curl present, age absent; $(stat -L -c %s "$RUNNER_TEMP/provide/envs-effect.tar") bytes"
 
       - name: Provide effect artifact
         id: provide
