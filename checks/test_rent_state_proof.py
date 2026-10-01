@@ -68,6 +68,8 @@ def s3_error(code: str) -> bytes:
 ACCESS_DENIED_XML = s3_error("AccessDenied")
 NO_SUCH_KEY_XML = s3_error("NoSuchKey")
 SIGNATURE_XML = s3_error("SignatureDoesNotMatch")
+# Two contradictory direct codes: not one S3 Error.Code, so never a qualifying refusal.
+DUPLICATE_CODE_XML = b"<Error><Code>AccessDenied</Code><Code>SignatureDoesNotMatch</Code></Error>"
 
 
 def iso(seconds: float) -> str:
@@ -604,6 +606,7 @@ def test_negative_classes(root: Path) -> None:
         (World(s3={"decoy": (403, b"")}), "decoy_refused", "UNKNOWN", "UNKNOWN"),
         (World(s3={"outside": (403, SIGNATURE_XML)}), "outside_prefix_write_refused", "UNKNOWN", "UNKNOWN"),
         (World(s3={"decoy": (404, NO_SUCH_KEY_XML)}), "decoy_refused", "UNKNOWN", "UNKNOWN"),
+        (World(s3={"decoy": (403, DUPLICATE_CODE_XML)}), "decoy_refused", "UNKNOWN", "UNKNOWN"),
         # A nonzero curl exit (18: partial transfer) is never a completed reply, whatever status or body arrived.
         (World(s3={"outside": (403, ACCESS_DENIED_XML, 18)}), "outside_prefix_write_refused", "UNKNOWN", "UNKNOWN"),
         (World(s3={"decoy": (200, jev.STATE_MARKER, 18)}), "decoy_refused", "UNKNOWN", "UNKNOWN"),
@@ -1106,6 +1109,7 @@ def real_s3(curl: str) -> None:
             ("no_such_key", (404, NO_SUCH_KEY_XML), "unknown", "other"),
             ("signature", (403, SIGNATURE_XML), "unknown", "403"),
             ("malformed", (403, b"<Error><Code>AccessDenied"), "unknown", "403"),
+            ("duplicate_code", (403, DUPLICATE_CODE_XML), "unknown", "403"),
             ("text_only", (403, b"AccessDenied"), "unknown", "403"),
             ("server_error", (500, s3_error("InternalError")), "unknown", "5xx"),
             ("redirect", (301, b"", 0, {"Location": f"{endpoint}/elsewhere"}), "unknown", "other"),

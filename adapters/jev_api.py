@@ -1330,15 +1330,16 @@ def curl_value(value: str) -> str:
 
 
 def s3_error_code(body: bytes) -> str | None:
-    # Only an actual S3 XML error document names a code; a substring, a bodyless reply or malformed XML names none.
+    # Only an actual S3 XML error document with exactly one direct Code names a code; a substring, a bodyless reply,
+    # malformed XML or contradictory duplicate codes name none.
     if not body or len(body) > S3_BODY_LIMIT:
         return None
     try:
         document = ElementTree.fromstring(body)
     except ElementTree.ParseError:
         return None
-    code = document.find("Code") if document.tag == "Error" else None
-    return code.text.strip() if code is not None and code.text else None
+    codes = document.findall("Code") if document.tag == "Error" else []
+    return codes[0].text.strip() if len(codes) == 1 and codes[0].text else None
 
 
 def s3_object(tools: Mapping[str, str], runner: Runner, endpoint: str, credentials: Mapping[str, str], method: str,
