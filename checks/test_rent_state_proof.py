@@ -44,6 +44,8 @@ LOCK_DENIED = (b"Error acquiring the state lock\n\nError message: operation erro
                b"StatusCode: 403, RequestID: r, api error AccessDenied: Access Denied")
 UNAUTHORIZED = b"operation error S3: ListObjectsV2, https response error StatusCode: 401, RequestID: r, api error Unauthorized"
 UNAVAILABLE = b"operation error S3: GetObject, https response error StatusCode: 503, RequestID: r, api error ServiceUnavailable"
+# A fake shape only: native OpenTofu 1.12.3 rejects an enforced root without a method at init as a configuration
+# error before reading any state (real_tofu records that as a guard); this fixture is not evidence of real output.
 NO_METHOD = b"Error: state encryption is enforced, but no encryption method is configured"
 NO_CREDENTIAL = b"Error: No valid credential sources found"
 UNDECRYPTABLE = b"Error: decryption failed for all provided methods"
@@ -741,11 +743,7 @@ def test_encryption_config() -> None:
 
 
 # The backend root's encryption and canary on a local backend: OpenTofu's own encryption metadata, without S3 or R2.
-NATIVE_ROOT = """terraform {
-  backend "local" {
-    path = "%s"
-  }
-  encryption {
+NATIVE_ENCRYPTION = """  encryption {
     state {
       enforced = true
     }
@@ -753,7 +751,12 @@ NATIVE_ROOT = """terraform {
       enforced = true
     }
   }
-}
+"""
+NATIVE_ROOT = """terraform {
+  backend "local" {
+    path = "%s"
+  }
+""" + NATIVE_ENCRYPTION + """}
 
 variable "canary" {
   type    = string
@@ -768,6 +771,10 @@ output "canary" {
   value = terraform_data.canary.output
 }
 """
+# The same root with no encryption block at all: OpenTofu then has no encryption configuration. It is only ever
+# initialized and read, never planned or applied, so it cannot write the state.
+NATIVE_PLAIN_ROOT = NATIVE_ROOT.replace(NATIVE_ENCRYPTION, "")
+assert NATIVE_PLAIN_ROOT != NATIVE_ROOT and "encryption" not in NATIVE_PLAIN_ROOT
 
 
 def real_tofu(tofu: str) -> None:
@@ -782,12 +789,13 @@ def real_tofu(tofu: str) -> None:
     first, second = secrets.token_hex(32), secrets.token_hex(32)
     old, new = "canary-" + secrets.token_hex(16), "canary-" + secrets.token_hex(16)
 
-    def run(name: str, encryption: str | None, canary: str, *args: str) -> subprocess.CompletedProcess[bytes]:
+    def run(name: str, encryption: str | None, canary: str, *args: str,
+            root: str = NATIVE_ROOT) -> subprocess.CompletedProcess[bytes]:
         directory, home = work / name, work / f"home-{name}"
         if not directory.exists():
             directory.mkdir()
             home.mkdir()
-            (directory / "main.tf").write_text(NATIVE_ROOT % state.as_posix(), encoding="utf-8")
+            (directory / "main.tf").write_text(root % state.as_posix(), encoding="utf-8")
         env = {"PATH": os.path.dirname(tofu), "HOME": str(home), "TF_IN_AUTOMATION": "1", "TF_INPUT": "0",
                "HTTPS_PROXY": "http://127.0.0.1:9", "HTTP_PROXY": "http://127.0.0.1:9", "CHECKPOINT_DISABLE": "1",
                "TF_VAR_canary": canary}
@@ -818,18 +826,24 @@ def real_tofu(tofu: str) -> None:
     after = state.read_bytes() if state.is_file() else None
     outcome["raw_rewritten"] = jev.encrypted_raw(after, new) and after != before
     outcome["new_key_read"] = reads("new-key", jev.encryption_config("k1", second), new)
-    refused, cause = reads("old-key", jev.encryption_config("k0", first), new)
-    outcome["old_key_refused"] = (not refused and cause == "decryption", cause)
-    # Only the encryption configuration is absent: the same encrypted state must be refused for the adapter's own
-    # qualifying cause, right after the current key read it (new_key_read); phase is where it stopped.
+    # Right after that control, only the encryption configuration differs: a root with no encryption block reads the
+    # same encrypted state (init and output only) and must be refused for the adapter's own qualifying cause.
+    held = state.read_bytes() if state.is_file() else None
     phase, cause = "admitted", "ok"
     for name, command in (("init", ("init", "-input=false", "-no-color")), ("read", ("output", "-raw", "canary"))):
-        result = run("no-encryption", None, "", *command)
+        result = run("no-config", None, "", *command, root=NATIVE_PLAIN_ROOT)
         if result.returncode != 0:
             phase, cause = name, jev.failure_cause(result)
             break
     qualifying = jev.STATE_NEGATIVES["unencrypted_read_refused"]
-    outcome["unencrypted_read_refused"] = (phase != "admitted" and cause in qualifying, cause, phase)
+    outcome["no_config_read_refused"] = (phase != "admitted" and cause in qualifying, cause, phase)
+    # A guard, not a read refusal: the enforced root without TF_ENCRYPTION is rejected at init by its own
+    # configuration (no method), before any state is read; only that refusal is recorded, not its cause.
+    guard = run("enforced-no-key", None, "", "init", "-input=false", "-no-color")
+    outcome["enforced_init_refused"] = guard.returncode != 0
+    outcome["no_config_state_unchanged"] = held is not None and state.read_bytes() == held
+    refused, cause = reads("old-key", jev.encryption_config("k0", first), new)
+    outcome["old_key_refused"] = (not refused and cause == "decryption", cause)
     passed = all(value[0] if isinstance(value, tuple) else value for value in outcome.values())
     print("native OpenTofu rotation:", json.dumps(outcome, sort_keys=True), "PASS" if passed else "RED")
     assert passed, "native OpenTofu rotation regression failed"
