@@ -2,6 +2,11 @@ name: probe-dev-rent-state
 
 on:
   workflow_dispatch:
+    inputs:
+      expected_source_sha:
+        description: The exact canonical commit authorized for this one attempt
+        required: true
+        type: string
 
 permissions:
   actions: read
@@ -13,7 +18,9 @@ concurrency:
 
 jobs:
   proof:
-    if: github.repository == 'roccho-dev/envs' && github.ref_name == 'proposals'
+    # The job (and so its Environment secrets) starts only for the authorized commit and only as attempt 1: a moved
+    # branch, a missing or other SHA, or a re-run is skipped before any provider effect.
+    if: github.repository == 'roccho-dev/envs' && github.ref_name == 'proposals' && github.sha == inputs.expected_source_sha && github.run_attempt == '1'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     environment: dev-rent-access-probe

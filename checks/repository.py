@@ -178,6 +178,11 @@ ALLOWED_COMMAND = re.compile(
     r'|"\$(?:ENVS_EFFECT_BIN|tool)/[a-z0-9-]+"(?: .*)?)$'
 )
 COMMAND_CONTROL = re.compile(r"[;&|<>`\n]|\$\(")
+STATE_DISPATCH_INPUT = ("on:\n  workflow_dispatch:\n    inputs:\n      expected_source_sha:\n"
+                        "        description: The exact canonical commit authorized for this one attempt\n"
+                        "        required: true\n        type: string\n")
+STATE_JOB_GUARD = ("    if: github.repository == 'roccho-dev/envs' && github.ref_name == 'proposals'"
+                   " && github.sha == inputs.expected_source_sha && github.run_attempt == '1'\n")
 FLAKE_NIXPKGS = re.compile(r'(?m)^\s*inputs\.nixpkgs\.url = "github:NixOS/nixpkgs/([0-9a-f]{40})";$')
 
 
@@ -584,6 +589,11 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]],
             "state proof workflow entry call missing")
     require("permissions:\n  actions: read\n  contents: read\n" in state and "write" not in state,
             "state proof workflow must be read-only on the repository")
+    # The provider job enters only for the one authorized commit and first attempt; the SHA is a required input.
+    require(STATE_DISPATCH_INPUT in state and state.count("expected_source_sha") == 2,
+            "state proof dispatch must require the exact expected source SHA")
+    require(state.count(STATE_JOB_GUARD) == 1 and state.count("    if: ") == 1,
+            "state proof job must enter only for the expected SHA on its first attempt")
     require(f"    timeout-minutes: {adapter.STATE_JOB_MINUTES}\n" in state and state.count("timeout-minutes:") == 1,
             "state proof job bound differs from the adapter's expiry window")
     # One Environment, two meanings kept apart: neither workflow maps the other's secret.

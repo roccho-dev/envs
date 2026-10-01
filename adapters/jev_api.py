@@ -1647,9 +1647,12 @@ def state_cleanup(tools: Mapping[str, str], scratch: Path, account: str, token: 
         report["buckets"] = "LEFTOVER" if any(value is not None for value in after_buckets) else "ABSENT"
     except STATE_FAILURES:
         report["buckets"] = "UNKNOWN"
+    # Absence means only what this run saw: every bucket its create evidence names was read back present and owned
+    # before it went; a 404 for a bucket never seen present is doubt, not ABSENT.
     if report["buckets"] == "LEFTOVER":
         report["cleanup"] = "LEFTOVER"
-    elif report["buckets"] == "ABSENT" and report["credential"] in {"NOT_ATTEMPTED", "UNUSABLE_AFTER_TTL"}:
+    elif report["buckets"] == "ABSENT" and set(owned) == set(created) \
+            and report["credential"] in {"NOT_ATTEMPTED", "UNUSABLE_AFTER_TTL"}:
         report["cleanup"] = "ABSENT"
     return report
 
@@ -1749,8 +1752,10 @@ def state_proof(root: Path = ROOT, *, runner: Runner = default_runner, api: Api 
             result["diagnostics"]["credential_probe"] = report.pop("credential_probe")
             result.update(report)
     if not diagnostics_finite(result["diagnostics"]):
-        # A value outside the closed sets is never emitted; the labels above stand unchanged.
+        # A value outside the closed sets is never emitted, and a proof without its evidence is not a proof.
         result["diagnostics"] = None
+        if result["status"] == "STATE_BACKEND_PROVEN":
+            result["status"] = "UNKNOWN"
     if result["cleanup"] != "ABSENT":
         # Resources or a usable credential may remain: no proof outcome stands as the status.
         result["status"] = result["cleanup"]
