@@ -35,7 +35,9 @@ RUN_ENV = {"GITHUB_RUN_ID": "36700000001", "GITHUB_RUN_ATTEMPT": "2", "GITHUB_SH
 RUN = jev.run_identity(RUN_ENV)
 NAMES = jev.state_bucket_names(RUN)
 NOW = 1_800_000_000.0
-PASSPHRASE = re.compile(r'key_provider "pbkdf2" "(current|previous)" \{\n  passphrase = "([0-9a-f]+)"')
+PASSPHRASE = re.compile(r'key_provider "pbkdf2" "(\w+)" \{\n  passphrase = "([0-9a-f]+)"')
+# The state method and its optional fallback, by key name: like OpenTofu, the fake binds stored state to that name.
+METHODS = re.compile(r'(?m)^state \{\n  method = method\.aes_gcm\.(\w+)\n(?:  fallback \{\n    method = method\.aes_gcm\.(\w+)\n)?')
 # OpenTofu/AWS SDK-shaped failures; only their class matters, and the adapter never prints them.
 DENIED = b"operation error S3: ListObjectsV2, https response error StatusCode: 403, RequestID: r, api error AccessDenied: Access Denied"
 LOCK_DENIED = (b"Error acquiring the state lock\n\nError message: operation error S3: PutObject, https response error "
@@ -200,8 +202,9 @@ class World:
 
     def inner(self, work, command, argv, env):
         assert "CLOUDFLARE_API_TOKEN" not in env and PARENT_TOKEN not in env.values(), "the parent token reached the backend"
-        keys = dict(PASSPHRASE.findall(env.get("TF_ENCRYPTION", "")))
-        current, previous = keys.get("current"), keys.get("previous")
+        text = env.get("TF_ENCRYPTION", "")
+        keys, methods = dict(PASSPHRASE.findall(text)), METHODS.search(text)
+        current, previous = ((name, keys[name]) if name else None for name in (methods.groups() if methods else (None, None)))
         valid = env.get("AWS_SECRET_ACCESS_KEY") == TEMPORARY["secretAccessKey"] \
             and env.get("AWS_SESSION_TOKEN") == TEMPORARY["sessionToken"]
         expired = self.issued is not None and not self.never_expire and self.clock >= self.issued + jev.STATE_CREDENTIAL_TTL
@@ -566,11 +569,14 @@ def test_recovery_input() -> None:
 
 
 def test_encryption_config() -> None:
-    single = jev.encryption_config("a" * 64)
-    rotated = jev.encryption_config("b" * 64, "a" * 64)
-    assert dict(PASSPHRASE.findall(single)) == {"current": "a" * 64} and "fallback" not in single
-    assert dict(PASSPHRASE.findall(rotated)) == {"current": "b" * 64, "previous": "a" * 64}
-    assert rotated.count("fallback {\n    method = method.aes_gcm.previous\n  }") == 2
+    single = jev.encryption_config("k0", "a" * 64)
+    rotated = jev.encryption_config("k1", "b" * 64, ("k0", "a" * 64))
+    assert dict(PASSPHRASE.findall(single)) == {"k0": "a" * 64} and "fallback" not in single
+    assert METHODS.search(single).groups() == ("k0", None)
+    # The old key keeps the name it was written under; the new key gets its own.
+    assert dict(PASSPHRASE.findall(rotated)) == {"k1": "b" * 64, "k0": "a" * 64}
+    assert METHODS.search(rotated).groups() == ("k1", "k0")
+    assert rotated.count("fallback {\n    method = method.aes_gcm.k0\n  }") == 2
     assert jev.encrypted_raw(b'{"encrypted_data":"x","serial":1}', "canary-1")
     for raw in (None, b'{"encrypted_data":"canary-1"}', b'{"resources":[],"encrypted_data":"x"}', b"not json"):
         assert not jev.encrypted_raw(raw, "canary-1")
@@ -645,14 +651,14 @@ def real_tofu(tofu: str) -> None:
 
     apply = ("apply", "-input=false", "-auto-approve", "-no-color")
     outcome: dict[str, object] = {}
-    outcome["write"] = step("write", jev.encryption_config(first), old, *apply)
+    outcome["write"] = step("write", jev.encryption_config("k0", first), old, *apply)
     before = state.read_bytes() if state.is_file() else None
     outcome["raw_encrypted"] = jev.encrypted_raw(before, old)
-    outcome["rotate"] = step("rotate", jev.encryption_config(second, first), new, *apply)
+    outcome["rotate"] = step("rotate", jev.encryption_config("k1", second, ("k0", first)), new, *apply)
     after = state.read_bytes() if state.is_file() else None
     outcome["raw_rewritten"] = jev.encrypted_raw(after, new) and after != before
-    outcome["new_key_read"] = reads("new-key", jev.encryption_config(second), new)
-    refused, cause = reads("old-key", jev.encryption_config(first), new)
+    outcome["new_key_read"] = reads("new-key", jev.encryption_config("k1", second), new)
+    refused, cause = reads("old-key", jev.encryption_config("k0", first), new)
     outcome["old_key_refused"] = (not refused and cause == "decryption", cause)
     passed = all(value[0] if isinstance(value, tuple) else value for value in outcome.values())
     print("native OpenTofu rotation:", json.dumps(outcome, sort_keys=True), "PASS" if passed else "RED")
