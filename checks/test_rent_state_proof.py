@@ -609,8 +609,11 @@ output "canary" {
 def real_tofu(tofu: str) -> None:
     # The pinned closure OpenTofu writes, rotates and reads one synthetic state with the adapter's own encryption text,
     # each step from a fresh directory, network closed. Only stage outcomes are printed, never a canary or a key.
+    # The work directory is a fresh empty path that is never deleted here: recursive deletion is not allowed in an
+    # automated check, and its synthetic, encrypted state is left to the ephemeral runner.
     assert os.path.isfile(tofu) and os.access(tofu, os.X_OK), "native OpenTofu cannot run"
     work = Path(tempfile.mkdtemp(prefix="envs-native-tofu-"))
+    assert not any(work.iterdir()), "native OpenTofu work directory is not empty"
     state = work / "state.tfstate"
     first, second = secrets.token_hex(32), secrets.token_hex(32)
     old, new = "canary-" + secrets.token_hex(16), "canary-" + secrets.token_hex(16)
@@ -642,18 +645,15 @@ def real_tofu(tofu: str) -> None:
 
     apply = ("apply", "-input=false", "-auto-approve", "-no-color")
     outcome: dict[str, object] = {}
-    try:
-        outcome["write"] = step("write", jev.encryption_config(first), old, *apply)
-        before = state.read_bytes() if state.is_file() else None
-        outcome["raw_encrypted"] = jev.encrypted_raw(before, old)
-        outcome["rotate"] = step("rotate", jev.encryption_config(second, first), new, *apply)
-        after = state.read_bytes() if state.is_file() else None
-        outcome["raw_rewritten"] = jev.encrypted_raw(after, new) and after != before
-        outcome["new_key_read"] = reads("new-key", jev.encryption_config(second), new)
-        refused, cause = reads("old-key", jev.encryption_config(first), new)
-        outcome["old_key_refused"] = (not refused and cause == "decryption", cause)
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
+    outcome["write"] = step("write", jev.encryption_config(first), old, *apply)
+    before = state.read_bytes() if state.is_file() else None
+    outcome["raw_encrypted"] = jev.encrypted_raw(before, old)
+    outcome["rotate"] = step("rotate", jev.encryption_config(second, first), new, *apply)
+    after = state.read_bytes() if state.is_file() else None
+    outcome["raw_rewritten"] = jev.encrypted_raw(after, new) and after != before
+    outcome["new_key_read"] = reads("new-key", jev.encryption_config(second), new)
+    refused, cause = reads("old-key", jev.encryption_config(first), new)
+    outcome["old_key_refused"] = (not refused and cause == "decryption", cause)
     passed = all(value[0] if isinstance(value, tuple) else value for value in outcome.values())
     print("native OpenTofu rotation:", json.dumps(outcome, sort_keys=True), "PASS" if passed else "RED")
     assert passed, "native OpenTofu rotation regression failed"
