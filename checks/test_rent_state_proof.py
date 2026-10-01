@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import hashlib
+import http.server
 import importlib.util
 import io
 import json
@@ -13,6 +14,8 @@ import secrets
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -56,6 +59,19 @@ UNDECRYPTABLE = b"Error: decryption failed for all provided methods"
 NEGATIVES = dict.fromkeys(jev.STATE_NEGATIVES, "REFUSED")
 
 
+def s3_error(code: str) -> bytes:
+    return (f'<?xml version="1.0" encoding="UTF-8"?>\n<Error><Code>{code}</Code><Message>fixture</Message>'
+            f"</Error>").encode()
+
+
+# S3 object replies as (HTTP status, body), or a curl transport failure; only their class matters.
+ACCESS_DENIED_XML = s3_error("AccessDenied")
+NO_SUCH_KEY_XML = s3_error("NoSuchKey")
+SIGNATURE_XML = s3_error("SignatureDoesNotMatch")
+# Two contradictory direct codes: not one S3 Error.Code, so never a qualifying refusal.
+DUPLICATE_CODE_XML = b"<Error><Code>AccessDenied</Code><Code>SignatureDoesNotMatch</Code></Error>"
+
+
 def iso(seconds: float) -> str:
     return datetime.fromtimestamp(seconds, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -87,12 +103,16 @@ class World:
     """A fake R2/Cloudflare/OpenTofu/Wrangler world: buckets, objects, one lock file and the temporary credential."""
 
     def __init__(self, *, verify=None, present=(), fail=(), unknown=(), lock_ignored=False, plaintext=False,
-                 never_expire=False, redated=(), issuance=None, transient=(), admit=(), outside_init_denied=False,
-                 expiry=UNAUTHORIZED, decoy=DENIED, raising=None, plain_phase="init",
-                 plain_error=ENCRYPTED_NO_CONFIG) -> None:
+                 never_expire=False, redated=(), issuance=None, transient=(), admit=(), expiry=UNAUTHORIZED,
+                 raising=None, plain_phase="init", plain_error=ENCRYPTED_NO_CONFIG, s3=None) -> None:
         # plain_phase/plain_error: where and how a root with no encryption configuration refuses the state; both
         # phases are exercised because which one S3 uses is not observed.
         self.plain_phase, self.plain_error, self.roots = plain_phase, plain_error, {}
+        # s3: an object request label (proof-put, proof-get, outside, decoy, post-ttl) -> (status, body), "timeout"
+        # (no reply) or "timeout-wrote" (no reply, yet the object was written).
+        self.s3 = dict(s3 or {})
+        self.markers: dict[tuple[str, str], bytes] = {}
+        self.s3_calls: list[str] = []
         # raising: a work directory, "wrangler-delete", "outer-destroy" or "api-current" -> a local exception type.
         self.raising = dict(raising or {})
         self.verify = {"id": PARENT_ID, "status": "active", "not_before": iso(NOW - 3600),
@@ -100,7 +120,7 @@ class World:
         self.fail, self.unknown, self.redated = set(fail), set(unknown), set(redated)
         self.lock_ignored, self.plaintext, self.never_expire = lock_ignored, plaintext, never_expire
         self.issuance, self.transient, self.admit = issuance, set(transient), set(admit)
-        self.outside_init_denied, self.expiry, self.decoy = outside_init_denied, expiry, decoy
+        self.expiry = expiry
         self.issuances = 0
         self.clock = NOW
         self.buckets = {name: "2026-01-01T00:00:00.000Z" for name in present}
@@ -158,7 +178,9 @@ class World:
         if argv[0] == TOOLS["wrangler"]:
             if argv[3] == "delete" and "wrangler-delete" in self.raising:
                 raise self.raising["wrangler-delete"]("fixture launch failure")
-            return self.wrangler(argv, env)
+            return self.wrangler(argv, input_data, env)
+        if argv[0] == TOOLS["curl"]:
+            return self.curl(argv, input_data, env)
         assert argv[0] == TOOLS["tofu"], argv
         work = Path(argv[1].split("=", 1)[1]).name
         if work in self.raising or (work == "outer" and argv[2] == "destroy" and "outer-destroy" in self.raising):
@@ -204,7 +226,7 @@ class World:
                          for name, created in self.state.items()]
             return self.done(argv, 0, json.dumps({"values": {"root_module": {"resources": resources}}}).encode())
         elif command == "destroy":
-            if "destroy" in self.fail or any(bucket in self.state for bucket, _ in self.objects):
+            if "destroy" in self.fail or any(bucket in self.state for bucket, _ in [*self.objects, *self.markers]):
                 return self.done(argv, 1)
             for name in list(self.state):
                 self.buckets.pop(name, None)
@@ -241,13 +263,12 @@ class World:
             return self.done(argv, 1, stderr=NO_CREDENTIAL)
         if not valid or expired:
             return self.done(argv, 1, stderr=self.expiry)
-        if bucket != NAMES["proof"] or bucket not in self.buckets:
-            return self.done(argv, 1, stderr=self.decoy)
+        # OpenTofu only ever reaches the proof bucket inside the prefix; the object boundaries are curl's.
+        assert bucket == NAMES["proof"] and inside, (work, bucket, key)
+        if bucket not in self.buckets:
+            return self.done(argv, 1, stderr=DENIED)
         if command == "init":
-            return self.done(argv, 1, stderr=DENIED) if not inside and self.outside_init_denied else self.done(argv)
-        if not inside:
-            # The first write outside the prefix is OpenTofu's own lock file.
-            return self.done(argv, 1, stderr=LOCK_DENIED)
+            return self.done(argv)
         if command == "plan":
             if self.lock_held and not self.lock_ignored:
                 return self.done(argv, 1, stderr=b"Error acquiring the state lock\nLock Info: fixture")
@@ -264,14 +285,28 @@ class World:
             return self.done(argv, 0, str(stored["canary"]).encode()) if readable else self.done(argv, 1, stderr=UNDECRYPTABLE)
         raise AssertionError(argv)
 
-    def wrangler(self, argv, env):
+    def wrangler(self, argv, input_data, env):
         assert env["CLOUDFLARE_API_TOKEN"] == PARENT_TOKEN and argv[1:3] == ["r2", "object"] and "--remote" in argv
         bucket, key = argv[4].split("/", 1)
-        assert bucket == NAMES["proof"] and key in {jev.STATE_KEY, jev.STATE_KEY + ".tflock"}, argv
+        markers = {jev.STATE_MARKER_KEY, jev.STATE_OUTSIDE_MARKER_KEY}
+        assert bucket in NAMES.values() and key in {jev.STATE_KEY, jev.STATE_KEY + ".tflock", *markers}, argv
         if argv[3] == "delete":
             self.objects.pop((bucket, key), None)
+            self.markers.pop((bucket, key), None)
+            return self.done(argv)
+        if argv[3] == "put":
+            # Only the parent's known decoy marker is written here.
+            assert (bucket, key) == (NAMES["decoy"], jev.STATE_MARKER_KEY) and "--pipe" in argv, argv
+            assert input_data == jev.STATE_MARKER
+            if "seed" in self.fail:
+                return self.done(argv, 1)
+            self.markers[(bucket, key)] = input_data
             return self.done(argv)
         assert argv[3] == "get" and "--pipe" in argv
+        if key == jev.STATE_MARKER_KEY:
+            stored_marker = self.markers.get((bucket, key))
+            return self.done(argv, 0, stored_marker) if stored_marker is not None else self.done(argv, 1)
+        assert bucket == NAMES["proof"] and key == jev.STATE_KEY, argv
         stored = self.objects.get((bucket, key))
         if stored is None:
             return self.done(argv, 1)
@@ -280,6 +315,52 @@ class World:
         if self.plaintext:
             body["canary"] = stored["canary"]
         return self.done(argv, 0, json.dumps(body).encode())
+
+    def curl(self, argv, input_data, env):
+        # The temporary credential reaches curl only as stdin config; argv is fixed and the parent token never comes.
+        assert argv[1:] == ["-q", "--config", "-"] and input_data is not None, argv
+        assert PARENT_TOKEN.encode() not in input_data and "AWS_SECRET_ACCESS_KEY" not in env
+        config = dict(re.findall(r'(?m)^([a-z0-9-]+) = "((?:[^"\\]|\\.)*)"$', input_data.decode()))
+        headers = re.findall(r'(?m)^header = "((?:[^"\\]|\\.)*)"$', input_data.decode())
+        assert config["aws-sigv4"] == "aws:amz:auto:s3" and config["noproxy"] == "*" and config["proto"] == "=https"
+        assert "silent" in input_data.decode().splitlines() and config["write-out"] == "%{stderr}%{http_code}"
+        method, url = config["request"], config["url"]
+        prefix = f"https://{ACCOUNT_ID}.r2.cloudflarestorage.com/"
+        assert url.startswith(prefix), url
+        bucket, key = url[len(prefix):].split("/", 1)
+        valid = config["user"] == f"{TEMPORARY['accessKeyId']}:{TEMPORARY['secretAccessKey']}" \
+            and f"x-amz-security-token: {TEMPORARY['sessionToken']}" in headers
+        expired = self.issued is not None and not self.never_expire and self.clock >= self.issued + jev.STATE_CREDENTIAL_TTL
+        label = "post-ttl" if expired else "decoy" if bucket == NAMES["decoy"] else \
+            "outside" if not key.startswith("state/") else f"proof-{method.lower()}"
+        # Each label has exactly one method and path-style target; a misrouted request fails, whatever it is answered.
+        assert (method, bucket, key) == {"proof-put": ("PUT", NAMES["proof"], jev.STATE_MARKER_KEY),
+                                         "proof-get": ("GET", NAMES["proof"], jev.STATE_MARKER_KEY),
+                                         "outside": ("PUT", NAMES["proof"], jev.STATE_OUTSIDE_MARKER_KEY),
+                                         "decoy": ("GET", NAMES["decoy"], jev.STATE_MARKER_KEY),
+                                         "post-ttl": ("GET", NAMES["proof"], jev.STATE_MARKER_KEY)}[label], \
+            (label, method, bucket, key)
+        body = config.get("data-binary", "").encode()
+        assert (method == "PUT") == bool(body) and (not body or body == jev.STATE_MARKER)
+        self.s3_calls.append(label)
+        if f"curl:{label}" in self.raising:
+            raise self.raising[f"curl:{label}"]("fixture launch failure")
+        reply = self.s3.get(label)
+        if reply in ("timeout", "timeout-wrote"):
+            if reply == "timeout-wrote":
+                self.markers[(bucket, key)] = body
+            return self.done(argv, 28, b"", b"000")
+        if reply is None:
+            # The modelled R2: 401 for an invalid or expired credential, 403 AccessDenied with an XML body outside
+            # its bucket or prefix, and the marker as written inside it.
+            stored = self.markers.get((bucket, key))
+            reply = (401, b"") if not valid or expired else (403, ACCESS_DENIED_XML) if label in {"outside", "decoy"} \
+                else (200, b"") if method == "PUT" else (200, stored) if stored is not None else (404, NO_SUCH_KEY_XML)
+        status, content, *rest = reply
+        exit_code = rest[0] if rest else 0
+        if 200 <= status < 300 and method == "PUT":
+            self.markers[(bucket, key)] = body
+        return self.done(argv, exit_code, content, f"{status:03d}".encode())
 
     def prove(self, root: Path) -> dict:
         with contextlib.redirect_stderr(self.stderr):
@@ -303,7 +384,7 @@ def no_secret_escapes(world: World, result: dict) -> None:
     # encryption text only the backend root; the parent token ID and account only the environment and URLs.
     text = json.dumps(result) + world.stderr.getvalue()
     passphrases = {value for _, env in world.calls for _, value in PASSPHRASE.findall(env.get("TF_ENCRYPTION", ""))}
-    assert len(passphrases) == 3, "state key, rotated key and credential-probe key"
+    assert len(passphrases) == 2, "state key and rotated key"
     for value in (PARENT_TOKEN, PARENT_ID, ACCOUNT_ID, *TEMPORARY.values(), *passphrases):
         assert value not in text, "a secret or pinned ID reached the result or a log line"
         for argv, _ in world.calls:
@@ -337,16 +418,24 @@ def test_state_pass(root: Path) -> None:
     assert result["negatives"] == NEGATIVES and len(NEGATIVES) == 5
     assert result["credential"] == "UNUSABLE_AFTER_TTL" and result["credential_control"] == "USABLE"
     assert result["buckets"] == "ABSENT" and result["owned"] == sorted(NAMES.values())
-    # The post-TTL test runs in its own fresh directory, never the control's cached one, and after the TTL.
-    assert world.tofu("usable-control") == [["init", "-input=false", "-no-color"]]
-    assert world.tofu("unusable-after-ttl") == [["init", "-input=false", "-no-color"]]
-    # Each negative has its adjacent control; the prefix write is OpenTofu's own lock, after an accepted init.
-    for name in ("old-key", "no-encryption", "no-credential", "outside-prefix", "decoy"):
+    # Object requests in order: the credential control writes and reads the proof marker; the prefix write follows its
+    # write control, the decoy read its read control after the parent seeded and verified the decoy marker; after
+    # the TTL the same credential reads the same marker.
+    assert world.s3_calls == ["proof-put", "proof-get", "proof-put", "outside", "proof-get", "decoy", "post-ttl"]
+    seed = [i for i, (argv, _) in enumerate(world.calls) if argv[0] == TOOLS["wrangler"] and argv[3] == "put"]
+    decoy = [i for i, (argv, _) in enumerate(world.calls) if argv[0] == TOOLS["curl"]][5]
+    assert len(seed) == 1 and seed[0] < decoy
+    # Each OpenTofu negative keeps its adjacent control; OpenTofu no longer runs the object boundaries.
+    for name in ("old-key", "no-encryption", "no-credential"):
         assert world.tofu(f"{name}-control") and world.tofu(name), name
-    assert [args[0] for args in world.tofu("outside-prefix")] == ["init", "plan"]
-    assert "-lock-timeout=0" in world.tofu("outside-prefix")[1]
+    assert not world.tofu("outside-prefix") and not world.tofu("decoy") and not world.tofu("usable-control")
+    # Every attempted marker key is deleted before the owned buckets are destroyed.
+    deleted = {argv[4] for argv, _ in world.calls if argv[0] == TOOLS["wrangler"] and argv[3] == "delete"}
+    assert deleted == {f"{NAMES['proof']}/{jev.STATE_KEY}", f"{NAMES['proof']}/{jev.STATE_KEY}.tflock",
+                       f"{NAMES['proof']}/{jev.STATE_MARKER_KEY}", f"{NAMES['proof']}/{jev.STATE_OUTSIDE_MARKER_KEY}",
+                       f"{NAMES['decoy']}/{jev.STATE_MARKER_KEY}"}, deleted
     assert result["parent"] == {"id": "MATCHED", "status": "ACTIVE", "expiry": "COVERS_WINDOW"}
-    assert world.buckets == {} and world.objects == {} and not world.lock_held
+    assert world.buckets == {} and world.objects == {} and world.markers == {} and not world.lock_held
     # The first bounded create comes before the decoy, the credential and any state operation.
     assert [args[0] for args in world.tofu("outer")] == ["init", "apply", "show", "apply", "show", "destroy"]
     assert world.tofu("outer")[1][-1] == "decoy=false" and world.tofu("outer")[3][-1] == "decoy=true"
@@ -440,13 +529,26 @@ def test_cleanup_is_evidence_bound(root: Path) -> None:
     world = World(never_expire=True)
     result = world.prove(root)
     assert result["cleanup"] == "UNKNOWN" and result["status"] == "UNKNOWN" and result["credential"] == "STILL_USABLE"
-    # Only a 401 for the same credential in a fresh directory after the TTL, with a usable control before it, counts;
-    # a 403, a 5xx or a failed control leaves the credential UNKNOWN and the buckets are still removed.
-    for world in (World(expiry=DENIED), World(transient={"unusable-after-ttl"}), World(transient={"usable-control"})):
+    # Only a 401 for the same credential reading the same marker after the TTL, with a usable control before it,
+    # counts; a 403 (even AccessDenied), a timeout or a failed control leaves the credential UNKNOWN and the buckets
+    # are still removed.
+    for world in (World(s3={"post-ttl": (403, ACCESS_DENIED_XML)}), World(s3={"post-ttl": "timeout"}),
+                  World(s3={"post-ttl": (401, b"", 18)}), World(s3={"proof-get": (503, b"")})):
         result = world.prove(root)
         assert result["credential"] == "UNKNOWN" and result["buckets"] == "ABSENT", result
         assert result["cleanup"] == "UNKNOWN" and result["status"] == "UNKNOWN" and world.buckets == {}
-    assert result["credential_control"] == "UNKNOWN" and not world.tofu("unusable-after-ttl")
+    assert result["credential_control"] == "UNKNOWN" and "post-ttl" not in world.s3_calls
+    # A write whose reply never came may still have landed: its exact key is deleted anyway, and nothing is retried.
+    for label in ("outside", "proof-put"):
+        world = World(s3={label: "timeout-wrote"})
+        result = world.prove(root)
+        assert result["buckets"] == "ABSENT" and world.markers == {} and world.buckets == {}, (label, result)
+        assert world.s3_calls.count(label) == (1 if label == "outside" else 2), world.s3_calls
+    # Without a verified decoy marker the decoy read is not attempted at all.
+    world = World(fail={"seed"})
+    result = world.prove(root)
+    assert result["negatives"]["decoy_refused"] == "UNKNOWN" and "decoy" not in world.s3_calls
+    assert result["diagnostics"]["negatives"]["decoy_refused"] is None and result["buckets"] == "ABSENT"
     # A readback that cannot be completed is UNKNOWN, never ABSENT.
     world = World(unknown={"bucket-after"})
     result = world.prove(root)
@@ -465,7 +567,7 @@ def test_cleanup_survives_local_failures(root: Path) -> None:
     # The post-TTL probe cannot launch (either local failure class): the credential is UNKNOWN, yet the owned
     # buckets are still deleted and read back once.
     for error in (OSError, subprocess.SubprocessError):
-        world = World(raising={"unusable-after-ttl": error})
+        world = World(raising={"curl:post-ttl": error})
         result = world.prove(root)
         assert result["credential"] == "UNKNOWN" and result["buckets"] == "ABSENT", result
         assert result["cleanup"] == "UNKNOWN" and result["status"] == "UNKNOWN" and world.buckets == {}
@@ -500,11 +602,19 @@ def test_negative_classes(root: Path) -> None:
     # A negative that succeeds is ADMITTED and RED; one failing for another cause, or behind a failed control, is
     # UNKNOWN; an outside-prefix init already refused proves no write denial.
     for world, name, label, status in (
-        (World(admit={"outside-prefix"}), "outside_prefix_write_refused", "ADMITTED", "STATE_BACKEND_RED"),
+        (World(s3={"outside": (200, b"")}), "outside_prefix_write_refused", "ADMITTED", "STATE_BACKEND_RED"),
         (World(admit={"old-key"}), "old_key_refused", "ADMITTED", "STATE_BACKEND_RED"),
-        (World(transient={"decoy"}), "decoy_refused", "UNKNOWN", "UNKNOWN"),
-        (World(decoy=UNAUTHORIZED), "decoy_refused", "UNKNOWN", "UNKNOWN"),
-        (World(outside_init_denied=True), "outside_prefix_write_refused", "UNKNOWN", "UNKNOWN"),
+        (World(s3={"decoy": (200, jev.STATE_MARKER)}), "decoy_refused", "ADMITTED", "STATE_BACKEND_RED"),
+        (World(s3={"decoy": "timeout"}), "decoy_refused", "UNKNOWN", "UNKNOWN"),
+        (World(s3={"decoy": (401, b"")}), "decoy_refused", "UNKNOWN", "UNKNOWN"),
+        # A bodyless or other-coded 403, or a missing object, is not the scope refusal.
+        (World(s3={"decoy": (403, b"")}), "decoy_refused", "UNKNOWN", "UNKNOWN"),
+        (World(s3={"outside": (403, SIGNATURE_XML)}), "outside_prefix_write_refused", "UNKNOWN", "UNKNOWN"),
+        (World(s3={"decoy": (404, NO_SUCH_KEY_XML)}), "decoy_refused", "UNKNOWN", "UNKNOWN"),
+        (World(s3={"decoy": (403, DUPLICATE_CODE_XML)}), "decoy_refused", "UNKNOWN", "UNKNOWN"),
+        # A nonzero curl exit (18: partial transfer) is never a completed reply, whatever status or body arrived.
+        (World(s3={"outside": (403, ACCESS_DENIED_XML, 18)}), "outside_prefix_write_refused", "UNKNOWN", "UNKNOWN"),
+        (World(s3={"decoy": (200, jev.STATE_MARKER, 18)}), "decoy_refused", "UNKNOWN", "UNKNOWN"),
         (World(transient={"no-credential-control"}), "no_credential_refused", "UNKNOWN", "UNKNOWN"),
         (World(transient={"no-encryption"}), "unencrypted_read_refused", "UNKNOWN", "UNKNOWN"),
     ):
@@ -512,8 +622,6 @@ def test_negative_classes(root: Path) -> None:
         assert result["negatives"][name] == label and result["status"] == status, (name, result)
         assert result["cleanup"] == "ABSENT" and {key: value for key, value in result["negatives"].items()
                                                    if key != name} == {key: "REFUSED" for key in NEGATIVES if key != name}
-        if world.outside_init_denied:
-            assert [args[0] for args in world.tofu("outside-prefix")] == ["init"], "no write was attempted"
 
 
 def test_without_encryption() -> None:
@@ -568,10 +676,11 @@ def test_no_encryption_root(root: Path) -> None:
 
 
 MARKER = "fixture-marker-" + secrets.token_hex(8)
-# A 403 without AccessDenied (for example a body-less HEAD) whose text also carries a marker that must never escape.
-FORBIDDEN = f"operation error S3: HeadBucket, https response error StatusCode: 403, RequestID: r, {MARKER}".encode()
+# A reply body carrying a marker and the AccessDenied word, but not as an S3 XML error: it must neither qualify nor
+# escape into the receipt.
+LEAKY = f"AccessDenied {MARKER} <Error><Code>AccessDenied".encode()
 PHASES = {"old_key_refused": "read", "unencrypted_read_refused": "init", "no_credential_refused": "init",
-          "outside_prefix_write_refused": "lock", "decoy_refused": "init"}
+          "outside_prefix_write_refused": "write", "decoy_refused": "read"}
 
 
 def label_from(name: str, entry: dict | None) -> str:
@@ -580,8 +689,6 @@ def label_from(name: str, entry: dict | None) -> str:
         return "UNKNOWN"
     if entry["phase"] == "admitted":
         return "ADMITTED"
-    if name == "outside_prefix_write_refused" and entry["phase"] == "init":
-        return "UNKNOWN"
     facts = {key: entry[key] for key in jev.NO_FAILURE_FACTS}
     cause = "unknown" if facts["transient"] or facts["status"] in {"5xx", "multiple", "other"} else \
         "unauthorized" if facts["status"] == "401" else \
@@ -625,15 +732,20 @@ def test_branch_evidence(root: Path) -> None:
                                                "transient": False, "word": "none", "local": "none"}
     # Each UNKNOWN or ADMITTED branch is told apart by finite evidence, with the label unchanged.
     for world, name, expected in (
-        (World(outside_init_denied=True), "outside_prefix_write_refused",
-         {"control": True, "phase": "init", "status": "403", "access_denied": True}),
-        (World(admit={"outside-prefix"}), "outside_prefix_write_refused", {"phase": "admitted", "status": "none"}),
+        (World(s3={"outside": (200, b"")}), "outside_prefix_write_refused", {"phase": "admitted", "status": "none"}),
+        (World(s3={"proof-put": (503, b"")}), "outside_prefix_write_refused",
+         {"control": False, "phase": "write", "status": "403", "access_denied": True}),
+        (World(s3={"proof-get": (503, b"")}), "decoy_refused",
+         {"control": False, "phase": "read", "status": "403", "access_denied": True}),
         (World(transient={"no-credential-control"}), "no_credential_refused", {"control": False, "phase": "init"}),
         (World(transient={"no-encryption"}), "unencrypted_read_refused", {"phase": "init", "status": "5xx"}),
-        (World(decoy=UNAUTHORIZED), "decoy_refused", {"control": True, "status": "401"}),
-        (World(decoy=FORBIDDEN), "decoy_refused", {"control": True, "status": "403", "access_denied": False}),
-        (World(decoy=DENIED + b"\n" + UNAUTHORIZED), "decoy_refused", {"status": "multiple"}),
-        (World(decoy=b"dial tcp: i/o timeout"), "decoy_refused", {"status": "none", "transient": True}),
+        (World(s3={"decoy": (401, b"")}), "decoy_refused", {"control": True, "status": "401"}),
+        (World(s3={"decoy": (403, b"")}), "decoy_refused", {"control": True, "status": "403", "access_denied": False}),
+        (World(s3={"decoy": (403, LEAKY)}), "decoy_refused", {"status": "403", "access_denied": False}),
+        (World(s3={"outside": (403, SIGNATURE_XML)}), "outside_prefix_write_refused",
+         {"status": "403", "access_denied": False}),
+        (World(s3={"decoy": (404, NO_SUCH_KEY_XML)}), "decoy_refused", {"status": "other", "access_denied": False}),
+        (World(s3={"decoy": "timeout"}), "decoy_refused", {"status": "none", "transient": True}),
     ):
         result = world.prove(root)
         entry = diagnostics_hold(world, result)["negatives"][name]
@@ -643,11 +755,13 @@ def test_branch_evidence(root: Path) -> None:
     # named only by its closed class.
     for world, credential, expected in (
         (World(never_expire=True), "STILL_USABLE", {"probe": "admitted", "status": "none", "local": "none"}),
-        (World(expiry=DENIED), "UNKNOWN", {"probe": "refused", "status": "403", "access_denied": True}),
-        (World(transient={"unusable-after-ttl"}), "UNKNOWN", {"probe": "refused", "status": "5xx"}),
-        (World(transient={"usable-control"}), "UNKNOWN", {"probe": "not_run", "local": "none"}),
-        (World(raising={"unusable-after-ttl": OSError}), "UNKNOWN", {"probe": "local_failure", "local": "os"}),
-        (World(raising={"unusable-after-ttl": subprocess.SubprocessError}), "UNKNOWN",
+        (World(s3={"post-ttl": (403, ACCESS_DENIED_XML)}), "UNKNOWN",
+         {"probe": "refused", "status": "403", "access_denied": True}),
+        (World(s3={"post-ttl": (503, b"")}), "UNKNOWN", {"probe": "refused", "status": "5xx"}),
+        (World(s3={"post-ttl": "timeout"}), "UNKNOWN", {"probe": "refused", "status": "none", "transient": True}),
+        (World(s3={"proof-get": (503, b"")}), "UNKNOWN", {"probe": "not_run", "local": "none"}),
+        (World(raising={"curl:post-ttl": OSError}), "UNKNOWN", {"probe": "local_failure", "local": "os"}),
+        (World(raising={"curl:post-ttl": subprocess.SubprocessError}), "UNKNOWN",
          {"probe": "local_failure", "local": "subprocess"}),
         (World(issuance="5xx"), "ISSUANCE_UNKNOWN", {"probe": "not_run"}),
     ):
@@ -909,9 +1023,209 @@ def real_tofu(tofu: str) -> None:
     assert passed, "native OpenTofu rotation regression failed"
 
 
+class FixtureS3(http.server.BaseHTTPRequestHandler):
+    # A bounded loopback HTTP responder: it records each request and answers the next scripted (status, body, delay,
+    # headers). It is a transport fixture for the real curl, not an S3 service and not R2 evidence.
+    def serve(self) -> None:
+        length = int(self.headers.get("Content-Length") or 0)
+        self.server.seen.append({"method": self.command, "path": self.path, "body": self.rfile.read(length) if length else b"",
+                                 "headers": {name.lower(): value for name, value in self.headers.items()}})
+        status, content, delay, extra = self.server.replies.pop(0)
+        time.sleep(delay)
+        try:
+            self.send_response(status)
+            # An extra Content-Length larger than the body delivered makes the transfer partial (curl exit 18).
+            for name, value in extra.items():
+                self.send_header(name, value)
+            if "Content-Length" not in extra:
+                self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+        except OSError:
+            pass
+
+    do_GET = do_PUT = serve
+
+    def log_message(self, *args) -> None:
+        pass
+
+
+SIGNED = re.compile(r"^AWS4-HMAC-SHA256 Credential=([^/]+)/(\d{8})/auto/s3/aws4_request, ?SignedHeaders=([a-z0-9;-]+), ?"
+                    r"Signature=[0-9a-f]{64}$")
+
+
+def real_s3(curl: str) -> None:
+    # The locked closure curl signs real HTTP requests to the loopback fixture with synthetic credentials: exact request
+    # order, method, path-style path, host, payload, SigV4 scope and signed session token, then every reply class the
+    # adapter must keep apart. Only finite classes are printed; network and every proxy stay closed.
+    assert os.path.isfile(curl) and os.access(curl, os.X_OK), "native curl cannot run"
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FixtureS3)
+    server.daemon_threads, server.seen, server.replies = True, [], []
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    endpoint, host = f"http://127.0.0.1:{server.server_port}", f"127.0.0.1:{server.server_port}"
+    credentials = {"AWS_ACCESS_KEY_ID": "AKIA" + secrets.token_hex(8).upper(), "AWS_SECRET_ACCESS_KEY": secrets.token_hex(20),
+                   "AWS_SESSION_TOKEN": secrets.token_urlsafe(48)}
+    launched: list[tuple[list[str], dict[str, str]]] = []
+    exits: list[int] = []
+
+    def runner(argv, input_data, env):
+        # A dead proxy in the environment proves the request goes direct.
+        env = {**env, "http_proxy": "http://127.0.0.1:9", "HTTP_PROXY": "http://127.0.0.1:9", "ALL_PROXY": "http://127.0.0.1:9"}
+        launched.append((list(argv), dict(env)))
+        result = jev.default_runner(argv, input_data, env)
+        exits.append(result.returncode)
+        return result
+
+    proof, decoy = "proof-bucket", "proof-bucket-decoy"
+    expected: list[tuple[str, str, str, bytes | None]] = []
+
+    def mismatch(sent, method, bucket, key, body):
+        # Every field the fixture observed against the one request the test expects; the scripted reply plays no part.
+        headers = sent["headers"]
+        signed = SIGNED.fullmatch(headers.get("authorization", ""))
+        payload = body or b""
+        fields = {
+            "method": sent["method"] == method,
+            "target": sent["path"] == f"/{bucket}/{key}",
+            "host": headers.get("host") == host,
+            "payload": sent["body"] == payload,
+            "content_type": (headers.get("content-type") == "application/octet-stream") == (method == "PUT"),
+            "scope": signed is not None and signed.group(1) == credentials["AWS_ACCESS_KEY_ID"]
+            and signed.group(2) == headers.get("x-amz-date", "")[:8],
+            "signed_headers": signed is not None and {"host", "x-amz-date", "x-amz-security-token",
+                                                      "x-amz-content-sha256"} <= set(signed.group(3).split(";")),
+            "token": headers.get("x-amz-security-token") == credentials["AWS_SESSION_TOKEN"],
+            "payload_hash": headers.get("x-amz-content-sha256") in {hashlib.sha256(payload).hexdigest(),
+                                                                    "UNSIGNED-PAYLOAD"},
+        }
+        return sorted(name for name, good in fields.items() if not good)
+
+    def script(reply, method, bucket, key, body=None):
+        status, content, *rest = reply
+        server.replies.append((status, content, rest[0] if rest else 0, rest[1] if len(rest) > 1 else {}))
+        expected.append((method, bucket, key, body))
+
+    def send(method, bucket, key, body=None, timeout=jev.S3_TIMEOUT):
+        before = len(server.seen)
+        operation = jev.s3_object({"curl": curl}, runner, endpoint, credentials, method, bucket, key, body, timeout)
+        seen = server.seen[before:]
+        assert len(seen) == 1, (method, bucket, key, "a request was retried, a redirect followed or none was sent")
+        return operation, seen[0], expected.pop(0)
+
+    def s3(method, bucket, key, body=None, timeout=jev.S3_TIMEOUT):
+        # The adapter's S3 callable: each request must be exactly the scripted one before its reply is used.
+        operation, sent, want = send(method, bucket, key, body, timeout)
+        wrong = mismatch(sent, *want)
+        assert not wrong, (want[:3], wrong)
+        return operation
+
+    outcome: dict[str, object] = {}
+    attempted: dict[str, set[str]] = {}
+    try:
+        # The credential control, the adapter's own marker write and exact read.
+        script((200, b""), "PUT", proof, jev.STATE_MARKER_KEY, jev.STATE_MARKER)
+        assert jev.marker_written(s3, proof, attempted)["ok"]
+        payload = server.seen[-1]["headers"].get("x-amz-content-sha256")
+        outcome["payload_hash"] = "sha256" if payload == hashlib.sha256(jev.STATE_MARKER).hexdigest() else \
+            "unsigned" if payload == "UNSIGNED-PAYLOAD" else "other"
+        assert outcome["payload_hash"] in {"sha256", "unsigned"}
+        script((200, jev.STATE_MARKER), "GET", proof, jev.STATE_MARKER_KEY)
+        assert jev.marker_read(s3, proof)
+        outcome["control"] = True
+        causes = jev.STATE_NEGATIVES["outside_prefix_write_refused"]
+        # Only a 403 whose XML error document says AccessDenied is the scope refusal; 401 is the credential itself.
+        # Each outside attempt follows its write control, both by the adapter's marker write.
+        for name, reply, cause, status in (
+            ("xml_access_denied", (403, ACCESS_DENIED_XML), "access_denied", "403"),
+            ("bodyless_403", (403, b""), "unknown", "403"),
+            ("unauthorized", (401, b""), "unauthorized", "401"),
+            ("no_such_key", (404, NO_SUCH_KEY_XML), "unknown", "other"),
+            ("signature", (403, SIGNATURE_XML), "unknown", "403"),
+            ("malformed", (403, b"<Error><Code>AccessDenied"), "unknown", "403"),
+            ("duplicate_code", (403, DUPLICATE_CODE_XML), "unknown", "403"),
+            ("text_only", (403, b"AccessDenied"), "unknown", "403"),
+            ("server_error", (500, s3_error("InternalError")), "unknown", "5xx"),
+            ("redirect", (301, b"", 0, {"Location": f"{endpoint}/elsewhere"}), "unknown", "other"),
+        ):
+            script((200, b""), "PUT", proof, jev.STATE_MARKER_KEY, jev.STATE_MARKER)
+            control = jev.marker_written(s3, proof, attempted)["ok"]
+            script(reply, "PUT", proof, jev.STATE_OUTSIDE_MARKER_KEY, jev.STATE_MARKER)
+            operation = jev.marker_written(s3, proof, attempted, jev.STATE_OUTSIDE_MARKER_KEY)
+            assert not operation["ok"] and operation["status"] == status and jev.s3_cause(operation) == cause, (name, operation)
+            assert operation["body"] is None
+            outcome[name] = jev.s3_refusal(control, operation, causes)
+        assert attempted == {proof: {jev.STATE_MARKER_KEY, jev.STATE_OUTSIDE_MARKER_KEY}}, attempted
+        # The decoy read follows its read control (the proof marker's exact bytes) and is a real GET of the decoy bucket.
+        decoy_causes = jev.STATE_NEGATIVES["decoy_refused"]
+        for name, reply, verdict in (("decoy_access_denied", (403, ACCESS_DENIED_XML), "REFUSED"),
+                                     ("decoy_bodyless_403", (403, b""), "UNKNOWN")):
+            script((200, jev.STATE_MARKER), "GET", proof, jev.STATE_MARKER_KEY)
+            control = jev.marker_read(s3, proof)
+            script(reply, "GET", decoy, jev.STATE_MARKER_KEY)
+            operation = s3("GET", decoy, jev.STATE_MARKER_KEY)
+            outcome[name] = jev.s3_refusal(control, operation, decoy_causes)
+            assert control and outcome[name] == verdict and operation["body"] is None, (name, operation)
+        script((403, ACCESS_DENIED_XML), "GET", proof, jev.STATE_MARKER_KEY)
+        refused = s3("GET", proof, jev.STATE_MARKER_KEY)
+        assert outcome["xml_access_denied"] == "REFUSED" and refused["access_denied"] and \
+            jev.s3_refusal(False, refused, causes) == "UNKNOWN", "a failed control qualified"
+        # The post-TTL probe is the same exact GET of the proof marker; only a completed 401 is expiry.
+        script((401, b""), "GET", proof, jev.STATE_MARKER_KEY)
+        after = s3("GET", proof, jev.STATE_MARKER_KEY)
+        assert not after["ok"] and after["status"] == "401" and jev.s3_cause(after) == "unauthorized", after
+        outcome["post_ttl"] = jev.s3_cause(after)
+        # No reply within the bound: transient, never retried, never a refusal.
+        script((200, jev.STATE_MARKER, 4), "GET", proof, jev.STATE_MARKER_KEY)
+        operation = s3("GET", proof, jev.STATE_MARKER_KEY, timeout=2)
+        assert not operation["ok"] and operation["transient"] and operation["status"] == "none"
+        outcome["timeout"] = jev.s3_refusal(True, operation, causes)
+        # A partial transfer (more Content-Length than delivered) with a parsable reply: curl exits nonzero, so neither
+        # the XML 403 AccessDenied, the 401 nor the exact marker bytes count as a completed reply.
+        for name, (status, content) in (("partial_access_denied", (403, ACCESS_DENIED_XML)),
+                                        ("partial_unauthorized", (401, b"")),
+                                        ("partial_marker", (200, jev.STATE_MARKER))):
+            script((status, content, 0, {"Content-Length": str(len(content) + 64)}), "GET", proof, jev.STATE_MARKER_KEY)
+            operation = s3("GET", proof, jev.STATE_MARKER_KEY, timeout=5)
+            assert exits[-1] == 18, (name, "the transfer was not partial")
+            assert not operation["ok"] and operation["transient"] and not operation["access_denied"]
+            assert jev.s3_cause(operation) == "unknown" and operation["body"] is None, (name, jev.s3_facts(operation))
+            outcome[name] = jev.s3_refusal(True, operation, causes)
+        # A misrouted request answered with the qualifying XML 403 would classify as REFUSED, so only the observed
+        # method, target and payload keep it out: each wrong request differs from the expected one in those fields.
+        caught = {}
+        for name, want, sent in (
+            ("decoy_as_put", ("GET", decoy, jev.STATE_MARKER_KEY, None), ("PUT", decoy, jev.STATE_MARKER_KEY, jev.STATE_MARKER)),
+            ("decoy_in_proof", ("GET", decoy, jev.STATE_MARKER_KEY, None), ("GET", proof, jev.STATE_MARKER_KEY, None)),
+            ("outside_in_prefix", ("PUT", proof, jev.STATE_OUTSIDE_MARKER_KEY, jev.STATE_MARKER),
+             ("PUT", proof, jev.STATE_MARKER_KEY, jev.STATE_MARKER)),
+            ("outside_as_get", ("PUT", proof, jev.STATE_OUTSIDE_MARKER_KEY, jev.STATE_MARKER),
+             ("GET", proof, jev.STATE_OUTSIDE_MARKER_KEY, None)),
+        ):
+            script((403, ACCESS_DENIED_XML), *want)
+            operation, seen, expect = send(*sent)
+            assert expect == want and jev.s3_refusal(True, operation, causes) == "REFUSED", (name, operation)
+            caught[name] = mismatch(seen, *want)
+            assert caught[name], (name, "a misrouted request matched the expected one")
+        outcome["misroute"] = caught
+        assert all(value == "UNKNOWN" for name, value in outcome.items() if name not in {
+            "payload_hash", "control", "xml_access_denied", "decoy_access_denied", "post_ttl", "misroute"}), outcome
+        assert expected == [] and attempted == {proof: {jev.STATE_MARKER_KEY, jev.STATE_OUTSIDE_MARKER_KEY}}, attempted
+        # The credential and session token never reach argv or the environment; only finite facts leave.
+        assert len(server.seen) == len(launched) and server.replies == []
+        for argv, env in launched:
+            assert argv == [curl, "-q", "--config", "-"], argv
+            for value in credentials.values():
+                assert all(value not in item for item in argv) and value not in json.dumps(env)
+    finally:
+        server.shutdown()
+        server.server_close()
+    print("native S3 transport:", json.dumps(outcome, sort_keys=True), "PASS")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--real-tofu", metavar="TOFU")
+    parser.add_argument("--real-s3", metavar="CURL")
     args = parser.parse_args()
     try:
         jev.validate_contracts(ROOT)
@@ -935,6 +1249,10 @@ def main() -> None:
             print("native OpenTofu rotation: NOT RUN (the check workflow runs it with --real-tofu)")
         else:
             real_tofu(args.real_tofu)
+        if args.real_s3 is None:
+            print("native S3 transport: NOT RUN (the check workflow runs it with --real-s3)")
+        else:
+            real_s3(args.real_s3)
     finally:
         shutil.rmtree(fixtures.STORE, ignore_errors=True)
     print("state proof adapter self-test: PASS")

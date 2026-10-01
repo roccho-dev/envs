@@ -131,7 +131,8 @@ jobs:
           "$tool/python3" -I checks/test_rent_access_probe.py --real-ssh "$tool"
 
       # The state proof roots come from the same closure: both initialized and validated with every network route
-      # closed (the backend root without a backend), the Wrangler raw-read argv shape, and the self-test.
+      # closed (the backend root without a backend), the Wrangler raw-read and marker-write argv shapes, and the
+      # self-test with real OpenTofu and the real closure curl against a loopback HTTP fixture.
       - name: State proof roots from the closure without network or credentials
         run: |
           set -euo pipefail
@@ -148,7 +149,10 @@ jobs:
           "$tool/wrangler" r2 object get --help >"$RUNNER_TEMP/r2-object-get.help" 2>&1 || true
           grep -qF -- --pipe "$RUNNER_TEMP/r2-object-get.help"
           grep -qF -- --remote "$RUNNER_TEMP/r2-object-get.help"
-          "$tool/python3" -I checks/test_rent_state_proof.py --real-tofu "$tool/tofu"
+          "$tool/wrangler" r2 object put --help >"$RUNNER_TEMP/r2-object-put.help" 2>&1 || true
+          grep -qF -- --pipe "$RUNNER_TEMP/r2-object-put.help"
+          "$tool/curl" --version
+          "$tool/python3" -I checks/test_rent_state_proof.py --real-tofu "$tool/tofu" --real-s3 "$tool/curl"
 
       - name: Test Jev adapter on the toolchain interpreter
         run: '"$RUNNER_TEMP/envs-effect/bin/python3" -I checks/test_jev_api.py'
@@ -203,11 +207,14 @@ jobs:
           age="$(readlink -f "$RUNNER_TEMP/check-age/bin/age-keygen")"
           age="${age#/}"
           grep -qxF "$sops" "$RUNNER_TEMP/provided.list"
+          curl="$(readlink -f "$RUNNER_TEMP/envs-effect/bin/curl")"
+          curl="${curl#/}"
+          grep -qxF "$curl" "$RUNNER_TEMP/provided.list"
           if grep -qxF "$age" "$RUNNER_TEMP/provided.list"; then
             echo "check-only age is in the provided artifact" >&2
             exit 1
           fi
-          echo "provided artifact: sops present, age absent"
+          echo "provided artifact: sops and curl present, age absent; $(stat -L -c %s "$RUNNER_TEMP/provide/envs-effect.tar") bytes"
 
       - name: Provide effect artifact
         id: provide

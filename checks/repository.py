@@ -116,7 +116,9 @@ STATE_TOOL_CHECKS = (
     '"$tool/tofu" -chdir="$state/backend" validate -no-color',
     'grep -qF -- --pipe "$RUNNER_TEMP/r2-object-get.help"',
     'grep -qF -- --remote "$RUNNER_TEMP/r2-object-get.help"',
-    '"$tool/python3" -I checks/test_rent_state_proof.py --real-tofu "$tool/tofu"',
+    'grep -qF -- --pipe "$RUNNER_TEMP/r2-object-put.help"',
+    '"$tool/curl" --version',
+    '"$tool/python3" -I checks/test_rent_state_proof.py --real-tofu "$tool/tofu" --real-s3 "$tool/curl"',
 )
 # check proves the probe tools from the built closure: exact client version, its token flags, and an OpenTofu
 # init/validate of the provider declaration with every network route closed.
@@ -139,7 +141,7 @@ OCI_ROUNDTRIP = ('"$tool/python3" -I checks/test_jev_api.py --sops "$tool/sops"'
                  ' --age-keygen "$RUNNER_TEMP/check-age/bin/age-keygen"')
 # The author dispatch names one declared binding; each has exactly one literal step carrying only its own inputs.
 AUTHOR_STEP = re.compile(r"(?ms)^      - name: [^\n]+\n        if: inputs\.target == '([a-z.-]+)'\n(.*?)(?=^      - name: |\Z)")
-EFFECT_PACKAGES = "packages = with pkgs; [ python3 sops wrangler git gh openssh ] ++ [ cloudflared opentofu ];"
+EFFECT_PACKAGES = "packages = with pkgs; [ python3 sops wrangler git gh openssh curl ] ++ [ cloudflared opentofu ];"
 PROBE_PINS = (
     'cloudflared = assert pkgs.cloudflared.version == "2026.6.1"; pkgs.cloudflared;',
     "opentofu = pkgs.opentofu.withPlugins (p: [ p.cloudflare_cloudflare ]);",
@@ -476,6 +478,7 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]],
         REAL_ROUNDTRIP,
         OCI_ROUNDTRIP,
         'grep -qxF "$sops" "$RUNNER_TEMP/provided.list"',
+        'grep -qxF "$curl" "$RUNNER_TEMP/provided.list"',
         'if grep -qxF "$age" "$RUNNER_TEMP/provided.list"; then',
     ):
         require(marker in toolchain, f"check must run the real SOPS roundtrip with check-only age: {marker}")
