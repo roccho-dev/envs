@@ -464,6 +464,25 @@ def test_state_pass(root: Path) -> None:
         jev.s3_evidence = original
     assert dropped["diagnostics"] is None and dropped["status"] == "UNKNOWN", dropped
     assert dropped["checks"] == result["checks"] and dropped["negatives"] == NEGATIVES and dropped["cleanup"] == "ABSENT"
+    # Finite yet incomplete: shapes a run that stopped early may carry (no entry for a negative, no negatives at all,
+    # no post-TTL probe) leave the labels proven but cannot leave the status proven.
+    checks_of, probe_of = jev.state_checks, jev.probe_evidence
+    for name, attribute, replacement in (
+        ("entry", "s3_evidence", lambda control, phase, operation: None),
+        ("negatives", "state_checks", lambda *args: (*checks_of(*args)[:2], None)),
+        ("probe", "probe_evidence", lambda probe, operation=None, error=None: probe_of("not_run")),
+    ):
+        original = getattr(jev, attribute)
+        setattr(jev, attribute, replacement)
+        try:
+            world = World()
+            with contextlib.redirect_stderr(world.stderr):
+                missing = jev.state_proof(root, runner=world.run, api=world.api, spawn=world.spawn, sleep=world.sleep,
+                                          clock=world.now)
+        finally:
+            setattr(jev, attribute, original)
+        assert jev.diagnostics_finite(missing["diagnostics"]) and missing["negatives"] == NEGATIVES, (name, missing)
+        assert missing["status"] == "UNKNOWN" and missing["cleanup"] == "ABSENT", (name, missing)
 
 
 def expect_preflight_red(world: World, root: Path) -> None:

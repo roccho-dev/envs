@@ -1751,11 +1751,17 @@ def state_proof(root: Path = ROOT, *, runner: Runner = default_runner, api: Api 
                                    result["credential"], control, issued, s3, attempted, runner, api, sleep, clock)
             result["diagnostics"]["credential_probe"] = report.pop("credential_probe")
             result.update(report)
-    if not diagnostics_finite(result["diagnostics"]):
-        # A value outside the closed sets is never emitted, and a proof without its evidence is not a proof.
+    # Absent negatives or entries are fine for a run that stopped early; a proof needs every negative's evidence and
+    # the observed post-TTL 401, all inside the closed sets. A proof without its evidence is not a proof.
+    diagnostics = result["diagnostics"]
+    finite = diagnostics_finite(diagnostics)
+    complete = finite and isinstance(diagnostics["negatives"], dict) and None not in diagnostics["negatives"].values() \
+        and diagnostics["credential_probe"]["status"] == "401"
+    if not finite:
+        # A value outside the closed sets is never emitted.
         result["diagnostics"] = None
-        if result["status"] == "STATE_BACKEND_PROVEN":
-            result["status"] = "UNKNOWN"
+    if result["status"] == "STATE_BACKEND_PROVEN" and not complete:
+        result["status"] = "UNKNOWN"
     if result["cleanup"] != "ABSENT":
         # Resources or a usable credential may remain: no proof outcome stands as the status.
         result["status"] = result["cleanup"]
