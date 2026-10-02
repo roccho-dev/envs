@@ -321,8 +321,8 @@ def main() -> None:
     declared = (ROOT / rent).read_text(encoding="utf-8")
     commented = ('# backend "s3" is not another backend\n// duration = "1h" is only a comment\n'
                  + declared.replace("  duration   = var.service_token_duration\n",
-                                    '  /* duration = "1h"\n  */\n  duration   = var.service_token_duration # bound at deployment\n'))
-    assert '  /* duration = "1h"\n' in commented, "rent fixture anchor missing"
+                                    '  /*\n  duration = "1h"\n  */\n  duration   = var.service_token_duration # bound at deployment\n'))
+    assert '  /*\n  duration = "1h"\n  */\n' in commented, "rent fixture anchor missing"
     repository.check_rent_config(commented)
     expect_red(lambda root: (root / "providers/dev-rent-access-probe/.terraform.lock.hcl").write_text("\n"))
     expect_red(mutate_plane("dev.rent-access-probe", lambda row: row.update(
