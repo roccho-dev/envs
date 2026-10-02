@@ -35,6 +35,16 @@ STORE = Path("/nix/store")
 RENT_PLANE = "dev.rent-tunnel"
 RENT_CIPHERTEXT = Path("ciphertexts/dev-rent-tunnel.sops.yaml")
 RENT_KEY = "RENT_TUNNEL_TOKEN"
+# Rent client (windows #14): the G6I3 normal user's Access service credential from the persistent root's sensitive
+# output, encrypted to exactly one target age recipient. place.ps1 decrypts it on the target and hands windows'
+# RentAccess the owner-only slot '<client id>LF<client secret>LF' through a private stdin pipe.
+CLIENT_PLANE = "dev.rent-client"
+CLIENT_CIPHERTEXT = Path("ciphertexts/dev-rent-client.sops.yaml")
+CLIENT_KEYS = ("RENT_ACCESS_CLIENT_ID", "RENT_ACCESS_CLIENT_SECRET")
+CLIENT_RECIPIENT = "RENT_CLIENT_AGE_RECIPIENT"
+# The windows slot rule (Get-RentAccessProblem) for each line: 1-1024 printable ASCII characters.
+SLOT_LINE = re.compile(r"^[!-~]{1,1024}$")
+WINDOWS_CONSUMER = "windows.rent.consumer"
 CLOUDFLARE_API = "https://api.cloudflare.com/client/v4"
 RETRIEVAL_TIMEOUT = 30.0
 RESPONSE_LIMIT = 65536
@@ -231,9 +241,44 @@ def expected_rent_boundary() -> dict[str, Any]:
         "capability": "rent-tunnel",
         "source_kind": "provider_issued",
         "target_kind": "public_sops",
-        "owns": ["contract", "bounded_retrieval", "single_recipient_encryption", "ciphertext_handoff_pr"],
+        "owns": ["contract", "bounded_retrieval", "single_recipient_encryption", "ciphertext_handoff_pr",
+                 "target_placement_entry"],
         "does_not_own": ["target_apply", "target_age_identity", "client_access_credential", "unattended_ssh_acceptance"],
         "handoff_ref_kind": "exact_commit_sha",
+    }
+
+
+def expected_client_boundary() -> dict[str, Any]:
+    # envs projects the root output and ships the entrance; the provider apply, running it on the target, the
+    # target's identity and the Windows slot writer belong to others.
+    return {
+        "id": "dev.rent-client.provider",
+        "kind": "envs.providerConsumerBoundary.v1",
+        "role": "provider",
+        "repository": "roccho-dev/envs",
+        "stage": "dev",
+        "capability": "rent-client",
+        "source_kind": "provider_issued",
+        "target_kind": "public_sops",
+        "owns": ["contract", "root_output_projection", "single_recipient_encryption", "target_placement_entry"],
+        "does_not_own": ["provider_apply", "target_apply", "target_age_identity", "client_slot_writer",
+                         "unattended_ssh_acceptance"],
+        "handoff_ref_kind": "exact_commit_sha",
+    }
+
+
+def expected_windows_consumer(source: str) -> dict[str, Any]:
+    # The exact windows source whose published Release (windows-<source>) the placement gate binds.
+    return {
+        "id": WINDOWS_CONSUMER,
+        "kind": "envs.providerConsumerBoundary.v1",
+        "role": "consumer",
+        "repository": "roccho-dev/windows",
+        "stage": "dev",
+        "capability": "rent-client",
+        "distribution_source": source,
+        "owns": ["client_slot_format", "client_slot_writer", "consumer_launcher", "rent_slot_format"],
+        "requires": ["exact_release", "release_publication_success", "target_native_slot"],
     }
 
 
@@ -325,6 +370,11 @@ def expected_inputs() -> dict[str, dict[str, list[dict[str, str]]]]:
                 ("RENT_AGE_RECIPIENT", "age_recipient", "persistent"),
             ),
         },
+        # The credential arrives on stdin from the root's sensitive output; only its one recipient is an input.
+        CLIENT_PLANE: {
+            "required_secrets": entries(),
+            "required_variables": entries((CLIENT_RECIPIENT, "age_recipient", "persistent")),
+        },
         PROBE_PLANE: {
             "required_secrets": entries(("CLOUDFLARE_API_TOKEN", "opaque", "persistent")),
             "required_variables": entries(
@@ -375,7 +425,7 @@ def validate_contracts(root: Path = ROOT) -> dict[str, dict[str, dict[str, Any]]
     boundary = index(root / BOUNDARY)
 
     require(set(envs) == {
-        "dev.authoring", "dev.projection", "dev.runtime", RENT_PLANE, PROBE_PLANE, STATE_PLANE,
+        "dev.authoring", "dev.projection", "dev.runtime", RENT_PLANE, CLIENT_PLANE, PROBE_PLANE, STATE_PLANE,
         "stg.projection", "stg.runtime", "prd.projection", "prd.runtime",
         "voice-ui.dev", "voice-ui.stg", "voice-ui.prd",
     }, "environment set differs")
@@ -433,6 +483,19 @@ def validate_contracts(root: Path = ROOT) -> dict[str, dict[str, dict[str, Any]]
         require(rent["active_github_environment"] is None and rent["migration_state"] == "NOT_CONFIGURED",
                 f"{RENT_PLANE} must be NOT_CONFIGURED without its ciphertext")
 
+    client = envs[CLIENT_PLANE]
+    require(client["github_environment"] == "dev-rent-client" and client["owner"] == "envs"
+            and client["source_kind"] == "provider_issued" and client["target_kind"] == "public_sops",
+            f"{CLIENT_PLANE} plane differs")
+    client_cipher = root / CLIENT_CIPHERTEXT
+    if client_cipher.is_file():
+        require(client["active_github_environment"] == "dev-rent-client" and client["migration_state"] == "ACTIVE",
+                f"{CLIENT_PLANE} must be ACTIVE with its ciphertext")
+        validate_client_ciphertext(client_cipher.read_bytes(), None, None)
+    else:
+        require(client["active_github_environment"] is None and client["migration_state"] == "NOT_CONFIGURED",
+                f"{CLIENT_PLANE} must be NOT_CONFIGURED without its ciphertext")
+
     probe = envs[PROBE_PLANE]
     require(probe["github_environment"] == "dev-rent-access-probe" and probe["owner"] == "envs"
             and probe["source_kind"] == "provider_issued" and probe["target_kind"] == "disposable_probe"
@@ -457,9 +520,13 @@ def validate_contracts(root: Path = ROOT) -> dict[str, dict[str, dict[str, Any]]
     require(set(boundary) == {
         "repository.branch-policy", "dev.jev-api.provider", "dev.rent-tunnel.provider", "dev.rent-access-probe.provider",
         "dev.rent-state-proof.provider", "dev.jev-api-oci-dev.provider", "apps.voice-ui.consumer", "ops.voice-ui.consumer",
-        "normal.consumer.path",
+        "normal.consumer.path", "dev.rent-client.provider", WINDOWS_CONSUMER,
     }, "provider-consumer boundary set differs")
     require(boundary["dev.rent-tunnel.provider"] == expected_rent_boundary(), "rent tunnel provider boundary differs")
+    require(boundary["dev.rent-client.provider"] == expected_client_boundary(), "rent client provider boundary differs")
+    source = boundary[WINDOWS_CONSUMER].get("distribution_source")
+    require(isinstance(source, str) and SHA40.fullmatch(source) is not None
+            and boundary[WINDOWS_CONSUMER] == expected_windows_consumer(source), "windows rent consumer boundary differs")
     require(boundary["dev.rent-access-probe.provider"] == expected_probe_boundary(), "access probe provider boundary differs")
     require(boundary["dev.rent-state-proof.provider"] == expected_state_boundary(), "state proof provider boundary differs")
     require(boundary["dev.jev-api-oci-dev.provider"] == expected_oci_boundary(), "OCI dev provider boundary differs")
@@ -517,6 +584,14 @@ def validate_rent_ciphertext(data: bytes, token: bytes | None, recipient: str | 
     require(set(re.findall(r"(?m)^([^\s#][^:]*):", text)) == {RENT_KEY, "sops"}, "rent tunnel ciphertext fields differ")
 
 
+def validate_client_ciphertext(data: bytes, values: Sequence[bytes] | None, recipient: str | None) -> None:
+    for index, key in enumerate(CLIENT_KEYS):
+        validate_ciphertext(data, None if values is None else values[index], None if recipient is None else [recipient], key=key)
+    text = data.decode("utf-8", errors="strict")
+    require(len(RECIPIENT_METADATA.findall(text)) == 1, "rent client ciphertext must have exactly one recipient")
+    require(set(re.findall(r"(?m)^([^\s#][^:]*):", text)) == {*CLIENT_KEYS, "sops"}, "rent client ciphertext fields differ")
+
+
 def validate_oci_ciphertext(data: bytes, secret: bytes | None, recipient: str | None) -> None:
     validate_ciphertext(data, secret, None if recipient is None else [recipient])
     text = data.decode("utf-8", errors="strict")
@@ -539,7 +614,7 @@ def reject_live_values(root: Path, name: str, values: list[str]) -> None:
     for path in repository_files(root):
         relative = path.relative_to(root).as_posix()
         data = path.read_bytes()
-        if relative in {CIPHERTEXT.as_posix(), RENT_CIPHERTEXT.as_posix(), OCI_CIPHERTEXT.as_posix()}:
+        if relative in {CIPHERTEXT.as_posix(), RENT_CIPHERTEXT.as_posix(), CLIENT_CIPHERTEXT.as_posix(), OCI_CIPHERTEXT.as_posix()}:
             data = without_recipient_metadata(data.decode("utf-8", errors="replace")).encode()
         for value in values:
             require(value.encode() not in data, f"{relative}: live {name} value is stored in Git")
@@ -790,6 +865,52 @@ def rent_author(root: Path = ROOT, runner: Runner = default_runner, fetch: Fetch
     validate_contracts(root)
     return {
         "kind": "envs.rentTunnelAuthoringResult.v1", "status": "PASS", "ciphertext": RENT_CIPHERTEXT.as_posix(),
+        "recipient_count": 1, "target_apply": "NOT_RUN", "client_access": "UNPROVED",
+    }
+
+
+def encrypt_client_credential(client_id: str, secret: str, recipient: str, tools: Mapping[str, str],
+                              runner: Runner = default_runner) -> bytes:
+    # Both values reach SOPS on stdin only; each must be one line of the windows slot rule, for exactly one recipient.
+    require(AGE_RECIPIENT.fullmatch(recipient) is not None, "rent client needs exactly one age recipient")
+    require(SLOT_LINE.fullmatch(client_id) is not None and SLOT_LINE.fullmatch(secret) is not None,
+            "invalid Access client credential")
+    payload = json.dumps(dict(zip(CLIENT_KEYS, (client_id, secret))), separators=(",", ":")).encode() + b"\n"
+    result = run_checked(
+        [tools["sops"], "--encrypt", "--input-type", "json", "--output-type", "yaml", "/dev/stdin"],
+        input_data=payload,
+        env=clean_env(tools, {"SOPS_AGE_RECIPIENTS": recipient}),
+        runner=runner,
+        label="SOPS encryption",
+    )
+    validate_client_ciphertext(result.stdout, (client_id.encode(), secret.encode()), recipient)
+    return result.stdout
+
+
+def client_author(credentials: bytes, root: Path = ROOT, runner: Runner = default_runner) -> dict[str, Any]:
+    # The persistent root's sensitive `credentials` output (tofu output -json credentials) arrives on stdin; only its
+    # service token pair is projected. Nothing is printed but this result, which carries no value.
+    contracts = validate_contracts(root)
+    tools = toolchain(root)
+    inputs = gate(root, contracts, CLIENT_PLANE)
+    require(len(credentials) <= RESPONSE_LIMIT, "root output exceeds its bound")
+    try:
+        value = json.loads(credentials)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise EnvsError("root output is not JSON") from None
+    require(isinstance(value, dict) and set(value) == set(PROBE_CREDENTIALS), "root output is not the credentials object")
+    client_id, secret = value["service_token_id"], value["service_token_value"]
+    require(isinstance(client_id, str) and isinstance(secret, str) and SLOT_LINE.fullmatch(client_id) is not None
+            and SLOT_LINE.fullmatch(secret) is not None, "invalid Access client credential")
+    reject_live_values(root, "rent client credential", [client_id, secret])
+    data = encrypt_client_credential(client_id, secret, inputs[CLIENT_RECIPIENT], tools, runner)
+    target = root / CLIENT_CIPHERTEXT
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(data)
+    set_dev_active(root, True, (CLIENT_PLANE,))
+    validate_contracts(root)
+    return {
+        "kind": "envs.rentClientAuthoringResult.v1", "status": "PASS", "ciphertext": CLIENT_CIPHERTEXT.as_posix(),
         "recipient_count": 1, "target_apply": "NOT_RUN", "client_access": "UNPROVED",
     }
 
@@ -1930,6 +2051,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     author_parser = sub.add_parser("author")
     author_parser.add_argument("--target", required=True, choices=AUTHOR_TARGETS)
     sub.add_parser("rent-tunnel")
+    # The root's sensitive credentials output on stdin only, never an argument, environment value or file.
+    sub.add_parser("rent-client")
     sub.add_parser("rent-access-probe")
     sub.add_parser("rent-access-locate")
     sub.add_parser("rent-state-proof")
@@ -1961,6 +2084,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(result, indent=2, sort_keys=True))
         elif args.command == "rent-tunnel":
             print(json.dumps(rent_author(root), indent=2, sort_keys=True))
+        elif args.command == "rent-client":
+            print(json.dumps(client_author(sys.stdin.buffer.read(RESPONSE_LIMIT + 1), root), indent=2, sort_keys=True))
         elif args.command in {"rent-access-probe", "rent-access-locate"}:
             result = access_probe(root, locate_only=args.command == "rent-access-locate")
             print(json.dumps(result, indent=2, sort_keys=True))
@@ -1984,7 +2109,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             print(json.dumps({"kind": receipt["kind"], "status": "PASS", "output": str(args.output)}, sort_keys=True))
     except (EnvsError, OSError) as exc:
-        label = {"rent-tunnel": "RENT_TUNNEL", "rent-access-probe": "RENT_ACCESS_PROBE",
+        label = {"rent-tunnel": "RENT_TUNNEL", "rent-client": "RENT_CLIENT", "rent-access-probe": "RENT_ACCESS_PROBE",
                  "rent-access-locate": "RENT_ACCESS_PROBE", "rent-state-proof": "RENT_STATE_PROOF"}.get(args.command, "JEV_API")
         print(f"{label}=RED: {exc}", file=sys.stderr)
         return 1

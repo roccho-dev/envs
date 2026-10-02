@@ -52,6 +52,399 @@ jobs:
         if: github.ref_name == 'main'
         run: python3 checks/repository.py --verify-main-compatibility-refresh
 
+  # placement-gate (windows #14): the actual CI outputs for each platform in one run of this exact source.
+  # placement-artifact builds the small Windows placement distribution; placement-author projects synthetic envelopes
+  # with the provided Linux artifact; placement-windows binds the exact published windows Release and runs place.ps1
+  # into windows' own released stdin reader; placement-rent runs the receiver in the rent image that Release names.
+  # Synthetic values only: no provider, real target, packaged Codex, -Mode RentAccess host glue or WSLC is proven.
+  placement-artifact:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      ENVS_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - name: Checkout exact source commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Install pinned Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
+        with:
+          extra_nix_config: |
+            extra-experimental-features = nix-command flakes
+
+      - name: Build the Windows placement distribution
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$ENVS_SOURCE_SHA"
+          nix build .#placement-artifact --no-update-lock-file --print-build-logs --out-link "$RUNNER_TEMP/placement"
+          test "$(cat "$RUNNER_TEMP/placement/SOURCE")" = "$ENVS_SOURCE_SHA"
+          echo "cb6fec76e23cb4ac56771ac38472b0fe1ba79a849bf2200aeda7c9467a045b7b  $RUNNER_TEMP/placement/sops.exe" | sha256sum -c -
+          cmp adapters/place.ps1 "$RUNNER_TEMP/placement/place.ps1"
+          cmp adapters/rent-receive.sh "$RUNNER_TEMP/placement/rent-receive.sh"
+          mkdir "$RUNNER_TEMP/provide-placement"
+          cp -RL "$RUNNER_TEMP/placement/." "$RUNNER_TEMP/provide-placement/"
+
+      - name: Provide the Windows placement distribution
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: envs-placement-${{ env.ENVS_SOURCE_SHA }}
+          path: ${{ runner.temp }}/provide-placement/
+          if-no-files-found: error
+
+  placement-author:
+    needs: toolchain
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      ENVS_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - name: Checkout exact source commit as data root
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Obtain the provided Linux artifact of this run
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: envs-effect-${{ env.ENVS_SOURCE_SHA }}
+          path: ${{ runner.temp }}/effect
+
+      - name: Obtain the synthetic placement identities of this run
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: placement-identities-${{ env.ENVS_SOURCE_SHA }}
+          path: ${{ runner.temp }}/placement-identities
+
+      # The provided entry projects a synthetic root output (stdin) into the client envelope; the adapter of the same
+      # commit seals a synthetic tunnel token with the closure sops. Values stay in shell variables and pipes.
+      - name: Synthetic envelopes from the provided Linux artifact
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$ENVS_SOURCE_SHA"
+          test "$(tar -xOf "$RUNNER_TEMP/effect/envs-effect.tar" SOURCE)" = "$ENVS_SOURCE_SHA"
+          entry="$(tar -xOf "$RUNNER_TEMP/effect/envs-effect.tar" ENTRY)"
+          [[ "$entry" =~ ^/nix/store/[0-9a-z]{32}-envs-effect-toolchain/bin/envs-effect$ ]]
+          sudo mkdir -p /nix/store
+          sudo tar -x -C / -f "$RUNNER_TEMP/effect/envs-effect.tar" nix/store
+          tool="${entry%/envs-effect}"
+          keys="$RUNNER_TEMP/placement-identities"
+          out="$RUNNER_TEMP/placement-inputs"
+          data="$RUNNER_TEMP/data"
+          mkdir "$out" "$data"
+          git archive HEAD | tar -x -C "$data"
+          client_id="ci$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n').access"
+          client_secret="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+          tunnel="$(head -c 96 /dev/urandom | base64 -w0)"
+          printf '{"tunnel_token":"%s","service_token_id":"%s","service_token_value":"%s"}' "$tunnel" "$client_id" "$client_secret" |
+            RENT_CLIENT_AGE_RECIPIENT="$(cat "$keys/client.pub")" "$entry" --root "$data" rent-client
+          cp "$data/ciphertexts/dev-rent-client.sops.yaml" "$out/client.sops.yaml"
+          printf '%s' "$tunnel" | "$tool/python3" -I -c 'import importlib.util, sys
+          spec = importlib.util.spec_from_file_location("jev", sys.argv[1]); jev = importlib.util.module_from_spec(spec); spec.loader.exec_module(jev)
+          sys.stdout.buffer.write(jev.encrypt_rent_token(sys.stdin.read(), sys.argv[2], {"sops": sys.argv[3]}))' \
+            "$data/adapters/jev_api.py" "$(cat "$keys/rent.pub")" "$tool/sops" >"$out/rent.sops.yaml"
+          # A well-formed envelope whose client ID is far beyond the slot bound: place.ps1 must stop reading it.
+          printf '{"RENT_ACCESS_CLIENT_ID":"%s","RENT_ACCESS_CLIENT_SECRET":"x"}' "$(head -c 300000 /dev/zero | tr '\0' a)" |
+            SOPS_AGE_RECIPIENTS="$(cat "$keys/client.pub")" "$tool/sops" --encrypt --input-type json --output-type yaml /dev/stdin >"$out/oversize.sops.yaml"
+          SOPS_AGE_KEY_FILE="$keys/client.key" "$tool/sops" --decrypt --input-type yaml --output-type json "$out/client.sops.yaml" |
+            CID="$client_id" CSECRET="$client_secret" jq -e '. == {RENT_ACCESS_CLIENT_ID: env.CID, RENT_ACCESS_CLIENT_SECRET: env.CSECRET}' >/dev/null
+          # The synthetic values and the slot digests the targets must receive, for the gate jobs' checks only.
+          printf '{"client_id":"%s","client_secret":"%s","tunnel":"%s","client_slot_sha256":"%s","tunnel_sha256":"%s"}\n' \
+            "$client_id" "$client_secret" "$tunnel" \
+            "$(printf '%s\n%s\n' "$client_id" "$client_secret" | sha256sum | cut -d ' ' -f 1)" \
+            "$(printf '%s' "$tunnel" | sha256sum | cut -d ' ' -f 1)" >"$out/values.json"
+
+      - name: Provide the synthetic placement inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: placement-inputs-${{ env.ENVS_SOURCE_SHA }}
+          path: ${{ runner.temp }}/placement-inputs/
+          if-no-files-found: error
+          retention-days: 1
+
+  placement-windows:
+    needs: [placement-artifact, placement-author]
+    runs-on: windows-latest
+    timeout-minutes: 20
+    outputs:
+      rent_image: ${{ steps.release.outputs.rent_image }}
+      windows_source: ${{ steps.release.outputs.windows_source }}
+    env:
+      ENVS_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - name: Checkout exact source commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Obtain the Windows placement distribution of this run
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: envs-placement-${{ env.ENVS_SOURCE_SHA }}
+          path: ${{ runner.temp }}/placement
+
+      - name: Obtain the synthetic placement inputs of this run
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: placement-inputs-${{ env.ENVS_SOURCE_SHA }}
+          path: ${{ runner.temp }}/placement-inputs
+
+      - name: Obtain the synthetic placement identities of this run
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: placement-identities-${{ env.ENVS_SOURCE_SHA }}
+          path: ${{ runner.temp }}/placement-identities
+
+      # Gate A: the windows Release of the exact declared source, published by github-actions[bot] from a push run whose
+      # publication chain passed (scope, build, the Windows proof, the rent image job, publish), with every asset equal to
+      # GitHub's own asset digest; the client distribution's bytes equal its .sha256, rent-image.json names this source.
+      - name: Bind the exact published windows Release
+        id: release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Api([string]$Path, [string[]]$Fields = @()) {
+            $argv = @('api', '-X', 'GET', $Path) + @($Fields | ForEach-Object { '-f'; $_ })
+            $text = (& gh @argv) -join "`n"
+            if ($LASTEXITCODE -ne 0) { throw "GitHub read failed: $Path" }
+            return $text | ConvertFrom-Json
+          }
+          function Sha([string]$Path) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() }
+          $consumer = @(Get-Content contracts/provider-consumer.jsonl | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.id -ceq 'windows.rent.consumer' })
+          $source = $consumer[0].distribution_source
+          if ($consumer.Count -ne 1 -or $source -cnotmatch '^[0-9a-f]{40}$') { throw 'no exact windows distribution source' }
+          $repo, $tag = 'repos/roccho-dev/windows', "windows-$source"
+          $ref = Api "$repo/git/ref/tags/$tag"
+          if ($ref.object.type -cne 'commit' -or $ref.object.sha -cne $source) { throw 'the Release tag does not name the exact windows commit' }
+          $release = Api "$repo/releases/tags/$tag"
+          if ($release.author.login -cne 'github-actions[bot]' -or $release.draft) { throw 'the Release is not a published github-actions[bot] Release' }
+          $assets = @($release.assets)
+          if ((@($assets.name | Sort-Object) -join ',') -cne 'rent-image.json,windows-dist.zip,windows-dist.zip.sha256') { throw 'the Release asset set differs' }
+          foreach ($asset in $assets) {
+            if ($asset.uploader.login -cne 'github-actions[bot]' -or [string]$asset.digest -cnotmatch '^sha256:[0-9a-f]{64}$') { throw "asset $($asset.name) has no trusted uploader or digest" }
+          }
+          $required = 'scope', 'build', 'windows', 'rent / build-test-publish', 'publish'
+          $published = $null
+          foreach ($run in @((Api "$repo/actions/runs" @("head_sha=$source", 'event=push', 'per_page=20')).workflow_runs)) {
+            if ($run.path -cne '.github/workflows/ci.yml' -or $run.head_branch -cne 'proposals' -or $run.head_sha -cne $source) { continue }
+            $jobs = @((Api "$repo/actions/runs/$($run.id)/jobs" @('per_page=100')).jobs)
+            if (@($required | Where-Object { $name = $_; -not @($jobs | Where-Object { $_.name -ceq $name -and $_.conclusion -ceq 'success' }).Count }).Count -eq 0) { $published = $run; break }
+          }
+          if ($null -eq $published) { throw 'no push run of the exact windows source passed its publication chain' }
+          $dir = Join-Path $env:RUNNER_TEMP 'windows-release'
+          & gh release download $tag --repo roccho-dev/windows --dir $dir
+          if ($LASTEXITCODE -ne 0) { throw 'the Release assets could not be read' }
+          foreach ($asset in $assets) {
+            if ('sha256:' + (Sha (Join-Path $dir $asset.name)) -cne $asset.digest) { throw "asset $($asset.name) differs from its GitHub digest" }
+          }
+          $zip = Join-Path $dir 'windows-dist.zip'
+          if ((Get-Content -LiteralPath "$zip.sha256" -Raw).Split(' ')[0] -cne (Sha $zip)) { throw 'windows-dist.zip differs from its published .sha256' }
+          $image = Get-Content -LiteralPath (Join-Path $dir 'rent-image.json') -Raw | ConvertFrom-Json
+          if ($image.kind -cne 'windows.rentImage.v1' -or $image.source -cne $source -or $image.image -cnotmatch '^ghcr\.io/roccho-dev/windows-rent@sha256:[0-9a-f]{64}$') { throw 'rent-image.json does not bind this source to one pushed image' }
+          Expand-Archive -LiteralPath $zip -DestinationPath (Join-Path $env:RUNNER_TEMP 'windows-dist')
+          "windows Release ${tag}: run $($published.id), windows-dist.zip $(Sha $zip), rent image $($image.image)"
+          "rent_image=$($image.image)" >> $env:GITHUB_OUTPUT
+          "windows_source=$source" >> $env:GITHUB_OUTPUT
+
+      # The actual place.ps1 in Windows PowerShell 5.1 hands the client credential to windows' own released stdin reader
+      # and slot rule (ReadRentAccessInput, Get-RentAccessProblem from the bound windows-dist), started exactly as it
+      # starts win.ps1 -Mode RentAccess. The host caller, ledger and slot write were proved by the windows proof.
+      - name: place.ps1 into the released Windows stdin reader, with leak and refusal checks
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $temp = $env:RUNNER_TEMP
+          $placement, $inputs, $keys = "$temp\placement", "$temp\placement-inputs", "$temp\placement-identities"
+          $values = Get-Content -LiteralPath "$inputs\values.json" -Raw | ConvertFrom-Json
+          $harness = New-Item -ItemType Directory -Path "$temp\reader"
+          Set-Content -LiteralPath "$harness\win.ps1" -Encoding ascii -Value @'
+          param([string]$Mode)
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          if ($Mode -cne 'RentAccess') { exit 9 }
+          $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $env:PLACEMENT_WINDOWS_DIST 'win.ps1'), [ref]$null, [ref]$null)
+          foreach ($d in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -cin @('ReadRentAccessInput', 'Get-RentAccessProblem') }, $false)) { . ([scriptblock]::Create($d.Extent.Text)) }
+          $bytes = ReadRentAccessInput
+          $problem = Get-RentAccessProblem $bytes
+          $hash = [Security.Cryptography.SHA256]::Create()
+          $me = @(([wmisearcher]"SELECT CommandLine, ParentProcessId FROM Win32_Process WHERE ProcessId = $PID").Get())[0]
+          $parent = @(([wmisearcher]"SELECT CommandLine FROM Win32_Process WHERE ProcessId = $($me.ParentProcessId)").Get())[0]
+          @{ problem = $problem; length = $bytes.Length; sha256 = (-join ($hash.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') }))
+             commandLines = @([string]$me.CommandLine, [string]$parent.CommandLine) } | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:PLACEMENT_VERDICT -Encoding ascii
+          if ($problem) { exit 3 }
+          exit 0
+          '@
+          Set-Content -LiteralPath "$temp\driver.ps1" -Encoding ascii -Value @'
+          param([string]$Placement, [string]$Identity, [string]$Envelope, [string]$Reader, [string]$Transcript)
+          Start-Transcript -LiteralPath $Transcript | Out-Null
+          & (Join-Path $Placement 'place.ps1') -Target client -Identity $Identity -Ciphertext $Envelope -WindowsDist $Reader
+          $code = $LASTEXITCODE
+          Stop-Transcript | Out-Null
+          exit $code
+          '@
+          function Place([string]$Identity, [string]$Envelope) {
+            $id = [guid]::NewGuid().ToString('N')
+            $verdict, $transcript = "$temp\verdict-$id.json", "$temp\transcript-$id.txt"
+            $info = [Diagnostics.ProcessStartInfo]::new("$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe",
+              "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$temp\driver.ps1`" -Placement `"$placement`" -Identity `"$Identity`" -Envelope `"$Envelope`" -Reader `"$harness`" -Transcript `"$transcript`"")
+            $info.UseShellExecute = $false; $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
+            $info.EnvironmentVariables.Remove('PSModulePath')
+            $info.EnvironmentVariables['PLACEMENT_WINDOWS_DIST'] = "$temp\windows-dist"
+            $info.EnvironmentVariables['PLACEMENT_VERDICT'] = $verdict
+            $process = [Diagnostics.Process]::Start($info)
+            $out, $err = $process.StandardOutput.ReadToEndAsync(), $process.StandardError.ReadToEndAsync()
+            if (-not $process.WaitForExit(120000)) { $process.Kill($true); throw 'place.ps1 did not finish' }
+            $process.WaitForExit()
+            $seen = $out.Result + $err.Result + $(if (Test-Path -LiteralPath $transcript) { [IO.File]::ReadAllText($transcript) } else { '' })
+            if ($seen.Contains($values.client_secret) -or $seen.Contains($values.client_id)) { throw 'a credential reached ordinary output, the transcript or the log' }
+            [pscustomobject]@{ code = $process.ExitCode; stderr = $err.Result
+              verdict = $(if (Test-Path -LiteralPath $verdict) { Get-Content -LiteralPath $verdict -Raw | ConvertFrom-Json } else { $null }) }
+          }
+          $placed = Place "$keys\client.key" "$inputs\client.sops.yaml"
+          if ($placed.code -ne 0 -or $null -eq $placed.verdict -or $null -ne $placed.verdict.problem -or $placed.verdict.sha256 -cne $values.client_slot_sha256) { throw "the released reader did not accept the exact slot bytes (exit $($placed.code))" }
+          if (@($placed.verdict.commandLines | Where-Object { $_.Contains($values.client_secret) -or $_.Contains($values.client_id) }).Count) { throw 'a credential reached a command line' }
+          $wrong = Place "$keys\rent.key" "$inputs\client.sops.yaml"
+          if ($wrong.code -ne 2 -or $null -ne $wrong.verdict -or $wrong.stderr -notlike 'place: decryption failed; nothing placed.*') { throw 'a wrong identity was not refused before the writer' }
+          $text = [IO.File]::ReadAllText("$inputs\client.sops.yaml")
+          $start = $text.IndexOf('ENC[AES256_GCM,data:') + 20
+          [IO.File]::WriteAllText("$temp\tampered.sops.yaml", $text.Substring(0, $start) + $(if ($text[$start] -ceq 'A') { 'B' } else { 'A' }) + $text.Substring($start + 1))
+          $tampered = Place "$keys\client.key" "$temp\tampered.sops.yaml"
+          if ($tampered.code -ne 2 -or $null -ne $tampered.verdict) { throw 'a tampered envelope was not refused before the writer' }
+          $oversize = Place "$keys\client.key" "$inputs\oversize.sops.yaml"
+          if ($oversize.code -ne 2 -or $null -ne $oversize.verdict -or $oversize.stderr -notlike 'place: the decrypted value exceeds its bound; nothing placed.*') { throw 'an oversized value was not stopped at its bound' }
+          # The rent branch refuses a non-digest image before any decryption; running it through WSLC is a deployment gate.
+          $info = [Diagnostics.ProcessStartInfo]::new("$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe",
+            "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$placement\place.ps1`" -Target rent -Identity `"$keys\rent.key`" -Ciphertext `"$inputs\rent.sops.yaml`" -RentImage ghcr.io/roccho-dev/windows-rent:latest")
+          $info.UseShellExecute = $false; $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true; $info.EnvironmentVariables.Remove('PSModulePath')
+          $process = [Diagnostics.Process]::Start($info); $err = $process.StandardError.ReadToEndAsync(); $null = $process.StandardOutput.ReadToEndAsync()
+          if (-not $process.WaitForExit(60000)) { $process.Kill($true); throw 'place.ps1 -Target rent did not finish' }
+          if ($process.ExitCode -ne 2 -or $err.Result -notlike 'place: the rent image is not one exact digest; nothing placed.*') { throw 'a tag-named rent image was not refused' }
+          foreach ($file in Get-ChildItem -LiteralPath $temp -Recurse -File | Where-Object { $_.FullName -ne "$inputs\values.json" }) {
+            $bytes = [IO.File]::ReadAllBytes($file.FullName)
+            if ([Text.Encoding]::ASCII.GetString($bytes).Contains($values.client_secret)) { throw "a credential reached the file $($file.Name)" }
+          }
+          'place.ps1 -> released ReadRentAccessInput/Get-RentAccessProblem: exact slot bytes; wrong identity and tampered envelope refused before the writer; no credential in output, transcript, command lines or files'
+
+  placement-rent:
+    needs: [toolchain, placement-artifact, placement-author, placement-windows]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      ENVS_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      RENT_IMAGE: ${{ needs.placement-windows.outputs.rent_image }}
+      WINDOWS_SOURCE: ${{ needs.placement-windows.outputs.windows_source }}
+    steps:
+      - name: Obtain the provided Linux artifact of this run
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: envs-effect-${{ env.ENVS_SOURCE_SHA }}
+          path: ${{ runner.temp }}/effect
+
+      - name: Obtain the Windows placement distribution of this run
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: envs-placement-${{ env.ENVS_SOURCE_SHA }}
+          path: ${{ runner.temp }}/placement
+
+      - name: Obtain the synthetic placement inputs of this run
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: placement-inputs-${{ env.ENVS_SOURCE_SHA }}
+          path: ${{ runner.temp }}/placement-inputs
+
+      - name: Obtain the synthetic placement identities of this run
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: placement-identities-${{ env.ENVS_SOURCE_SHA }}
+          path: ${{ runner.temp }}/placement-identities
+
+      # The rent image the bound Release names, by digest; the registry tag must still resolve to that digest.
+      # rent-receive.sh from the placement distribution runs in it on a scratch state volume, fed by the closure sops
+      # through a pipe. Docker stands in for WSLC here: this proves the receiver, not WSLC.
+      - name: rent-receive.sh in the released rent image
+        run: |
+          set -euo pipefail
+          [[ "$RENT_IMAGE" =~ ^ghcr\.io/roccho-dev/windows-rent@(sha256:[0-9a-f]{64})$ ]]
+          digest="${BASH_REMATCH[1]}"
+          [[ "$WINDOWS_SOURCE" =~ ^[0-9a-f]{40}$ ]]
+          # Anonymous pull token, passed to curl on stdin, never in argv.
+          token="$(curl -fsS 'https://ghcr.io/token?scope=repository:roccho-dev/windows-rent:pull' | jq -r .token)"
+          remote="$(printf 'header = "Authorization: Bearer %s"\n' "$token" | curl -fsSI -K - \
+            -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+            "https://ghcr.io/v2/roccho-dev/windows-rent/manifests/sha-$WINDOWS_SOURCE" | tr -d '\r' | sed -nE 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: (sha256:[0-9a-f]{64})$/\1/p')"
+          test "$remote" = "$digest"
+          docker pull "$RENT_IMAGE"
+          test "$(tar -xOf "$RUNNER_TEMP/effect/envs-effect.tar" SOURCE)" = "$ENVS_SOURCE_SHA"
+          test "$(cat "$RUNNER_TEMP/placement/SOURCE")" = "$ENVS_SOURCE_SHA"
+          entry="$(tar -xOf "$RUNNER_TEMP/effect/envs-effect.tar" ENTRY)"
+          [[ "$entry" =~ ^/nix/store/[0-9a-z]{32}-envs-effect-toolchain/bin/envs-effect$ ]]
+          sudo mkdir -p /nix/store
+          sudo tar -x -C / -f "$RUNNER_TEMP/effect/envs-effect.tar" nix/store
+          tool="${entry%/envs-effect}"
+          receiver="$(cat "$RUNNER_TEMP/placement/rent-receive.sh")"
+          values="$RUNNER_TEMP/placement-inputs/values.json"
+          docker volume create rent-placement-state >/dev/null
+          place() {
+            SOPS_AGE_KEY_FILE="$RUNNER_TEMP/placement-identities/rent.key" "$tool/sops" --decrypt --input-type yaml \
+              --extract '["RENT_TUNNEL_TOKEN"]' "$RUNNER_TEMP/placement-inputs/rent.sops.yaml" | tr -d '\r\n' |
+              docker run --rm -i -v rent-placement-state:/var/lib/rent "$RENT_IMAGE" /bin/bash -c "$receiver"
+          }
+          slot() { docker run --rm -v rent-placement-state:/s "$RENT_IMAGE" /bin/bash -c "$1"; }
+          receive() { docker run --rm -i -v rent-placement-state:/var/lib/rent "$RENT_IMAGE" /bin/bash -c "$receiver"; }
+          token_sha() { slot 'sha256sum /s/cloudflared/token' | cut -d ' ' -f 1; }
+          test "$(place)" = "rent-receive: placed"
+          test "$(slot 'stat -c %u:%g:%a /s/cloudflared/token')" = "0:0:600"
+          test "$(token_sha)" = "$(jq -r .tunnel_sha256 "$values")"
+          test "$(place)" = "rent-receive: unchanged"
+          for bad in '' '   ' "$(head -c 4097 /dev/zero | tr '\0' a)"; do
+            if printf '%s' "$bad" | receive; then
+              echo "an invalid token was placed" >&2
+              exit 1
+            fi
+          done
+          test "$(token_sha)" = "$(jq -r .tunnel_sha256 "$values")"
+          # Rotation replaces only the owned slot; a slot of another owner or mode is refused and kept as found.
+          other="$(head -c 96 /dev/urandom | base64 -w0)"
+          test "$(printf '%s' "$other" | receive)" = "rent-receive: placed"
+          test "$(token_sha)" = "$(printf '%s' "$other" | sha256sum | cut -d ' ' -f 1)"
+          for drift in 'chmod 644 /s/cloudflared/token' 'chown 1000:1000 /s/cloudflared/token'; do
+            slot "$drift"
+            before="$(slot 'stat -c %u:%g:%a /s/cloudflared/token')"
+            if place; then
+              echo "a drifted slot was replaced: $drift" >&2
+              exit 1
+            fi
+            test "$(slot 'stat -c %u:%g:%a /s/cloudflared/token')" = "$before"
+            test "$(token_sha)" = "$(printf '%s' "$other" | sha256sum | cut -d ' ' -f 1)"
+            slot 'chown 0:0 /s/cloudflared/token && chmod 600 /s/cloudflared/token'
+          done
+          # A parent another user could change, at either level, is refused before input: the slot keeps its bytes,
+          # owner and mode and no temp file appears. A safe parent of another mode (755) is still accepted.
+          root_mode="$(slot 'stat -c %a /s')"
+          for pair in 'chmod 777 /s/cloudflared|chmod 700 /s/cloudflared' 'chmod 770 /s/cloudflared|chmod 700 /s/cloudflared' \
+            'chown 1000:0 /s/cloudflared|chown 0:0 /s/cloudflared' "chmod 775 /s|chmod $root_mode /s" 'chown 1000:0 /s|chown 0:0 /s'; do
+            before="$(slot 'stat -c %u:%g:%a:%s /s/cloudflared/token')"
+            slot "${pair%%|*}"
+            if place; then
+              echo "an unsafe parent was accepted: ${pair%%|*}" >&2
+              exit 1
+            fi
+            slot "${pair#*|}"
+            test "$(slot 'stat -c %u:%g:%a:%s /s/cloudflared/token')" = "$before"
+            test "$(token_sha)" = "$(printf '%s' "$other" | sha256sum | cut -d ' ' -f 1)"
+            test -z "$(slot 'ls -A /s/cloudflared | grep -v ^token$ || true')"
+          done
+          slot 'chmod 755 /s/cloudflared'
+          test "$(printf '%s' "$other" | receive)" = "rent-receive: unchanged"
+          test -z "$(slot 'ls -A /s/cloudflared | grep -v ^token$ || true')"
+          echo "rent-receive.sh in $RENT_IMAGE: placed 0:0 600 exact token, same value unchanged, rotated; blank, whitespace, oversized and drifted (mode, owner) slots and writable or foreign parents (slot directory and state root) refused and kept; a 755 parent accepted"
+
   toolchain:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -178,6 +571,26 @@ jobs:
           set -euo pipefail
           tool="$RUNNER_TEMP/envs-effect/bin"
           "$tool/python3" -I checks/test_jev_api.py --sops "$tool/sops" --age-keygen "$RUNNER_TEMP/check-age/bin/age-keygen"
+
+      # Throwaway identities for the placement gate only, made by the check-only age; the gate's envelopes are
+      # encrypted to them. They never enter the effect toolchain or the placement distribution.
+      - name: Synthetic placement identities from the check-only age
+        run: |
+          set -euo pipefail
+          keys="$RUNNER_TEMP/placement-identities"
+          mkdir "$keys"
+          for name in client rent; do
+            "$RUNNER_TEMP/check-age/bin/age-keygen" -o "$keys/$name.key" 2>/dev/null
+            "$RUNNER_TEMP/check-age/bin/age-keygen" -y "$keys/$name.key" >"$keys/$name.pub"
+          done
+
+      - name: Provide the synthetic placement identities
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: placement-identities-${{ env.ENVS_SOURCE_SHA }}
+          path: ${{ runner.temp }}/placement-identities/
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Missing or mismatched toolchain is RED
         run: |

@@ -1,1 +1,3 @@
 {"id":"g6i3","kind":"envs.target.v1","platform":"linux","architecture":"amd64","required_capabilities":["git","nix","tailscale"],"observation_owner":"roccho-dev/ops"}
+{"id":"pc7337-rent","kind":"envs.target.v1","platform":"linux","architecture":"amd64","runtime":"wslc_one_shot","slot":"/var/lib/rent/cloudflared/token","slot_owner":"roccho-dev/windows","placement":"place.ps1 -Target rent","observation_owner":"roccho-dev/windows"}
+{"id":"g6i3-windows-user","kind":"envs.target.v1","platform":"windows","architecture":"amd64","runtime":"windows_powershell_5_1_normal_user","slot":"%USERPROFILE%\\.ssh\\windows-rent\\access","slot_owner":"roccho-dev/windows","placement":"place.ps1 -Target client","observation_owner":"roccho-dev/windows"}

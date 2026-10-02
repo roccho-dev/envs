@@ -238,6 +238,101 @@ def test_fetch_boundary() -> None:
     assert jev.NoRedirect().redirect_request(request, None, 302, "Found", {}, "https://example.invalid/") is None
 
 
+# Rent client (windows #14): the root's credentials output projected to one recipient; values generated per run.
+CLIENT_ID = "ci" + secrets.token_hex(16) + ".access"
+CLIENT_SECRET = secrets.token_hex(32)
+
+
+def credentials(**overrides: object) -> bytes:
+    value: dict[str, object] = {"tunnel_token": TOKEN, "service_token_id": CLIENT_ID, "service_token_value": CLIENT_SECRET}
+    value.update(overrides)
+    return json.dumps({key: item for key, item in value.items() if item is not None}).encode()
+
+
+def client_ciphertext(recipients: tuple[str, ...] = (RECIPIENT,), keys: tuple[str, ...] = jev.CLIENT_KEYS, extra: str = "") -> bytes:
+    lines = "".join(f"    - recipient: {item}\n" for item in recipients)
+    fields = "".join(f"{key}: ENC[AES256_GCM,data:fixture]\n" for key in keys)
+    return f"{fields}{extra}sops:\n  age:\n{lines}".encode()
+
+
+def client_env(**overrides: str) -> dict[str, str]:
+    values = {"ENVS_EFFECT_TOOLCHAIN": fixtures.MANIFEST, jev.CLIENT_RECIPIENT: RECIPIENT}
+    values.update(overrides)
+    return values
+
+
+def test_client_author() -> None:
+    root = fixtures.copy_root()
+    sops = Sops(client_ciphertext())
+    try:
+        with fixtures.environment(client_env()):
+            result = jev.client_author(credentials(), root, sops)
+        assert result == {
+            "kind": "envs.rentClientAuthoringResult.v1", "status": "PASS", "ciphertext": jev.CLIENT_CIPHERTEXT.as_posix(),
+            "recipient_count": 1, "target_apply": "NOT_RUN", "client_access": "UNPROVED",
+        }
+        assert len(sops.calls) == 1
+        argv, stdin, env = sops.calls[0]
+        assert argv == [fixtures.TOOLS["sops"], "--encrypt", "--input-type", "json", "--output-type", "yaml", "/dev/stdin"]
+        # Only the service token pair is projected; the tunnel token in the same output never reaches SOPS.
+        assert json.loads(stdin) == {"RENT_ACCESS_CLIENT_ID": CLIENT_ID, "RENT_ACCESS_CLIENT_SECRET": CLIENT_SECRET}
+        assert set(env) <= SOPS_ENV_KEYS and env["SOPS_AGE_RECIPIENTS"] == RECIPIENT
+        assert not any(value in item for value in (CLIENT_ID, CLIENT_SECRET, TOKEN) for item in [*argv, *env.values()])
+        assert not any(value in json.dumps(result) for value in (CLIENT_ID, CLIENT_SECRET))
+        contracts = jev.validate_contracts(root)
+        assert contracts["environments"][jev.CLIENT_PLANE]["migration_state"] == "ACTIVE"
+        assert contracts["environments"][jev.RENT_PLANE]["migration_state"] == "NOT_CONFIGURED"
+        for path in jev.repository_files(root):
+            data = path.read_bytes()
+            assert not any(value.encode() in data for value in (CLIENT_ID, CLIENT_SECRET, TOKEN)), path
+    finally:
+        shutil.rmtree(root.parent, ignore_errors=True)
+
+
+def expect_client_red(values: dict[str, str], body: bytes, *, mutate=None, output: bytes | None = None,
+                      returncode: int = 0) -> None:
+    root = fixtures.copy_root()
+    sops = Sops(client_ciphertext() if output is None else output, returncode)
+    try:
+        if mutate is not None:
+            mutate(root)
+        before = (root / jev.ENVIRONMENTS).read_bytes()
+        with fixtures.environment(values):
+            try:
+                jev.client_author(body, root, sops)
+            except jev.EnvsError as exc:
+                message = str(exc)
+            else:
+                raise AssertionError("invalid rent client state was accepted")
+        assert not any(value in message for value in (CLIENT_ID, CLIENT_SECRET, TOKEN)), message
+        assert output is not None or not sops.calls, "sops ran before a valid credential"
+        assert not (root / jev.CLIENT_CIPHERTEXT).exists()
+        assert (root / jev.ENVIRONMENTS).read_bytes() == before
+    finally:
+        shutil.rmtree(root.parent, ignore_errors=True)
+
+
+def test_client_red() -> None:
+    expect_client_red(client_env(**{jev.CLIENT_RECIPIENT: ""}), credentials())
+    expect_client_red(client_env(**{jev.CLIENT_RECIPIENT: f"{RECIPIENT},{OTHER_RECIPIENT}"}), credentials())
+    for body in (
+        b"not json", credentials(service_token_value=None), credentials(extra="x"), credentials(service_token_id=7),
+        credentials(service_token_id=""), credentials(service_token_value="two words"), credentials(service_token_id=CLIENT_ID + "\n"),
+        credentials(service_token_value="x" * 1025), credentials(service_token_value="é" + CLIENT_SECRET), b"x" * (jev.RESPONSE_LIMIT + 1),
+    ):
+        expect_client_red(client_env(), body)
+    for value in (CLIENT_ID, CLIENT_SECRET):
+        expect_client_red(client_env(), credentials(), mutate=lambda root, value=value: fixtures.append(root / "README.md", f"\n{value}\n"))
+    for output, returncode in (
+        (client_ciphertext((RECIPIENT, OTHER_RECIPIENT)), 0),
+        (client_ciphertext((OTHER_RECIPIENT,)), 0),
+        (client_ciphertext(keys=jev.CLIENT_KEYS[:1]), 0),
+        (client_ciphertext(extra=f"note: {CLIENT_SECRET}\n"), 0),
+        (client_ciphertext(), 1),
+    ):
+        expect_client_red(client_env(), credentials(), output=output, returncode=returncode)
+
+
 def run(argv: list[str], env: dict[str, str]) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, shell=False)
 
@@ -309,6 +404,18 @@ def real_roundtrip(sops_bin: str, keygen_bin: str) -> None:
         else:
             raise AssertionError("two recipients were accepted")
         assert len(calls) == before, "sops ran for a recipient list"
+
+        # The client envelope: both slot lines, one recipient; each line extracts exactly as place.ps1 reads it.
+        client = jev.encrypt_client_credential(CLIENT_ID, CLIENT_SECRET, recipient, tools, runner)
+        assert CLIENT_ID.encode() not in client and CLIENT_SECRET.encode() not in client
+        client_file = work / "dev-rent-client.sops.yaml"
+        client_file.write_bytes(client)
+        for name, expected in zip(jev.CLIENT_KEYS, (CLIENT_ID, CLIENT_SECRET)):
+            extracted = run([sops_path, "--decrypt", "--input-type", "yaml", "--extract", f'["{name}"]', str(client_file)],
+                            {**base, "SOPS_AGE_KEY_FILE": str(key)})
+            assert extracted.returncode == 0 and extracted.stdout.rstrip(b"\r\n") == expected.encode(), f"{name} extraction differs"
+        refused = decrypt(client_file, other_key)
+        assert refused.returncode != 0 and CLIENT_SECRET.encode() not in refused.stdout + refused.stderr, "another identity decrypted"
         print(f"real SOPS roundtrip: PASS (sops={sops_path}, age-keygen={keygen})")
     finally:
         shutil.rmtree(work, ignore_errors=True)
@@ -328,6 +435,8 @@ def main() -> None:
         test_rent_ciphertext_red()
         test_committed_state_red()
         test_fetch_boundary()
+        test_client_author()
+        test_client_red()
         if args.sops is None:
             print("real SOPS roundtrip: NOT RUN (the check workflow runs it with --sops and --age-keygen)")
         else:

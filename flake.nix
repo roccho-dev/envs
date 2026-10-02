@@ -60,10 +60,25 @@
         tar --create --file "$out" --sort=name --mtime=@1 --owner=0 --group=0 --numeric-owner \
           ENTRY SOURCE $(cat "$closure/store-paths")
       '';
+
+      # Windows placement distribution (windows #14): the official Windows SOPS client of exactly the locked sops
+      # version (its release asset digest, equal to its published checksums.txt), the entrance, the rent receiver and
+      # this exact source's committed ciphertexts. It decrypts on the target; it holds no identity or credential.
+      sops-windows = pkgs.fetchurl {
+        url = "https://github.com/getsops/sops/releases/download/v${pkgs.sops.version}/sops-v${pkgs.sops.version}.amd64.exe";
+        hash = assert pkgs.sops.version == "3.13.2"; "sha256-y2/sduI8tKxWdxrDhHKw/hunmoSb8iAK7afJRnoEW3s=";
+      };
+      placement-artifact = pkgs.runCommand "envs-placement" { } ''
+        mkdir -p "$out"
+        cp ${self}/adapters/place.ps1 ${self}/adapters/rent-receive.sh "$out/"
+        cp ${sops-windows} "$out/sops.exe"
+        echo ${rev} > "$out/SOURCE"
+        if [ -d ${self}/ciphertexts ]; then cp -r ${self}/ciphertexts "$out/ciphertexts"; fi
+      '';
     in
     {
       packages.${system} = {
-        inherit effect-toolchain effect-artifact;
+        inherit effect-toolchain effect-artifact placement-artifact;
         default = effect-toolchain;
         # Check-only: a throwaway identity for the real SOPS roundtrip; never in the effect toolchain or artifact.
         check-age = pkgs.age;

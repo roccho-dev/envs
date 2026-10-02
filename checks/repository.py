@@ -26,6 +26,8 @@ REQUIRED_FILES = {
     "README.md",
     "THIRD_PARTY_NOTICES.md",
     "adapters/jev_api.py",
+    "adapters/place.ps1",
+    "adapters/rent-receive.sh",
     "checks/repository.py",
     "checks/test_jev_api.py",
     "checks/test_rent_access_probe.py",
@@ -84,6 +86,51 @@ FORBIDDEN_FILENAMES = {
     "id_rsa",
 }
 FORBIDDEN_SUFFIXES = {".go", ".p12", ".pem", ".pfx", ".sh"}
+# The one shell text: the rent receiver, which runs inside the rent image and is never executed on this repository.
+RENT_RECEIVER = "adapters/rent-receive.sh"
+PLACEMENT_ENTRY = "adapters/place.ps1"
+# placement-gate (windows #14): the four jobs and the bindings that make each one evidence of the actual outputs.
+PLACEMENT_MARKERS = (
+    "\n  placement-artifact:\n",
+    "\n  placement-author:\n    needs: toolchain\n",
+    "\n  placement-windows:\n    needs: [placement-artifact, placement-author]\n    runs-on: windows-latest\n",
+    "\n  placement-rent:\n    needs: [toolchain, placement-artifact, placement-author, placement-windows]\n",
+    "nix build .#placement-artifact --no-update-lock-file",
+    'test "$(cat "$RUNNER_TEMP/placement/SOURCE")" = "$ENVS_SOURCE_SHA"',
+    'echo "cb6fec76e23cb4ac56771ac38472b0fe1ba79a849bf2200aeda7c9467a045b7b  $RUNNER_TEMP/placement/sops.exe" | sha256sum -c -',
+    "name: envs-placement-${{ env.ENVS_SOURCE_SHA }}",
+    "name: placement-identities-${{ env.ENVS_SOURCE_SHA }}",
+    'test "$(tar -xOf "$RUNNER_TEMP/effect/envs-effect.tar" SOURCE)" = "$ENVS_SOURCE_SHA"',
+    '"$entry" --root "$data" rent-client',
+    "$ref.object.type -cne 'commit' -or $ref.object.sha -cne $source",
+    "$release.author.login -cne 'github-actions[bot]'",
+    "$asset.uploader.login -cne 'github-actions[bot]'",
+    "$required = 'scope', 'build', 'windows', 'rent / build-test-publish', 'publish'",
+    "if ('sha256:' + (Sha (Join-Path $dir $asset.name)) -cne $asset.digest)",
+    "(Get-Content -LiteralPath \"$zip.sha256\" -Raw).Split(' ')[0] -cne (Sha $zip)",
+    "$image.source -cne $source",
+    "$n.Name -cin @('ReadRentAccessInput', 'Get-RentAccessProblem')",
+    "& (Join-Path $Placement 'place.ps1') -Target client",
+    "$placed.verdict.sha256 -cne $values.client_slot_sha256",
+    "$wrong.stderr -notlike 'place: decryption failed; nothing placed.*'",
+    "$tampered.code -ne 2",
+    "manifests/sha-$WINDOWS_SOURCE",
+    'docker run --rm -i -v rent-placement-state:/var/lib/rent "$RENT_IMAGE" /bin/bash -c "$receiver"',
+    "test \"$(slot 'stat -c %u:%g:%a /s/cloudflared/token')\" = \"0:0:600\"",
+    "$oversize.stderr -notlike 'place: the decrypted value exceeds its bound; nothing placed.*'",
+    "-Target rent -Identity",
+    'test "$(place)" = "rent-receive: unchanged"',
+    "for drift in 'chmod 644 /s/cloudflared/token' 'chown 1000:1000 /s/cloudflared/token'; do",
+    "for pair in 'chmod 777 /s/cloudflared|chmod 700 /s/cloudflared' 'chmod 770 /s/cloudflared|chmod 700 /s/cloudflared' \\\n"
+    "            'chown 1000:0 /s/cloudflared|chown 0:0 /s/cloudflared' \"chmod 775 /s|chmod $root_mode /s\" 'chown 1000:0 /s|chown 0:0 /s'; do",
+    'slot \'chmod 755 /s/cloudflared\'\n          test "$(printf \'%s\' "$other" | receive)" = "rent-receive: unchanged"',
+)
+PLACEMENT_FLAKE = (
+    'hash = assert pkgs.sops.version == "3.13.2"; "sha256-y2/sduI8tKxWdxrDhHKw/hunmoSb8iAK7afJRnoEW3s=";',
+    'url = "https://github.com/getsops/sops/releases/download/v${pkgs.sops.version}/sops-v${pkgs.sops.version}.amd64.exe";',
+    "cp ${self}/adapters/place.ps1 ${self}/adapters/rent-receive.sh \"$out/\"",
+    "inherit effect-toolchain effect-artifact placement-artifact;",
+)
 SECRET_PATTERNS = {
     "age private identity": re.compile(rb"AGE-SECRET-KEY-1[0-9A-Z]{20,}"),
     "private key": re.compile(rb"-----BEGIN (?:OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----"),
@@ -138,6 +185,7 @@ PROBE_TOOL_CHECKS = (
 )
 CIPHERTEXTS = {
     "ciphertexts/dev-jev-api.sops.yaml", "ciphertexts/dev-rent-tunnel.sops.yaml", "ciphertexts/dev-jev-api.oci-dev.sops.yaml",
+    "ciphertexts/dev-rent-client.sops.yaml",
 }
 # The real SOPS roundtrip runs the locked sops with a check-only age that never enters the effect toolchain.
 CHECK_AGE_BUILD = 'nix build .#check-age --no-update-lock-file --out-link "$RUNNER_TEMP/check-age"'
@@ -244,7 +292,8 @@ def check_shape(root: Path) -> None:
     for path in files(root):
         relative = path.relative_to(root)
         require(path.name not in FORBIDDEN_FILENAMES, f"forbidden file: {relative}")
-        require(path.suffix.lower() not in FORBIDDEN_SUFFIXES, f"forbidden implementation type: {relative}")
+        require(path.suffix.lower() not in FORBIDDEN_SUFFIXES or relative.as_posix() == RENT_RECEIVER,
+                f"forbidden implementation type: {relative}")
         require("duck" + "db" not in relative.as_posix().lower(), f"database binding path survives: {relative}")
 
     ciphertext_dir = root / "ciphertexts"
@@ -651,6 +700,43 @@ def check_toolchain(root: Path, adapter) -> None:
         require(token not in source, f"adapter selects an ambient or runtime tool: {token}")
 
 
+def check_placement(root: Path) -> None:
+    check = (root / ".github/workflows/check.yml").read_text(encoding="utf-8")
+    for marker in PLACEMENT_MARKERS:
+        require(marker in check, f"placement-gate must bind the actual outputs: {marker.strip()}")
+    # The four jobs sit before toolchain, outside the toolchain/effect-shape/clean-start slices checked above.
+    require(-1 < check.find("\n  placement-artifact:\n") < check.find("\n  placement-rent:\n") < check.find("\n  toolchain:\n"),
+            "placement-gate jobs must precede toolchain")
+    gate = check[check.find("\n  placement-artifact:\n"):check.find("\n  toolchain:\n")]
+    require("secrets." not in gate and "curl -fsSL -H" not in gate and "-u \"" not in gate,
+            "placement-gate must pass no credential in argv")
+    flake = (root / "flake.nix").read_text(encoding="utf-8")
+    for marker in PLACEMENT_FLAKE:
+        require(marker in flake, f"flake must provide the pinned Windows placement distribution: {marker}")
+    receiver = (root / RENT_RECEIVER).read_text(encoding="utf-8")
+    # One bash -c argument through Windows argv: no quote or backslash, and the slot rule rent-start checks.
+    require('"' not in receiver and "\\" not in receiver, "the rent receiver must be argv-safe")
+    for marker in ("head -c 4097 >$temp", "[ $size -ge 1 ] && [ $size -le 4096 ]", "chown 0:0 $temp", "chmod 600 $temp",
+                   "mv -f -- $temp $slot", "[ ! -L $slot ] || fail",
+                   "[ ! -e $slot ] || [ $(stat -c %u:%g:%a $slot) = 0:0:600 ] || fail", "if [ -e $slot ] && cmp -s $temp $slot; then",
+                   "safe() { [ -d $1 ] && [ ! -L $1 ] && [ $(stat -c %u $1) = 0 ] && [ $(( 0$(stat -c %a $1) & 022 )) = 0 ]; }",
+                   "safe $state || fail", "safe $dir || fail"):
+        require(marker in receiver, f"the rent receiver must enforce the slot rule: {marker}")
+    entry = (root / PLACEMENT_ENTRY).read_text(encoding="utf-8")
+    for marker in ("'-NoProfile -NonInteractive -File \"' + $win + '\" -Mode RentAccess'", "@{ SOPS_AGE_KEY_FILE = $Identity }",
+                   "$writer.StandardInput.BaseStream.Write($payload, 0, $payload.Length)",
+                   "if ([Console]::InputEncoding.GetPreamble().Length) { Refuse 'the console input encoding would prefix the value' }",
+                   "$buffer, $count = [byte[]]::new($Limit + 3), 0",
+                   "if ($count -gt $Limit + 2) { try { $child.Kill() } catch { }; Refuse 'the decrypted value exceeds its bound' }",
+                   "Decrypt 'RENT_ACCESS_CLIENT_ID' 1024", "Decrypt 'RENT_ACCESS_CLIENT_SECRET' 1024", "Decrypt 'RENT_TUNNEL_TOKEN' 4096",
+                   "if ($script.Contains('\"') -or $script.Contains('\\')) { Refuse 'the rent receiver is not argv-safe' }"):
+        require(marker in entry, f"the placement entrance differs: {marker}")
+    # Child streams are bounded (decryption) or discarded (writer, stderr): nothing reads an unbounded stream to memory.
+    for token in ("Write-Host", "Write-Output", "Out-File", "Set-Content", "Add-Content", "Start-Transcript", "$env:TUNNEL",
+                  "ReadToEnd", "MemoryStream"):
+        require(token not in entry, f"the placement entrance must not emit or store a value: {token}")
+
+
 def check_readme(root: Path, environments: dict[str, dict[str, Any]]) -> None:
     text = (root / "README.md").read_text(encoding="utf-8")
     for row in environments.values():
@@ -677,6 +763,11 @@ def check_readme(root: Path, environments: dict[str, dict[str, Any]]) -> None:
         "dev-authoring/OCI_DEV_AGE_RECIPIENT",
         "ciphertexts/dev-jev-api.oci-dev.sops.yaml",
         "`author --target jev-api.oci-dev`",
+        RENT_RECEIVER,
+        PLACEMENT_ENTRY,
+        "placement-gate",
+        "ciphertexts/dev-rent-client.sops.yaml",
+        "-Mode RentAccess` glue",
     ):
         require(marker in text, f"README missing {marker}")
     require("delete `main`" not in text.lower(), "README proposes deleting main")
@@ -713,6 +804,7 @@ def inspect(root: Path = ROOT, *, verify_main_compatibility_refresh: bool = Fals
         adapter.load_receipt(root / adapter.HANDOFF)
     check_workflows(root, environments, author_target_inputs(adapter, contracts), adapter)
     check_toolchain(root, adapter)
+    check_placement(root)
     check_readme(root, environments)
     if verify_main_compatibility_refresh:
         check_main_compatibility_refresh(root)
