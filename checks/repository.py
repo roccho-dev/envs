@@ -117,6 +117,10 @@ PLACEMENT_MARKERS = (
     "manifests/sha-$WINDOWS_SOURCE",
     'docker run --rm -i -v rent-placement-state:/var/lib/rent "$RENT_IMAGE" /bin/bash -c "$receiver"',
     "test \"$(slot 'stat -c %u:%g:%a /s/cloudflared/token')\" = \"0:0:600\"",
+    "$oversize.stderr -notlike 'place: the decrypted value exceeds its bound; nothing placed.*'",
+    "-Target rent -Identity",
+    'test "$(place)" = "rent-receive: unchanged"',
+    "for drift in 'chmod 644 /s/cloudflared/token' 'chown 1000:1000 /s/cloudflared/token'; do",
 )
 PLACEMENT_FLAKE = (
     'hash = assert pkgs.sops.version == "3.13.2"; "sha256-y2/sduI8tKxWdxrDhHKw/hunmoSb8iAK7afJRnoEW3s=";',
@@ -710,15 +714,21 @@ def check_placement(root: Path) -> None:
     # One bash -c argument through Windows argv: no quote or backslash, and the slot rule rent-start checks.
     require('"' not in receiver and "\\" not in receiver, "the rent receiver must be argv-safe")
     for marker in ("head -c 4097 >$temp", "[ $size -ge 1 ] && [ $size -le 4096 ]", "chown 0:0 $temp", "chmod 600 $temp",
-                   "mv -f -- $temp $slot", "[ ! -L $slot ] || fail"):
+                   "mv -f -- $temp $slot", "[ ! -L $slot ] || fail",
+                   "[ ! -e $slot ] || [ $(stat -c %u:%g:%a $slot) = 0:0:600 ] || fail", "if [ -e $slot ] && cmp -s $temp $slot; then"):
         require(marker in receiver, f"the rent receiver must enforce the slot rule: {marker}")
     entry = (root / PLACEMENT_ENTRY).read_text(encoding="utf-8")
     for marker in ("'-NoProfile -NonInteractive -File \"' + $win + '\" -Mode RentAccess'", "@{ SOPS_AGE_KEY_FILE = $Identity }",
                    "$writer.StandardInput.BaseStream.Write($payload, 0, $payload.Length)",
                    "if ([Console]::InputEncoding.GetPreamble().Length) { Refuse 'the console input encoding would prefix the value' }",
+                   "$buffer, $count = [byte[]]::new($Limit + 3), 0",
+                   "if ($count -gt $Limit + 2) { try { $child.Kill() } catch { }; Refuse 'the decrypted value exceeds its bound' }",
+                   "Decrypt 'RENT_ACCESS_CLIENT_ID' 1024", "Decrypt 'RENT_ACCESS_CLIENT_SECRET' 1024", "Decrypt 'RENT_TUNNEL_TOKEN' 4096",
                    "if ($script.Contains('\"') -or $script.Contains('\\')) { Refuse 'the rent receiver is not argv-safe' }"):
         require(marker in entry, f"the placement entrance differs: {marker}")
-    for token in ("Write-Host", "Write-Output", "Out-File", "Set-Content", "Add-Content", "Start-Transcript", "$env:TUNNEL"):
+    # Child streams are bounded (decryption) or discarded (writer, stderr): nothing reads an unbounded stream to memory.
+    for token in ("Write-Host", "Write-Output", "Out-File", "Set-Content", "Add-Content", "Start-Transcript", "$env:TUNNEL",
+                  "ReadToEnd", "MemoryStream"):
         require(token not in entry, f"the placement entrance must not emit or store a value: {token}")
 
 

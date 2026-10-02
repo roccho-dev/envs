@@ -38,28 +38,32 @@ function Finish($Child, [int]$Seconds) {
     $Child.WaitForExit()
     return $Child.ExitCode
 }
-# One value from the envelope, read from the child's stdout stream into memory; a trailing line break is dropped.
-function Decrypt([string]$Key) {
+# One value from the envelope, read from the child's stdout into one fixed buffer of the value's bound plus a line
+# break: more bytes stop the child and refuse before anything is kept. One trailing LF or CRLF is dropped.
+function Decrypt([string]$Key, [int]$Limit) {
     $child = Start-Child $sops ('--decrypt --input-type yaml --extract "[\"' + $Key + '\"]" "' + $Ciphertext + '"') @{ SOPS_AGE_KEY_FILE = $Identity }
-    $buffer = [IO.MemoryStream]::new()
+    $buffer, $count = [byte[]]::new($Limit + 3), 0
     try {
         try { $child.StandardInput.BaseStream.Close() } catch { }
         try { $child.StandardInput.Close() } catch { }
-        $copy = $child.StandardOutput.BaseStream.CopyToAsync($buffer)
-        $null = $child.StandardError.ReadToEndAsync()
-        $code = Finish $child 60
-        $copy.Wait()
-        if ($code -ne 0) { Refuse 'decryption failed' }
-        $bytes = $buffer.ToArray()
-        $length = $bytes.Length
-        while ($length -gt 0 -and ($bytes[$length - 1] -eq 10 -or $bytes[$length - 1] -eq 13)) { $length-- }
-        $value = [byte[]]::new($length)
-        [Array]::Copy($bytes, $value, $length)
-        [Array]::Clear($bytes, 0, $bytes.Length)
+        $null = $child.StandardError.BaseStream.CopyToAsync([IO.Stream]::Null)
+        $stream = $child.StandardOutput.BaseStream
+        while ($true) {
+            $read = $stream.ReadAsync($buffer, $count, $buffer.Length - $count)
+            if (-not $read.Wait(60000)) { try { $child.Kill() } catch { }; Refuse 'decryption did not finish' }
+            if ($read.Result -le 0) { break }
+            $count += $read.Result
+            if ($count -gt $Limit + 2) { try { $child.Kill() } catch { }; Refuse 'the decrypted value exceeds its bound' }
+        }
+        if ((Finish $child 60) -ne 0) { Refuse 'decryption failed' }
+        if ($count -gt 0 -and $buffer[$count - 1] -eq 10) { $count--; if ($count -gt 0 -and $buffer[$count - 1] -eq 13) { $count-- } }
+        if ($count -gt $Limit) { Refuse 'the decrypted value exceeds its bound' }
+        $value = [byte[]]::new($count)
+        [Array]::Copy($buffer, $value, $count)
         return ,$value
     } finally {
-        [Array]::Clear($buffer.GetBuffer(), 0, $buffer.GetBuffer().Length)
-        $buffer.Dispose(); $child.Dispose()
+        [Array]::Clear($buffer, 0, $buffer.Length)
+        $child.Dispose()
     }
 }
 function Matches([byte[]]$Bytes, [string]$Pattern) {
@@ -88,8 +92,8 @@ if ($Target -ceq 'client') {
 $payload = $null
 try {
     if ($Target -ceq 'client') {
-        $id = Decrypt 'RENT_ACCESS_CLIENT_ID'
-        $secret = Decrypt 'RENT_ACCESS_CLIENT_SECRET'
+        $id = Decrypt 'RENT_ACCESS_CLIENT_ID' 1024
+        $secret = Decrypt 'RENT_ACCESS_CLIENT_SECRET' 1024
         try {
             if (-not (Matches $id '^[!-~]{1,1024}\z') -or -not (Matches $secret '^[!-~]{1,1024}\z')) { Refuse 'the envelope is not one Access client credential' }
             $payload = [byte[]]::new($id.Length + $secret.Length + 2)
@@ -99,7 +103,7 @@ try {
             $payload[$payload.Length - 1] = 10
         } finally { [Array]::Clear($id, 0, $id.Length); [Array]::Clear($secret, 0, $secret.Length) }
     } else {
-        $payload = Decrypt 'RENT_TUNNEL_TOKEN'
+        $payload = Decrypt 'RENT_TUNNEL_TOKEN' 4096
         if (-not (Matches $payload '^[A-Za-z0-9+/=_-]{1,4096}\z')) { Refuse 'the envelope is not one tunnel token' }
     }
     # Windows PowerShell (.NET Framework) opens a child's redirected stdin with Console.InputEncoding and writes that
@@ -112,8 +116,8 @@ try {
         $writer = Start-Child $exe $arguments @{}
     } finally { try { [Console]::InputEncoding = $saved } catch { } }
     try {
-        $null = $writer.StandardOutput.ReadToEndAsync()
-        $null = $writer.StandardError.ReadToEndAsync()
+        $null = $writer.StandardOutput.BaseStream.CopyToAsync([IO.Stream]::Null)
+        $null = $writer.StandardError.BaseStream.CopyToAsync([IO.Stream]::Null)
         try { $writer.StandardInput.BaseStream.Write($payload, 0, $payload.Length); $writer.StandardInput.BaseStream.Flush() } catch { }
         # End of input at the raw pipe; the unused StreamWriter is disposed after it.
         try { $writer.StandardInput.BaseStream.Close() } catch { }

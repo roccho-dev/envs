@@ -146,6 +146,9 @@ jobs:
           spec = importlib.util.spec_from_file_location("jev", sys.argv[1]); jev = importlib.util.module_from_spec(spec); spec.loader.exec_module(jev)
           sys.stdout.buffer.write(jev.encrypt_rent_token(sys.stdin.read(), sys.argv[2], {"sops": sys.argv[3]}))' \
             "$data/adapters/jev_api.py" "$(cat "$keys/rent.pub")" "$tool/sops" >"$out/rent.sops.yaml"
+          # A well-formed envelope whose client ID is far beyond the slot bound: place.ps1 must stop reading it.
+          printf '{"RENT_ACCESS_CLIENT_ID":"%s","RENT_ACCESS_CLIENT_SECRET":"x"}' "$(head -c 300000 /dev/zero | tr '\0' a)" |
+            SOPS_AGE_RECIPIENTS="$(cat "$keys/client.pub")" "$tool/sops" --encrypt --input-type json --output-type yaml /dev/stdin >"$out/oversize.sops.yaml"
           SOPS_AGE_KEY_FILE="$keys/client.key" "$tool/sops" --decrypt --input-type yaml --output-type json "$out/client.sops.yaml" |
             CID="$client_id" CSECRET="$client_secret" jq -e '. == {RENT_ACCESS_CLIENT_ID: env.CID, RENT_ACCESS_CLIENT_SECRET: env.CSECRET}' >/dev/null
           # The synthetic values and the slot digests the targets must receive, for the gate jobs' checks only.
@@ -313,6 +316,15 @@ jobs:
           [IO.File]::WriteAllText("$temp\tampered.sops.yaml", $text.Substring(0, $start) + $(if ($text[$start] -ceq 'A') { 'B' } else { 'A' }) + $text.Substring($start + 1))
           $tampered = Place "$keys\client.key" "$temp\tampered.sops.yaml"
           if ($tampered.code -ne 2 -or $null -ne $tampered.verdict) { throw 'a tampered envelope was not refused before the writer' }
+          $oversize = Place "$keys\client.key" "$inputs\oversize.sops.yaml"
+          if ($oversize.code -ne 2 -or $null -ne $oversize.verdict -or $oversize.stderr -notlike 'place: the decrypted value exceeds its bound; nothing placed.*') { throw 'an oversized value was not stopped at its bound' }
+          # The rent branch refuses a non-digest image before any decryption; running it through WSLC is a deployment gate.
+          $info = [Diagnostics.ProcessStartInfo]::new("$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe",
+            "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$placement\place.ps1`" -Target rent -Identity `"$keys\rent.key`" -Ciphertext `"$inputs\rent.sops.yaml`" -RentImage ghcr.io/roccho-dev/windows-rent:latest")
+          $info.UseShellExecute = $false; $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true; $info.EnvironmentVariables.Remove('PSModulePath')
+          $process = [Diagnostics.Process]::Start($info); $err = $process.StandardError.ReadToEndAsync(); $null = $process.StandardOutput.ReadToEndAsync()
+          if (-not $process.WaitForExit(60000)) { $process.Kill($true); throw 'place.ps1 -Target rent did not finish' }
+          if ($process.ExitCode -ne 2 -or $err.Result -notlike 'place: the rent image is not one exact digest; nothing placed.*') { throw 'a tag-named rent image was not refused' }
           foreach ($file in Get-ChildItem -LiteralPath $temp -Recurse -File | Where-Object { $_.FullName -ne "$inputs\values.json" }) {
             $bytes = [IO.File]::ReadAllBytes($file.FullName)
             if ([Text.Encoding]::ASCII.GetString($bytes).Contains($values.client_secret)) { throw "a credential reached the file $($file.Name)" }
@@ -384,20 +396,36 @@ jobs:
               docker run --rm -i -v rent-placement-state:/var/lib/rent "$RENT_IMAGE" /bin/bash -c "$receiver"
           }
           slot() { docker run --rm -v rent-placement-state:/s "$RENT_IMAGE" /bin/bash -c "$1"; }
+          receive() { docker run --rm -i -v rent-placement-state:/var/lib/rent "$RENT_IMAGE" /bin/bash -c "$receiver"; }
+          token_sha() { slot 'sha256sum /s/cloudflared/token' | cut -d ' ' -f 1; }
           test "$(place)" = "rent-receive: placed"
           test "$(slot 'stat -c %u:%g:%a /s/cloudflared/token')" = "0:0:600"
-          test "$(slot 'sha256sum /s/cloudflared/token' | cut -d ' ' -f 1)" = "$(jq -r .tunnel_sha256 "$values")"
-          test "$(place)" = "rent-receive: placed"
-          test "$(slot 'sha256sum /s/cloudflared/token' | cut -d ' ' -f 1)" = "$(jq -r .tunnel_sha256 "$values")"
+          test "$(token_sha)" = "$(jq -r .tunnel_sha256 "$values")"
+          test "$(place)" = "rent-receive: unchanged"
           for bad in '' '   ' "$(head -c 4097 /dev/zero | tr '\0' a)"; do
-            if printf '%s' "$bad" | docker run --rm -i -v rent-placement-state:/var/lib/rent "$RENT_IMAGE" /bin/bash -c "$receiver"; then
+            if printf '%s' "$bad" | receive; then
               echo "an invalid token was placed" >&2
               exit 1
             fi
           done
-          test "$(slot 'sha256sum /s/cloudflared/token' | cut -d ' ' -f 1)" = "$(jq -r .tunnel_sha256 "$values")"
+          test "$(token_sha)" = "$(jq -r .tunnel_sha256 "$values")"
+          # Rotation replaces only the owned slot; a slot of another owner or mode is refused and kept as found.
+          other="$(head -c 96 /dev/urandom | base64 -w0)"
+          test "$(printf '%s' "$other" | receive)" = "rent-receive: placed"
+          test "$(token_sha)" = "$(printf '%s' "$other" | sha256sum | cut -d ' ' -f 1)"
+          for drift in 'chmod 644 /s/cloudflared/token' 'chown 1000:1000 /s/cloudflared/token'; do
+            slot "$drift"
+            before="$(slot 'stat -c %u:%g:%a /s/cloudflared/token')"
+            if place; then
+              echo "a drifted slot was replaced: $drift" >&2
+              exit 1
+            fi
+            test "$(slot 'stat -c %u:%g:%a /s/cloudflared/token')" = "$before"
+            test "$(token_sha)" = "$(printf '%s' "$other" | sha256sum | cut -d ' ' -f 1)"
+            slot 'chown 0:0 /s/cloudflared/token && chmod 600 /s/cloudflared/token'
+          done
           test -z "$(slot 'ls -A /s/cloudflared | grep -v ^token$ || true')"
-          echo "rent-receive.sh in $RENT_IMAGE: placed 0:0 600 exact token twice; blank, whitespace and oversized refused, slot kept"
+          echo "rent-receive.sh in $RENT_IMAGE: placed 0:0 600 exact token, same value unchanged, rotated; blank, whitespace, oversized and drifted (mode, owner) slots refused and kept"
 
   toolchain:
     runs-on: ubuntu-24.04

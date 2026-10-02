@@ -381,6 +381,15 @@ def main() -> None:
     expect_red(replace_text(receiver, "echo rent-receive: placed", 'echo "rent-receive: placed"'))
     expect_red(replace_text(receiver, "chmod 600 $temp\n", ""))
     expect_red(replace_text(receiver, "[ ! -L $slot ] || fail the slot is a link\n", ""))
+    expect_red(replace_text(receiver, "[ ! -e $slot ] || [ $(stat -c %u:%g:%a $slot) = 0:0:600 ] || fail the slot is not the owned 0:0 600 token\n", ""))
+    expect_red(replace_text(receiver, "if [ -e $slot ] && cmp -s $temp $slot; then", "if false; then"))
+    expect_red(replace_text("adapters/place.ps1", "if ($count -gt $Limit + 2) {", "if ($false) {"))
+    expect_red(replace_text("adapters/place.ps1", "Decrypt 'RENT_TUNNEL_TOKEN' 4096", "Decrypt 'RENT_TUNNEL_TOKEN' 1048576"))
+    expect_red(replace_text("adapters/place.ps1", "$null = $writer.StandardOutput.BaseStream.CopyToAsync([IO.Stream]::Null)",
+                            "$null = $writer.StandardOutput.ReadToEndAsync()"))
+    expect_red(replace_text(check, 'test "$(place)" = "rent-receive: unchanged"', 'test "$(place)" = "rent-receive: placed"'))
+    expect_red(replace_text(check, "for drift in 'chmod 644 /s/cloudflared/token' 'chown 1000:1000 /s/cloudflared/token'; do",
+                            "for drift in; do"))
     entrance = "adapters/place.ps1"
     expect_red(replace_text(entrance, "exit $code\n", "Write-Host $payload\nexit $code\n"))
     expect_red(replace_text(entrance, "-Mode RentAccess'", "-Mode RentSsh'"))
