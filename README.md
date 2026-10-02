@@ -28,6 +28,7 @@ flake.nix, flake.lock
 contracts/
 ciphertexts/       # absent while dev (Jev, rent tunnel) is NOT_CONFIGURED
 adapters/jev_api.py
+adapters/place.ps1, adapters/rent-receive.sh   # target-run placement entrance and rent receiver
 providers/         # disposable probe and state-proof declarations only; never state or lock files
 handoffs/          # absent until real projection/readback PASS
 checks/
@@ -46,7 +47,7 @@ THIRD_PARTY_NOTICES.md
 
 ## Environment inputs
 
-`contracts/environments.jsonl` declares each GitHub Environment's `required_secrets` and `required_variables` by name, type, and lifecycle. The actual values live only in the GitHub Environment; the owner sets them there without a commit. Git never stores a value body: before any provider effect the adapter turns a missing or invalid required input RED, and turns RED when a live Variable value appears anywhere in the repository. The only exception is the recipient metadata that sops writes into `ciphertexts/dev-jev-api.sops.yaml`, `ciphertexts/dev-rent-tunnel.sops.yaml` and `ciphertexts/dev-jev-api.oci-dev.sops.yaml`. A binding may declare its own input on an existing Environment (`jev-api.oci-dev` declares `OCI_DEV_AGE_RECIPIENT` on `dev-authoring`); only that binding's authoring reads it.
+`contracts/environments.jsonl` declares each GitHub Environment's `required_secrets` and `required_variables` by name, type, and lifecycle. The actual values live only in the GitHub Environment; the owner sets them there without a commit. Git never stores a value body: before any provider effect the adapter turns a missing or invalid required input RED, and turns RED when a live Variable value appears anywhere in the repository. The only exception is the recipient metadata that sops writes into `ciphertexts/dev-jev-api.sops.yaml`, `ciphertexts/dev-rent-tunnel.sops.yaml`, `ciphertexts/dev-rent-client.sops.yaml` and `ciphertexts/dev-jev-api.oci-dev.sops.yaml`. A binding may declare its own input on an existing Environment (`jev-api.oci-dev` declares `OCI_DEV_AGE_RECIPIENT` on `dev-authoring`); only that binding's authoring reads it.
 
 | Environment input | Kind | Type | Lifecycle |
 |---|---|---|---|
@@ -60,6 +61,7 @@ THIRD_PARTY_NOTICES.md
 | `dev-rent-tunnel/CLOUDFLARE_ACCOUNT_ID` | variable | cloudflare_account_id | persistent |
 | `dev-rent-tunnel/RENT_TUNNEL_ID` | variable | cloudflare_tunnel_id | persistent |
 | `dev-rent-tunnel/RENT_AGE_RECIPIENT` | variable | age_recipient | persistent |
+| `dev-rent-client/RENT_CLIENT_AGE_RECIPIENT` | variable | age_recipient | persistent |
 | `dev-rent-access-probe/CLOUDFLARE_API_TOKEN` | secret | opaque | persistent |
 | `dev-rent-access-probe/CLOUDFLARE_ACCOUNT_ID` | variable | cloudflare_account_id | persistent |
 | `dev-rent-access-probe/CLOUDFLARE_ZONE_ID` | variable | cloudflare_zone_id | persistent |
@@ -174,6 +176,29 @@ No plan or apply until three later gates are agreed, in no implied order:
 - the service-token lifetime, rotation and delivery to the Windows client, and the Tunnel-token placement into the rent's token slot.
 
 The disposable R2 proof below is design evidence only; it does not prove that production state survives. A denied connection still needs provider Access evidence, and the exact Windows client, reboot and cutover are later windows #14/#8 gates.
+
+## Dev rent placement (windows #14-E)
+
+One G6I3 normal-user Access service credential serves every surface of the `windows-rent` alias; the rent gets only its Tunnel token. envs owns the projection, the envelopes and the target-run entrance; windows owns each slot's format, the client slot's writer and the consumer (windows PR #37).
+
+```text
+tofu output -json credentials (the persistent root's sensitive output) → stdin of `rent-client`
+→ the service token pair, each one line of the windows slot rule → sops stdin, one recipient
+   (dev-rent-client/RENT_CLIENT_AGE_RECIPIENT) → ciphertexts/dev-rent-client.sops.yaml + dev.rent-client ACTIVE
+
+on the target, from the verified envs-placement-<sha> distribution (pinned official sops.exe 3.13.2, the locked
+sops version, by its release digest; adapters/place.ps1; adapters/rent-receive.sh; this source's ciphertexts):
+place.ps1 -Target client -Identity <the target's own age identity> -WindowsDist <verified windows-dist>
+→ sops.exe stdout into memory → '<id>LF<secret>LF' on the stdin of win.ps1 -Mode RentAccess
+place.ps1 -Target rent -Identity <identity> -RentImage ghcr.io/roccho-dev/windows-rent@sha256:<digest>
+→ token on the stdin of a one-shot `wslc run --rm -i` of that exact image running rent-receive.sh
+```
+
+- The plaintext exists only in `place.ps1`'s memory and its private child pipes: never printed, logged, in argv, environment or a file. The writer's exit code is the only result; a refusal is one fixed line. `rent-receive.sh` uses only the image's own bash and coreutils, holds no quote or backslash so it travels as one argument, and replaces the slot rent-start checks (regular file, 0:0, mode 600, 1-4096 bytes, not blank).
+- `rent-client` projects only the service token pair; the persistent root is still declaration only and nothing here plans or applies it. Until the owner configures `dev-rent-client`, the plane is `NOT_CONFIGURED`.
+- `placement-gate` in `check` uses each platform's actual CI output from one run: `placement-artifact` builds the Windows distribution, `placement-author` seals synthetic values with the provided Linux artifact, `placement-windows` binds the exact published windows Release named in `contracts/provider-consumer.jsonl` (the tag names that commit; github-actions[bot] published it from a push run whose scope, build, Windows proof, rent image and publish jobs passed; every asset equals GitHub's digest; the ZIP equals its `.sha256`; `rent-image.json` names that source) and runs `place.ps1` in Windows PowerShell 5.1 into windows' own released `ReadRentAccessInput` and `Get-RentAccessProblem`, and `placement-rent` runs `rent-receive.sh` in the rent image that Release names, by digest, after the registry tag resolves to it. Until that Release exists the gate is RED, never assumed.
+
+Not proven here: the production `-Mode RentAccess` glue (G6I3 normal-user caller, ledger lock, owner-only write; the windows proof covers the writer functions), WSLC (Docker stands in for the receiver), the target identities and their bootstrap, real issuance or placement, Cloudflare acceptance and denial, no-browser behaviour, and packaged Windows Codex.
 
 ## Dev rent R2 state proof (windows #8/#14)
 

@@ -354,6 +354,50 @@ def main() -> None:
     expect_red(replace_text(check, "run: python3 checks/test_rent_access_probe.py\n", "run: 'true'\n"))
     expect_red(replace_text("README.md", "name lookup locates candidates and never proves ownership", "name lookup finds ours"))
     expect_red(replace_text("README.md", "dev-rent-access-probe/CLOUDFLARE_ZONE_ID", "dev-rent-access-probe/REMOVED"))
+
+    # placement-gate (windows #14): each job binds the actual outputs; the entrance and the receiver keep values private.
+    for marker in (
+        'echo "cb6fec76e23cb4ac56771ac38472b0fe1ba79a849bf2200aeda7c9467a045b7b  $RUNNER_TEMP/placement/sops.exe" | sha256sum -c -',
+        "$required = 'scope', 'build', 'windows', 'rent / build-test-publish', 'publish'",
+        "$ref.object.type -cne 'commit' -or $ref.object.sha -cne $source",
+        "if ('sha256:' + (Sha (Join-Path $dir $asset.name)) -cne $asset.digest)",
+        "$n.Name -cin @('ReadRentAccessInput', 'Get-RentAccessProblem')",
+        "$placed.verdict.sha256 -cne $values.client_slot_sha256",
+        "manifests/sha-$WINDOWS_SOURCE",
+        '"$entry" --root "$data" rent-client',
+    ):
+        expect_red(replace_text(check, marker, "true"))
+    expect_red(replace_text(check, "    needs: [toolchain, placement-artifact, placement-author, placement-windows]\n",
+                            "    needs: [placement-author]\n"))
+    expect_red(replace_text(check, "    runs-on: windows-latest\n    timeout-minutes: 20\n", "    runs-on: ubuntu-24.04\n    timeout-minutes: 20\n"))
+    expect_red(replace_text(check, "          GH_TOKEN: ${{ github.token }}\n        run: |\n          $ErrorActionPreference",
+                            "          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n        run: |\n          $ErrorActionPreference"))
+    expect_red(replace_text(check, "          token=\"$(curl -fsS 'https://ghcr.io/token",
+                            "          curl -fsSL -H \"Authorization: Bearer $GH_TOKEN\" https://example.invalid\n"
+                            "          token=\"$(curl -fsS 'https://ghcr.io/token"))
+    expect_red(replace_text("flake.nix", '"sha256-y2/sduI8tKxWdxrDhHKw/hunmoSb8iAK7afJRnoEW3s="', "lib.fakeHash"))
+    expect_red(replace_text("flake.nix", 'assert pkgs.sops.version == "3.13.2"; ', ""))
+    receiver = "adapters/rent-receive.sh"
+    expect_red(replace_text(receiver, "echo rent-receive: placed", 'echo "rent-receive: placed"'))
+    expect_red(replace_text(receiver, "chmod 600 $temp\n", ""))
+    expect_red(replace_text(receiver, "[ ! -L $slot ] || fail the slot is a link\n", ""))
+    entrance = "adapters/place.ps1"
+    expect_red(replace_text(entrance, "exit $code\n", "Write-Host $payload\nexit $code\n"))
+    expect_red(replace_text(entrance, "-Mode RentAccess'", "-Mode RentSsh'"))
+    expect_red(replace_text(entrance, "@{ SOPS_AGE_KEY_FILE = $Identity }", "@{ SOPS_AGE_KEY = $Identity }"))
+    expect_red(replace_text(entrance, "        if ([Console]::InputEncoding.GetPreamble().Length) { Refuse 'the console input encoding would prefix the value' }\n", ""))
+    expect_red(lambda root: (root / "adapters/receive.sh").write_text("exit 0\n"))
+    expect_red(replace_text("README.md", "placement-gate", "placement gate"))
+    expect_red(replace_text("contracts/provider-consumer.jsonl", '"distribution_source":"', '"distribution_source":"main'))
+    expect_red(replace_text("contracts/provider-consumer.jsonl", '"root_output_projection",', ""))
+    expect_red(mutate_plane("dev.rent-client", lambda row: row["required_variables"][0].update({"type": "age_recipient_list"})))
+    expect_red(mutate_plane("dev.rent-client", lambda row: row.update({"github_environment": "dev-rent-tunnel"})))
+
+    def invalid_client_ciphertext(root: Path) -> None:
+        (root / "ciphertexts").mkdir(exist_ok=True)
+        (root / "ciphertexts/dev-rent-client.sops.yaml").write_text("RENT_ACCESS_CLIENT_ID: plain\n")
+
+    expect_red(invalid_client_ciphertext)
     print("repository checker self-test: PASS")
 
 
