@@ -410,10 +410,10 @@ def real_roundtrip(sops_bin: str, keygen_bin: str) -> None:
         assert CLIENT_ID.encode() not in client and CLIENT_SECRET.encode() not in client
         client_file = work / "dev-rent-client.sops.yaml"
         client_file.write_bytes(client)
-        for key, expected in zip(jev.CLIENT_KEYS, (CLIENT_ID, CLIENT_SECRET)):
-            extracted = run([sops_path, "--decrypt", "--input-type", "yaml", "--extract", f'["{key}"]', str(client_file)],
+        for name, expected in zip(jev.CLIENT_KEYS, (CLIENT_ID, CLIENT_SECRET)):
+            extracted = run([sops_path, "--decrypt", "--input-type", "yaml", "--extract", f'["{name}"]', str(client_file)],
                             {**base, "SOPS_AGE_KEY_FILE": str(key)})
-            assert extracted.returncode == 0 and extracted.stdout.rstrip(b"\r\n") == expected.encode(), f"{key} extraction differs"
+            assert extracted.returncode == 0 and extracted.stdout.rstrip(b"\r\n") == expected.encode(), f"{name} extraction differs"
         refused = decrypt(client_file, other_key)
         assert refused.returncode != 0 and CLIENT_SECRET.encode() not in refused.stdout + refused.stderr, "another identity decrypted"
         print(f"real SOPS roundtrip: PASS (sops={sops_path}, age-keygen={keygen})")
