@@ -112,7 +112,8 @@ jobs:
           "$tool/wrangler" pages secret put --help 2>&1 | grep -Ei 'pages secret put <key>' >/dev/null
 
       # The probe tools come from the built closure: the exact client version and its service-token flags, the provider
-      # declaration initialized and validated with every network route closed, and a real localhost sshd/ssh exchange.
+      # declaration and the persistent root initialized and validated with every network route closed, and a real
+      # localhost sshd/ssh exchange.
       - name: Access probe tools from the closure without network or credentials
         run: |
           set -euo pipefail
@@ -127,6 +128,12 @@ jobs:
           cp providers/dev-rent-access-probe/main.tf "$probe/"
           HTTPS_PROXY=http://127.0.0.1:9 HTTP_PROXY=http://127.0.0.1:9 "$tool/tofu" -chdir="$probe" init -input=false -no-color
           "$tool/tofu" -chdir="$probe" validate -no-color
+          # The persistent root is declaration only: initialized without its backend and validated, never planned.
+          rent="$RUNNER_TEMP/rent-cloudflare"
+          mkdir "$rent"
+          cp providers/dev-rent-cloudflare/main.tf "$rent/"
+          HTTPS_PROXY=http://127.0.0.1:9 HTTP_PROXY=http://127.0.0.1:9 "$tool/tofu" -chdir="$rent" init -backend=false -input=false -no-color
+          "$tool/tofu" -chdir="$rent" validate -no-color
           "$tool/ssh" -V
           "$tool/python3" -I checks/test_rent_access_probe.py --real-ssh "$tool"
 

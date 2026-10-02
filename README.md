@@ -161,6 +161,20 @@ Not proven here: that `cloudflared` 2026.6.1 honours a service token (a reported
 
 Not proven here, and not owned by envs: a real provider retrieval or dispatch of this workflow, the Cloudflare API token scope it needs, whether Actions may open the handoff PR (a PR opened with the workflow token does not trigger `check`), the target's age identity, applying the ciphertext on the target, the client credential, and unattended SSH.
 
+## Dev rent persistent Cloudflare root (windows #14-E)
+
+`providers/dev-rent-cloudflare/main.tf` declares the persistent SSH path the rent will use: one named Tunnel (`config_src = "cloudflare"`) with its ingress, the DNS CNAME, a self-hosted Access application and a Service Auth (`non_identity`) policy for exactly one service token. It reuses the resource shape the disposable probe ran against the real provider, without its `create` gate, and pins the same standard provider (5.21.1). Account, zone, hostname, origin service and `service_token_duration` are required inputs with no default; nothing adopts, imports or moves an existing resource.
+
+It is declaration only: no workflow plans or applies it. `check` initializes it without its backend and validates it with network access closed, and the repository check refuses the four things native validation accepts: a local (plaintext) backend instead of the locked native S3 backend, unenforced state or plan encryption, a credentials output that is not sensitive, and a service-token lifetime fixed in source. The output being sensitive does not keep the secrets out of state: the Tunnel token and the service-token secret will be stored there.
+
+No plan or apply until three later gates are agreed, in no implied order:
+
+- the persistent state: which root creates and owns the bucket (the S3 backend needs an existing one), how that ownership state itself persists encrypted and locked, and the key custody;
+- the backend credential boundary (adrs#443);
+- the service-token lifetime, rotation and delivery to the Windows client, and the Tunnel-token placement into the rent's token slot.
+
+The disposable R2 proof below is design evidence only; it does not prove that production state survives. A denied connection still needs provider Access evidence, and the exact Windows client, reboot and cutover are later windows #14/#8 gates.
+
 ## Dev rent R2 state proof (windows #8/#14)
 
 Before any production state, one bounded run must show that the bundled OpenTofu keeps encrypted state with a native lock file in Cloudflare R2. `providers/dev-rent-state-proof/main.tf` declares exactly two per-run buckets (`windows-rent-state-proof-<run_id>-<attempt>` and its `-decoy`); `providers/dev-rent-state-proof/backend/main.tf` is an S3-backend root on the proof bucket with `use_lockfile = true`, enforced state and plan encryption, and only built-in resources.

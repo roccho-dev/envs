@@ -39,6 +39,7 @@ REQUIRED_FILES = {
     "flake.lock",
     "flake.nix",
     "providers/dev-rent-access-probe/main.tf",
+    "providers/dev-rent-cloudflare/main.tf",
     "providers/dev-rent-state-proof/main.tf",
     "providers/dev-rent-state-proof/backend/main.tf",
 }
@@ -104,6 +105,7 @@ EFFECT_WORKFLOWS = {
     "probe-dev-rent-state.yml": "dev.rent-state-proof",
 }
 PROBE_CONFIG = "providers/dev-rent-access-probe/main.tf"
+RENT_CONFIG = "providers/dev-rent-cloudflare/main.tf"
 STATE_CONFIG = "providers/dev-rent-state-proof/main.tf"
 STATE_BACKEND = "providers/dev-rent-state-proof/backend/main.tf"
 # check initializes and validates both state-proof roots from the built closure with every network route closed, proves
@@ -128,6 +130,10 @@ PROBE_TOOL_CHECKS = (
     'grep -qF -- --service-token-id "$RUNNER_TEMP/access-ssh.help"',
     'HTTPS_PROXY=http://127.0.0.1:9 HTTP_PROXY=http://127.0.0.1:9 "$tool/tofu" -chdir="$probe" init -input=false -no-color',
     '"$tool/tofu" -chdir="$probe" validate -no-color',
+    'cp providers/dev-rent-cloudflare/main.tf "$rent/"',
+    'HTTPS_PROXY=http://127.0.0.1:9 HTTP_PROXY=http://127.0.0.1:9 "$tool/tofu" -chdir="$rent" init -backend=false -input=false'
+    ' -no-color',
+    '"$tool/tofu" -chdir="$rent" validate -no-color',
     '"$tool/python3" -I checks/test_rent_access_probe.py --real-ssh "$tool"',
 )
 CIPHERTEXTS = {
@@ -247,9 +253,10 @@ def check_shape(root: Path) -> None:
         require(bool(ciphertexts) and set(ciphertexts) <= CIPHERTEXTS, f"unexpected ciphertexts: {ciphertexts}")
 
     providers = sorted(path.relative_to(root).as_posix() for path in (root / "providers").rglob("*") if path.is_file())
-    require(providers == sorted([PROBE_CONFIG, STATE_CONFIG, STATE_BACKEND]),
+    require(providers == sorted([PROBE_CONFIG, RENT_CONFIG, STATE_CONFIG, STATE_BACKEND]),
             f"unexpected provider files (state or lock files are never committed): {providers}")
     check_probe_config((root / PROBE_CONFIG).read_text(encoding="utf-8"))
+    check_rent_config((root / RENT_CONFIG).read_text(encoding="utf-8"))
     check_state_config((root / STATE_CONFIG).read_text(encoding="utf-8"), (root / STATE_BACKEND).read_text(encoding="utf-8"))
 
     handoff_dir = root / "handoffs"
@@ -277,6 +284,24 @@ def check_probe_config(text: str) -> None:
             "probe names differ")
     require(re.search(r'(?ms)^output "credentials" \{\n  sensitive = true\n', text) is not None,
             "probe credentials must be a sensitive output")
+
+
+def check_rent_config(source: str) -> None:
+    # Only what native validate accepts and must not: a plaintext local backend, unenforced encryption, a credentials
+    # output printed in clear, and a service-token lifetime fixed in source rather than bound at deployment. Comments
+    # never count: /* */ blocks and #, // line comments are dropped first (this root has no # or // inside a string).
+    text = re.sub(r"(?m)[ \t]*(#|//).*$", "", re.sub(r"(?s)/\*.*?\*/", "", source))
+    require(text.count('backend "') == 1 and '  backend "s3" {\n' in text and "    use_lockfile                = true\n" in text,
+            "persistent root must use the locked native S3 backend")
+    require("  encryption {\n    state {\n      enforced = true\n    }\n    plan {\n      enforced = true\n    }\n  }\n" in text,
+            "persistent root must enforce state and plan encryption")
+    require(re.search(r'(?ms)^output "credentials" \{\n  sensitive = true\n', text) is not None,
+            "persistent root credentials must be a sensitive output")
+    # Every remaining duration assignment line (horizontal whitespace only).
+    durations = [value.strip() for value in re.findall(r"(?m)^[ \t]*duration[ \t]*=[ \t]*(.*)$", text)]
+    require('variable "service_token_duration" {\n  type = string\n}\n' in text
+            and durations == ["var.service_token_duration"],
+            "the service-token duration must be a required input with no default")
 
 
 def check_state_config(buckets: str, backend: str) -> None:
@@ -641,6 +666,8 @@ def check_readme(root: Path, environments: dict[str, dict[str, Any]]) -> None:
         "ciphertexts/dev-rent-tunnel.sops.yaml",
         "checks/test_rent_tunnel.py",
         PROBE_CONFIG,
+        RENT_CONFIG,
+        "declaration only: no workflow plans or applies it",
         "checks/test_rent_access_probe.py",
         "name lookup locates candidates and never proves ownership",
         STATE_CONFIG,
