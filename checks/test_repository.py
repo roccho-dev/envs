@@ -383,6 +383,11 @@ def main() -> None:
     expect_red(replace_text(receiver, "[ ! -L $slot ] || fail the slot is a link\n", ""))
     expect_red(replace_text(receiver, "[ ! -e $slot ] || [ $(stat -c %u:%g:%a $slot) = 0:0:600 ] || fail the slot is not the owned 0:0 600 token\n", ""))
     expect_red(replace_text(receiver, "if [ -e $slot ] && cmp -s $temp $slot; then", "if false; then"))
+    expect_red(replace_text(receiver, "safe $dir || fail the slot directory is not a root-owned directory only its owner can write\n", ""))
+    expect_red(replace_text(receiver, "safe $state || fail the state volume is not a root-owned directory only its owner can write\n", ""))
+    expect_red(replace_text(receiver, "& 022 ))", "& 0 ))"))
+    expect_red(replace_text(receiver, "[ $(stat -c %u $1) = 0 ] && ", ""))
+    expect_red(replace_text(check, "'chown 1000:0 /s|chown 0:0 /s'; do", "; do"))
     expect_red(replace_text("adapters/place.ps1", "if ($count -gt $Limit + 2) {", "if ($false) {"))
     expect_red(replace_text("adapters/place.ps1", "Decrypt 'RENT_TUNNEL_TOKEN' 4096", "Decrypt 'RENT_TUNNEL_TOKEN' 1048576"))
     expect_red(replace_text("adapters/place.ps1", "$null = $writer.StandardOutput.BaseStream.CopyToAsync([IO.Stream]::Null)",

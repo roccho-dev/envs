@@ -2,18 +2,21 @@
 #   wslc run --rm -i --volume windows-rent-state:/var/lib/rent <rent image by digest> /bin/bash -c <this text>
 # using only the image's own bash and coreutils. It reads the token on stdin only and replaces the one slot that
 # windows' rent-start checks: a regular file, owned 0:0, mode 600, 1 to 4096 bytes, not blank. An existing slot is
-# replaced only while it is exactly that owned shape; any other object is refused and left intact, and the same value
-# changes nothing. It never prints the token. It holds no quote or backslash, so it travels as one argument unchanged.
+# replaced only while it is exactly that owned shape under parents only root can change; any other object is refused
+# and left intact, and the same value changes nothing. It never prints the token. It holds no quote or backslash, so it travels as one argument unchanged.
 set -euo pipefail
 umask 077
 fail() { echo rent-receive: $* >&2; exit 2; }
+# A parent only root can change: a real directory owned by uid 0 with no group or other write bit (rent-start lays the
+# state root out 0:0 755; any such mode is accepted). Otherwise another user could redirect or replace the slot.
+safe() { [ -d $1 ] && [ ! -L $1 ] && [ $(stat -c %u $1) = 0 ] && [ $(( 0$(stat -c %a $1) & 022 )) = 0 ]; }
 state=/var/lib/rent
 dir=$state/cloudflared
 slot=$dir/token
-[ -d $state ] && [ ! -L $state ] || fail the state volume is absent
+safe $state || fail the state volume is not a root-owned directory only its owner can write
 [ ! -L $dir ] || fail the slot directory is a link
-mkdir -p $dir
-[ -d $dir ] || fail the slot directory is not a directory
+[ -e $dir ] || mkdir $dir
+safe $dir || fail the slot directory is not a root-owned directory only its owner can write
 [ ! -L $slot ] || fail the slot is a link
 [ ! -e $slot ] || [ -f $slot ] || fail the slot is not a regular file
 [ ! -e $slot ] || [ $(stat -c %u:%g:%a $slot) = 0:0:600 ] || fail the slot is not the owned 0:0 600 token

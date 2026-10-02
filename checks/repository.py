@@ -121,6 +121,9 @@ PLACEMENT_MARKERS = (
     "-Target rent -Identity",
     'test "$(place)" = "rent-receive: unchanged"',
     "for drift in 'chmod 644 /s/cloudflared/token' 'chown 1000:1000 /s/cloudflared/token'; do",
+    "for pair in 'chmod 777 /s/cloudflared|chmod 700 /s/cloudflared' 'chmod 770 /s/cloudflared|chmod 700 /s/cloudflared' \\\n"
+    "            'chown 1000:0 /s/cloudflared|chown 0:0 /s/cloudflared' \"chmod 775 /s|chmod $root_mode /s\" 'chown 1000:0 /s|chown 0:0 /s'; do",
+    'slot \'chmod 755 /s/cloudflared\'\n          test "$(printf \'%s\' "$other" | receive)" = "rent-receive: unchanged"',
 )
 PLACEMENT_FLAKE = (
     'hash = assert pkgs.sops.version == "3.13.2"; "sha256-y2/sduI8tKxWdxrDhHKw/hunmoSb8iAK7afJRnoEW3s=";',
@@ -715,7 +718,9 @@ def check_placement(root: Path) -> None:
     require('"' not in receiver and "\\" not in receiver, "the rent receiver must be argv-safe")
     for marker in ("head -c 4097 >$temp", "[ $size -ge 1 ] && [ $size -le 4096 ]", "chown 0:0 $temp", "chmod 600 $temp",
                    "mv -f -- $temp $slot", "[ ! -L $slot ] || fail",
-                   "[ ! -e $slot ] || [ $(stat -c %u:%g:%a $slot) = 0:0:600 ] || fail", "if [ -e $slot ] && cmp -s $temp $slot; then"):
+                   "[ ! -e $slot ] || [ $(stat -c %u:%g:%a $slot) = 0:0:600 ] || fail", "if [ -e $slot ] && cmp -s $temp $slot; then",
+                   "safe() { [ -d $1 ] && [ ! -L $1 ] && [ $(stat -c %u $1) = 0 ] && [ $(( 0$(stat -c %a $1) & 022 )) = 0 ]; }",
+                   "safe $state || fail", "safe $dir || fail"):
         require(marker in receiver, f"the rent receiver must enforce the slot rule: {marker}")
     entry = (root / PLACEMENT_ENTRY).read_text(encoding="utf-8")
     for marker in ("'-NoProfile -NonInteractive -File \"' + $win + '\" -Mode RentAccess'", "@{ SOPS_AGE_KEY_FILE = $Identity }",

@@ -424,8 +424,26 @@ jobs:
             test "$(token_sha)" = "$(printf '%s' "$other" | sha256sum | cut -d ' ' -f 1)"
             slot 'chown 0:0 /s/cloudflared/token && chmod 600 /s/cloudflared/token'
           done
+          # A parent another user could change, at either level, is refused before input: the slot keeps its bytes,
+          # owner and mode and no temp file appears. A safe parent of another mode (755) is still accepted.
+          root_mode="$(slot 'stat -c %a /s')"
+          for pair in 'chmod 777 /s/cloudflared|chmod 700 /s/cloudflared' 'chmod 770 /s/cloudflared|chmod 700 /s/cloudflared' \
+            'chown 1000:0 /s/cloudflared|chown 0:0 /s/cloudflared' "chmod 775 /s|chmod $root_mode /s" 'chown 1000:0 /s|chown 0:0 /s'; do
+            before="$(slot 'stat -c %u:%g:%a:%s /s/cloudflared/token')"
+            slot "${pair%%|*}"
+            if place; then
+              echo "an unsafe parent was accepted: ${pair%%|*}" >&2
+              exit 1
+            fi
+            slot "${pair#*|}"
+            test "$(slot 'stat -c %u:%g:%a:%s /s/cloudflared/token')" = "$before"
+            test "$(token_sha)" = "$(printf '%s' "$other" | sha256sum | cut -d ' ' -f 1)"
+            test -z "$(slot 'ls -A /s/cloudflared | grep -v ^token$ || true')"
+          done
+          slot 'chmod 755 /s/cloudflared'
+          test "$(printf '%s' "$other" | receive)" = "rent-receive: unchanged"
           test -z "$(slot 'ls -A /s/cloudflared | grep -v ^token$ || true')"
-          echo "rent-receive.sh in $RENT_IMAGE: placed 0:0 600 exact token, same value unchanged, rotated; blank, whitespace, oversized and drifted (mode, owner) slots refused and kept"
+          echo "rent-receive.sh in $RENT_IMAGE: placed 0:0 600 exact token, same value unchanged, rotated; blank, whitespace, oversized and drifted (mode, owner) slots and writable or foreign parents (slot directory and state root) refused and kept; a 755 parent accepted"
 
   toolchain:
     runs-on: ubuntu-24.04
