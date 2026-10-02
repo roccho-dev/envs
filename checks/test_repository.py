@@ -304,6 +304,16 @@ def main() -> None:
     expect_red(replace_text(tf, 'version = "5.21.1"', 'version = ">= 5.0"'))
     expect_red(replace_text(tf, 'output "credentials" {\n  sensitive = true\n', 'output "credentials" {\n'))
     expect_red(lambda root: (root / "providers/dev-rent-access-probe/terraform.tfstate").write_text("{}\n"))
+    # The persistent root: native validate accepts each of these, so the oracle must refuse them.
+    rent = "providers/dev-rent-cloudflare/main.tf"
+    expect_red(replace_text(rent, '  backend "s3" {\n', '  backend "local" {\n'))
+    expect_red(replace_text(rent, "    plan {\n      enforced = true\n    }\n", "    plan {\n      enforced = false\n    }\n"))
+    expect_red(replace_text(rent, "    state {\n      enforced = true\n    }\n", ""))
+    expect_red(replace_text(rent, 'output "credentials" {\n  sensitive = true\n', 'output "credentials" {\n'))
+    expect_red(replace_text(rent, "  duration   = var.service_token_duration\n", '  duration   = "1h"\n'))
+    expect_red(replace_text(rent, 'variable "service_token_duration" {\n  type = string\n}\n',
+                            'variable "service_token_duration" {\n  type    = string\n  default = "8760h"\n}\n'))
+    expect_red(replace_text(".github/workflows/check.yml", '"$tool/tofu" -chdir="$rent" validate -no-color\n', ""))
     expect_red(lambda root: (root / "providers/dev-rent-access-probe/.terraform.lock.hcl").write_text("\n"))
     expect_red(mutate_plane("dev.rent-access-probe", lambda row: row.update(
         {"active_github_environment": "dev-rent-access-probe", "migration_state": "ACTIVE"})))
