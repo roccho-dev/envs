@@ -1311,6 +1311,9 @@ STATE_DIAGNOSTIC_VALUES: dict[str, tuple[Any, ...]] = {
     "transient": (True, False),
     "word": ("decrypt", "encrypt", "credential", "none"),
     "local": ("none", "envs", "os", "subprocess"),
+    # The post-TTL probe's S3 error code: the R2 authentication and authorization codes, any other parsed code, or
+    # none. It narrows the investigation only; no code is a credential end, which stays a completed 401.
+    "code": ("Unauthorized", "AccessDenied", "ExpiredRequest", "SignatureDoesNotMatch", "NotEntitled", "other", "none"),
 }
 NO_FAILURE_FACTS = {"status": "none", "access_denied": False, "transient": False, "word": "none"}
 
@@ -1373,9 +1376,13 @@ def s3_object(tools: Mapping[str, str], runner: Runner, endpoint: str, credentia
     complete = result.returncode == 0
     ok = complete and 200 <= code < 300
     status = "none" if ok or code == 0 else str(code) if code in (401, 403) else "5xx" if code >= 500 else "other"
+    # Only a completed failed reply's single direct Code names one, mapped into the closed set; nothing else is kept.
+    parsed = s3_error_code(result.stdout) if complete and not ok else None
+    known = STATE_DIAGNOSTIC_VALUES["code"][:-2]
     return {"ok": ok, "status": status,
-            "access_denied": complete and status == "403" and s3_error_code(result.stdout) == "AccessDenied",
-            "transient": not complete, "body": result.stdout if ok else None}
+            "access_denied": complete and status == "403" and parsed == "AccessDenied",
+            "transient": not complete, "body": result.stdout if ok else None,
+            "code": "none" if parsed is None else parsed if parsed in known else "other"}
 
 
 def s3_facts(operation: Mapping[str, Any]) -> dict[str, Any]:
@@ -1413,7 +1420,7 @@ def probe_evidence(probe: str, operation: Mapping[str, Any] | None = None,
                    error: BaseException | None = None) -> dict[str, Any]:
     local = "none" if error is None else failure_class(error)
     facts = s3_facts(operation) if operation is not None else NO_FAILURE_FACTS
-    return {"probe": probe, **facts, "local": local}
+    return {"probe": probe, **facts, "local": local, "code": operation["code"] if operation is not None else "none"}
 
 
 def diagnostics_finite(diagnostics: Any) -> bool:
@@ -1429,7 +1436,7 @@ def diagnostics_finite(diagnostics: Any) -> bool:
     negative_keys = {"control", "phase", *NO_FAILURE_FACTS}
     return (negatives is None or (isinstance(negatives, dict) and set(negatives) == set(STATE_NEGATIVES) and all(
         item is None or entry(item, negative_keys) for item in negatives.values()))) and entry(
-        diagnostics["credential_probe"], {"probe", "local", *NO_FAILURE_FACTS})
+        diagnostics["credential_probe"], {"probe", "local", "code", *NO_FAILURE_FACTS})
 
 
 S3 = Callable[..., dict[str, Any]]

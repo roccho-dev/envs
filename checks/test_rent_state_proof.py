@@ -773,7 +773,7 @@ def test_branch_evidence(root: Path) -> None:
     for name in ("outside_prefix_write_refused", "decoy_refused"):
         assert negatives[name]["status"] == "403" and negatives[name]["access_denied"] is True
     assert diagnostics["credential_probe"] == {"probe": "refused", "status": "401", "access_denied": False,
-                                               "transient": False, "word": "none", "local": "none"}
+                                               "transient": False, "word": "none", "local": "none", "code": "none"}
     # Each UNKNOWN or ADMITTED branch is told apart by finite evidence, with the label unchanged.
     for world, name, expected in (
         (World(s3={"outside": (200, b"")}), "outside_prefix_write_refused", {"phase": "admitted", "status": "none"}),
@@ -798,20 +798,35 @@ def test_branch_evidence(root: Path) -> None:
     # The post-TTL probe: admitted, refused for another cause, not run behind a failed control, or a local failure
     # named only by its closed class.
     for world, credential, expected in (
-        (World(never_expire=True), "STILL_USABLE", {"probe": "admitted", "status": "none", "local": "none"}),
+        (World(never_expire=True), "STILL_USABLE", {"probe": "admitted", "status": "none", "local": "none", "code": "none"}),
         (World(s3={"post-ttl": (403, ACCESS_DENIED_XML)}), "UNKNOWN",
-         {"probe": "refused", "status": "403", "access_denied": True}),
-        (World(s3={"post-ttl": (503, b"")}), "UNKNOWN", {"probe": "refused", "status": "5xx"}),
-        (World(s3={"post-ttl": "timeout"}), "UNKNOWN", {"probe": "refused", "status": "none", "transient": True}),
-        (World(s3={"proof-get": (503, b"")}), "UNKNOWN", {"probe": "not_run", "local": "none"}),
-        (World(raising={"curl:post-ttl": OSError}), "UNKNOWN", {"probe": "local_failure", "local": "os"}),
+         {"probe": "refused", "status": "403", "access_denied": True, "code": "AccessDenied"}),
+        (World(s3={"post-ttl": (503, b"")}), "UNKNOWN", {"probe": "refused", "status": "5xx", "code": "none"}),
+        (World(s3={"post-ttl": "timeout"}), "UNKNOWN",
+         {"probe": "refused", "status": "none", "transient": True, "code": "none"}),
+        (World(s3={"proof-get": (503, b"")}), "UNKNOWN", {"probe": "not_run", "local": "none", "code": "none"}),
+        (World(raising={"curl:post-ttl": OSError}), "UNKNOWN", {"probe": "local_failure", "local": "os", "code": "none"}),
         (World(raising={"curl:post-ttl": subprocess.SubprocessError}), "UNKNOWN",
-         {"probe": "local_failure", "local": "subprocess"}),
-        (World(issuance="5xx"), "ISSUANCE_UNKNOWN", {"probe": "not_run"}),
+         {"probe": "local_failure", "local": "subprocess", "code": "none"}),
+        (World(issuance="5xx"), "ISSUANCE_UNKNOWN", {"probe": "not_run", "code": "none"}),
     ):
         result = world.prove(root)
         probe = diagnostics_hold(world, result)["credential_probe"]
         assert result["credential"] == credential and {key: probe[key] for key in expected} == expected, (probe, result)
+    # A completed post-TTL 403 names its code for the investigation only: whatever the code, the credential and the
+    # cleanup stay UNKNOWN and nothing is proven; only the 401 path proves, and its code changes nothing.
+    for reply, code in (((403, s3_error("ExpiredRequest")), "ExpiredRequest"), ((403, SIGNATURE_XML), "SignatureDoesNotMatch"),
+                        ((403, s3_error("NotEntitled")), "NotEntitled"), ((403, s3_error("ExpiredToken")), "other"),
+                        ((403, b""), "none"), ((403, DUPLICATE_CODE_XML), "none")):
+        world = World(s3={"post-ttl": reply})
+        result = world.prove(root)
+        probe = diagnostics_hold(world, result)["credential_probe"]
+        assert probe["code"] == code and probe["status"] == "403" and result["credential"] == "UNKNOWN", (code, probe)
+        assert result["cleanup"] == "UNKNOWN" and result["status"] == "UNKNOWN" and result["buckets"] == "ABSENT", result
+    world = World(s3={"post-ttl": (401, s3_error("Unauthorized"))})
+    result = world.prove(root)
+    assert diagnostics_hold(world, result)["credential_probe"]["code"] == "Unauthorized"
+    assert result["status"] == "STATE_BACKEND_PROVEN" and result["credential"] == "UNUSABLE_AFTER_TTL", result
     # No negative ran: the evidence says so instead of inventing a branch.
     world = World(issuance="transport")
     assert diagnostics_hold(world, result := world.prove(root))["negatives"] is None and result["negatives"] is None
@@ -828,6 +843,9 @@ def test_diagnostics_closed() -> None:
         {**good, "credential_probe": {**good["credential_probe"], "status": "403 AccessDenied: denied"}},
         {**good, "credential_probe": {**good["credential_probe"], "word": TEMPORARY["sessionToken"]}},
         {**good, "credential_probe": {**good["credential_probe"], "detail": "x"}},
+        {**good, "credential_probe": {**good["credential_probe"], "code": "ExpiredToken"}},
+        {**good, "credential_probe": {key: value for key, value in good["credential_probe"].items() if key != "code"}},
+        {**good, "negatives": {name: {**entry, "code": "none"} for name in jev.STATE_NEGATIVES}},
         {**good, "negatives": {name: {**entry, "control": 1} for name in jev.STATE_NEGATIVES}},
         {**good, "negatives": {name: {**entry, "phase": "plan"} for name in jev.STATE_NEGATIVES}},
         {**good, "negatives": {"old_key_refused": entry}},
@@ -1218,10 +1236,31 @@ def real_s3(curl: str) -> None:
         after = s3("GET", proof, jev.STATE_MARKER_KEY)
         assert not after["ok"] and after["status"] == "401" and jev.s3_cause(after) == "unauthorized", after
         outcome["post_ttl"] = jev.s3_cause(after)
+        # The probe's closed code: a completed failed reply's single direct Code if listed, other if not, none for a
+        # bodyless, malformed or contradictory reply. No code changes the cause: only the 401 is unauthorized.
+        codes = {}
+        for name, reply, code, cause in (
+            ("unauthorized_xml", (401, s3_error("Unauthorized")), "Unauthorized", "unauthorized"),
+            ("access_denied", (403, ACCESS_DENIED_XML), "AccessDenied", "access_denied"),
+            ("expired_request", (403, s3_error("ExpiredRequest")), "ExpiredRequest", "unknown"),
+            ("signature", (403, SIGNATURE_XML), "SignatureDoesNotMatch", "unknown"),
+            ("not_entitled", (403, s3_error("NotEntitled")), "NotEntitled", "unknown"),
+            ("unlisted", (403, s3_error("ExpiredToken")), "other", "unknown"),
+            ("bodyless", (403, b""), "none", "unknown"),
+            ("malformed", (403, b"<Error><Code>ExpiredRequest"), "none", "unknown"),
+            ("duplicate", (403, DUPLICATE_CODE_XML), "none", "unknown"),
+        ):
+            script(reply, "GET", proof, jev.STATE_MARKER_KEY)
+            operation = s3("GET", proof, jev.STATE_MARKER_KEY)
+            evidence = jev.probe_evidence("refused", operation)
+            assert operation["code"] == code and evidence["code"] == code and jev.s3_cause(operation) == cause, \
+                (name, operation["code"], jev.s3_cause(operation))
+            codes[name] = evidence["code"]
+        outcome["post_ttl_codes"] = codes
         # No reply within the bound: transient, never retried, never a refusal.
         script((200, jev.STATE_MARKER, 4), "GET", proof, jev.STATE_MARKER_KEY)
         operation = s3("GET", proof, jev.STATE_MARKER_KEY, timeout=2)
-        assert not operation["ok"] and operation["transient"] and operation["status"] == "none"
+        assert not operation["ok"] and operation["transient"] and operation["status"] == "none" and operation["code"] == "none"
         outcome["timeout"] = jev.s3_refusal(True, operation, causes)
         # A partial transfer (more Content-Length than delivered) with a parsable reply: curl exits nonzero, so neither
         # the XML 403 AccessDenied, the 401 nor the exact marker bytes count as a completed reply.
@@ -1233,6 +1272,7 @@ def real_s3(curl: str) -> None:
             assert exits[-1] == 18, (name, "the transfer was not partial")
             assert not operation["ok"] and operation["transient"] and not operation["access_denied"]
             assert jev.s3_cause(operation) == "unknown" and operation["body"] is None, (name, jev.s3_facts(operation))
+            assert operation["code"] == "none", (name, "an incomplete reply named a code")
             outcome[name] = jev.s3_refusal(True, operation, causes)
         # A misrouted request answered with the qualifying XML 403 would classify as REFUSED, so only the observed
         # method, target and payload keep it out: each wrong request differs from the expected one in those fields.
@@ -1252,7 +1292,8 @@ def real_s3(curl: str) -> None:
             assert caught[name], (name, "a misrouted request matched the expected one")
         outcome["misroute"] = caught
         assert all(value == "UNKNOWN" for name, value in outcome.items() if name not in {
-            "payload_hash", "control", "xml_access_denied", "decoy_access_denied", "post_ttl", "misroute"}), outcome
+            "payload_hash", "control", "xml_access_denied", "decoy_access_denied", "post_ttl", "post_ttl_codes",
+            "misroute"}), outcome
         assert expected == [] and attempted == {proof: {jev.STATE_MARKER_KEY, jev.STATE_OUTSIDE_MARKER_KEY}}, attempted
         # The credential and session token never reach argv or the environment; only finite facts leave.
         assert len(server.seen) == len(launched) and server.replies == []
