@@ -295,8 +295,12 @@ def check_rent_config(text: str) -> None:
             "persistent root must enforce state and plan encryption")
     require(re.search(r'(?ms)^output "credentials" \{\n  sensitive = true\n', text) is not None,
             "persistent root credentials must be a sensitive output")
+    # Every duration assignment line (horizontal whitespace only), its end-of-line # or // comment removed; a comment
+    # line is never an assignment.
+    durations = [re.sub(r"[ \t]*(#|//).*$", "", value).strip()
+                 for value in re.findall(r"(?m)^[ \t]*duration[ \t]*=[ \t]*(.*)$", text)]
     require('variable "service_token_duration" {\n  type = string\n}\n' in text
-            and "  duration   = var.service_token_duration\n" in text and text.count("duration") == 3,
+            and durations == ["var.service_token_duration"],
             "the service-token duration must be a required input with no default")
 
 
