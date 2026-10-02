@@ -286,19 +286,19 @@ def check_probe_config(text: str) -> None:
             "probe credentials must be a sensitive output")
 
 
-def check_rent_config(text: str) -> None:
+def check_rent_config(source: str) -> None:
     # Only what native validate accepts and must not: a plaintext local backend, unenforced encryption, a credentials
-    # output printed in clear, and a service-token lifetime fixed in source rather than bound at deployment.
+    # output printed in clear, and a service-token lifetime fixed in source rather than bound at deployment. Comments
+    # never count: /* */ blocks and #, // line comments are dropped first (this root has no # or // inside a string).
+    text = re.sub(r"(?m)[ \t]*(#|//).*$", "", re.sub(r"(?s)/\*.*?\*/", "", source))
     require(text.count('backend "') == 1 and '  backend "s3" {\n' in text and "    use_lockfile                = true\n" in text,
             "persistent root must use the locked native S3 backend")
     require("  encryption {\n    state {\n      enforced = true\n    }\n    plan {\n      enforced = true\n    }\n  }\n" in text,
             "persistent root must enforce state and plan encryption")
     require(re.search(r'(?ms)^output "credentials" \{\n  sensitive = true\n', text) is not None,
             "persistent root credentials must be a sensitive output")
-    # Every duration assignment line (horizontal whitespace only), its end-of-line # or // comment removed; a comment
-    # line is never an assignment.
-    durations = [re.sub(r"[ \t]*(#|//).*$", "", value).strip()
-                 for value in re.findall(r"(?m)^[ \t]*duration[ \t]*=[ \t]*(.*)$", text)]
+    # Every remaining duration assignment line (horizontal whitespace only).
+    durations = [value.strip() for value in re.findall(r"(?m)^[ \t]*duration[ \t]*=[ \t]*(.*)$", text)]
     require('variable "service_token_duration" {\n  type = string\n}\n' in text
             and durations == ["var.service_token_duration"],
             "the service-token duration must be a required input with no default")

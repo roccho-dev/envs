@@ -318,13 +318,12 @@ def main() -> None:
     expect_red(replace_text(rent, '\ndata "cloudflare_zero_trust_tunnel_cloudflared_token" "rent" {',
                             '\nresource "cloudflare_zero_trust_access_service_token" "spare" {\n  account_id = var.account_id\n'
                             '  name       = "spare"\n  duration   = "1h"\n}\n\ndata "cloudflare_zero_trust_tunnel_cloudflared_token" "rent" {'))
-    commented = copy_root()
-    try:
-        replace_text(rent, "  duration   = var.service_token_duration\n",
-                     "  # duration is bound at deployment\n  duration   = var.service_token_duration # not fixed here\n")(commented)
-        repository.inspect(commented)
-    finally:
-        shutil.rmtree(commented.parent, ignore_errors=True)
+    declared = (ROOT / rent).read_text(encoding="utf-8")
+    commented = ('# backend "s3" is not another backend\n// duration = "1h" is only a comment\n'
+                 + declared.replace("  duration   = var.service_token_duration\n",
+                                    '  /* duration = "1h"\n  */\n  duration   = var.service_token_duration # bound at deployment\n'))
+    assert '  /* duration = "1h"\n' in commented, "rent fixture anchor missing"
+    repository.check_rent_config(commented)
     expect_red(lambda root: (root / "providers/dev-rent-access-probe/.terraform.lock.hcl").write_text("\n"))
     expect_red(mutate_plane("dev.rent-access-probe", lambda row: row.update(
         {"active_github_environment": "dev-rent-access-probe", "migration_state": "ACTIVE"})))
