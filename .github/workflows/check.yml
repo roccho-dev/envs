@@ -401,6 +401,56 @@ jobs:
           test "$(place)" = "rent-receive: placed"
           test "$(slot 'stat -c %u:%g:%a /s/cloudflared/token')" = "0:0:600"
           test "$(token_sha)" = "$(jq -r .tunnel_sha256 "$values")"
+          # Exclusion over the placed token: a holder in the same image takes the state-root lock the receiver takes.
+          # While it holds it, the real receiver refuses another token with exit 2 and the exact busy line and the whole
+          # volume, slot included, stays identical; after that holder is removed and gone, the same receiver places that
+          # token, and the original token is placed again for the checks below. Only the container this step created
+          # (by its ID) is ever removed.
+          holder=""
+          trap 'if [ -n "$holder" ]; then docker rm -f "$holder" >/dev/null 2>&1 || true; fi' EXIT
+          created="$(docker run -d -v rent-placement-state:/var/lib/rent "$RENT_IMAGE" \
+            /bin/bash -c 'exec 9</var/lib/rent || exit 3; /bin/flock -x -n 9 || exit 4; echo held; exec sleep 600')"
+          [[ "$created" =~ ^[0-9a-f]{64}$ ]]
+          holder="$created"
+          held() { [ "$(docker logs "$holder" 2>&1)" = held ] && [ "$(docker inspect -f '{{.State.Running}}' "$holder")" = true ]; }
+          for _ in $(seq 30); do
+            if held; then break; fi
+            sleep 1
+          done
+          if ! held; then
+            echo "the lock holder is not holding: exit $(docker inspect -f '{{.State.ExitCode}}' "$holder")" >&2
+            exit 1
+          fi
+          volume_state() { slot 'set -euo pipefail; cd /s; find . -printf "%y %U:%G %m %s %p\n" | LC_ALL=C sort; find . -type f -exec sha256sum {} + | LC_ALL=C sort'; }
+          before="$(volume_state)"
+          busy="$(head -c 48 /dev/urandom | base64 -w0)"
+          busy_sha="$(printf '%s' "$busy" | sha256sum | cut -d ' ' -f 1)"
+          test "$busy_sha" != "$(token_sha)"
+          set +e
+          printf '%s' "$busy" | receive >"$RUNNER_TEMP/busy.out" 2>"$RUNNER_TEMP/busy.err"
+          codes=("${PIPESTATUS[@]}")
+          set -e
+          test "${codes[1]}" = 2
+          case "${codes[0]}" in 0 | 141) ;; *) echo "the busy producer failed: ${codes[0]}" >&2; exit 1 ;; esac
+          test ! -s "$RUNNER_TEMP/busy.out"
+          test "$(cat "$RUNNER_TEMP/busy.err")" = "rent-receive: the state volume is in use by a running rent or another writer"
+          after="$(volume_state)"
+          test "$after" = "$before"
+          if ! held; then
+            echo "the lock holder stopped during the busy attempt" >&2
+            exit 1
+          fi
+          docker rm -f "$holder" >/dev/null
+          if docker inspect "$holder" >/dev/null 2>&1; then
+            echo "the lock holder was not removed" >&2
+            exit 1
+          fi
+          holder=""
+          test "$(printf '%s' "$busy" | receive)" = "rent-receive: placed"
+          test "$(slot 'stat -c %u:%g:%a /s/cloudflared/token')" = "0:0:600"
+          test "$(token_sha)" = "$busy_sha"
+          test "$(place)" = "rent-receive: placed"
+          test "$(token_sha)" = "$(jq -r .tunnel_sha256 "$values")"
           test "$(place)" = "rent-receive: unchanged"
           for bad in '' '   ' "$(head -c 4097 /dev/zero | tr '\0' a)"; do
             if printf '%s' "$bad" | receive; then
@@ -443,7 +493,7 @@ jobs:
           slot 'chmod 755 /s/cloudflared'
           test "$(printf '%s' "$other" | receive)" = "rent-receive: unchanged"
           test -z "$(slot 'ls -A /s/cloudflared | grep -v ^token$ || true')"
-          echo "rent-receive.sh in $RENT_IMAGE: placed 0:0 600 exact token, same value unchanged, rotated; blank, whitespace, oversized and drifted (mode, owner) slots and writable or foreign parents (slot directory and state root) refused and kept; a 755 parent accepted"
+          echo "rent-receive.sh in $RENT_IMAGE: placed 0:0 600 exact token; refused another token with the exact busy line and left the whole volume, slot included, identical while a holder held the state-root lock, then after its removal placed that token and the original again; same value unchanged, rotated; blank, whitespace, oversized and drifted (mode, owner) slots and writable or foreign parents (slot directory and state root) refused and kept; a 755 parent accepted"
 
   toolchain:
     runs-on: ubuntu-24.04
