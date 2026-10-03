@@ -394,50 +394,51 @@ def snapshot(root: Path) -> dict[str, bytes | None]:
             for path in (jev.ENVIRONMENTS, jev.RENT_CIPHERTEXT, jev.CLIENT_CIPHERTEXT)}
 
 
+# The rent-root cases delete nothing (no recursive deletion in reusable automation): each copied data root and each
+# run's scratch stays in the CI runner's temporary space, which ends with the runner.
 def test_root_author() -> None:
     root = fixtures.copy_root()
     runner = RootRunner()
-    try:
-        with fixtures.environment(root_env()):
-            result = jev.rent_root(root, runner)
-        assert result == {
-            "kind": "envs.rentRootResult.v1", "status": "PASS",
-            "ciphertexts": [jev.RENT_CIPHERTEXT.as_posix(), jev.CLIENT_CIPHERTEXT.as_posix()],
-            "target_apply": "NOT_RUN", "client_access": "UNPROVED",
-        }
-        assert runner.steps() == ["init", "apply", "output", "sops", "sops"], runner.steps()
-        init = runner.calls[0][0]
-        assert init[3:] == ["-input=false", "-no-color", f"-backend-config=bucket={ROOT_VALUES['RENT_STATE_BUCKET']}",
-                            f"-backend-config=key={ROOT_VALUES['RENT_STATE_KEY']}"], init
-        assert runner.calls[2][0][3:] == ["-json", "credentials"]
-        # Every child's argv is free of values; each OpenTofu child gets exactly the root environment.
-        assert not any(value in item for value in root_secrets() for argv, _, _ in runner.calls for item in argv)
-        expected = {"PATH", "HOME", "CLOUDFLARE_API_TOKEN", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
-                    "AWS_ENDPOINT_URL_S3", "AWS_EC2_METADATA_DISABLED", "TF_ENCRYPTION", "TF_VAR_account_id",
-                    "TF_VAR_zone_id", "TF_VAR_hostname", "TF_VAR_origin_service", "TF_VAR_service_token_duration",
-                    "TF_IN_AUTOMATION", "TF_INPUT"}
-        for argv, stdin, env in runner.calls[:3]:
-            assert set(env) - {"TMPDIR", "LANG", "LC_ALL", "CI"} == expected, sorted(env)
-            assert stdin is None
-            assert env["TF_ENCRYPTION"] == jev.encryption_config("k0", ROOT_VALUES["RENT_STATE_PASSPHRASE"])
-            assert env["AWS_ENDPOINT_URL_S3"] == jev.r2_endpoint(ACCOUNT_ID)
-            assert env["TF_VAR_service_token_duration"] == ROOT_VALUES["RENT_SERVICE_TOKEN_DURATION"]
-            assert env["HOME"] != os.environ.get("HOME")
-        # Each sops child gets only its recipient, and only its own values on stdin.
-        (rent_argv, rent_stdin, rent_env), (client_argv, client_stdin, client_env) = runner.calls[3:]
-        assert set(rent_env) <= SOPS_ENV_KEYS and rent_env["SOPS_AGE_RECIPIENTS"] == RECIPIENT
-        assert set(client_env) <= SOPS_ENV_KEYS and client_env["SOPS_AGE_RECIPIENTS"] == ROOT_CLIENT_RECIPIENT
-        assert json.loads(rent_stdin) == {jev.RENT_KEY: TOKEN}
-        assert json.loads(client_stdin) == {"RENT_ACCESS_CLIENT_ID": CLIENT_ID, "RENT_ACCESS_CLIENT_SECRET": CLIENT_SECRET}
-        assert not any(value in json.dumps(result) for value in root_secrets())
-        contracts = jev.validate_contracts(root)
-        for plane in (jev.RENT_PLANE, jev.CLIENT_PLANE, jev.ROOT_PLANE):
-            assert contracts["environments"][plane]["migration_state"] == "ACTIVE"
-        for path in jev.repository_files(root):
-            data = path.read_bytes()
-            assert not any(value.encode() in data for value in root_secrets()), path
-    finally:
-        shutil.rmtree(root.parent, ignore_errors=True)
+    with fixtures.environment(root_env()):
+        result = jev.rent_root(root, runner)
+    assert result == {
+        "kind": "envs.rentRootResult.v1", "status": "PASS",
+        "ciphertexts": [jev.RENT_CIPHERTEXT.as_posix(), jev.CLIENT_CIPHERTEXT.as_posix()],
+        "target_apply": "NOT_RUN", "client_access": "UNPROVED",
+    }
+    assert runner.steps() == ["init", "apply", "output", "sops", "sops"], runner.steps()
+    init = runner.calls[0][0]
+    assert init[3:] == ["-input=false", "-no-color", f"-backend-config=bucket={ROOT_VALUES['RENT_STATE_BUCKET']}",
+                        f"-backend-config=key={ROOT_VALUES['RENT_STATE_KEY']}"], init
+    assert runner.calls[2][0][3:] == ["-json", "credentials"]
+    # Every child's argv is free of values; each OpenTofu child gets exactly the root environment.
+    assert not any(value in item for value in root_secrets() for argv, _, _ in runner.calls for item in argv)
+    expected = {"PATH", "HOME", "CLOUDFLARE_API_TOKEN", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+                "AWS_ENDPOINT_URL_S3", "AWS_EC2_METADATA_DISABLED", "TF_ENCRYPTION", "TF_VAR_account_id",
+                "TF_VAR_zone_id", "TF_VAR_hostname", "TF_VAR_origin_service", "TF_VAR_service_token_duration",
+                "TF_IN_AUTOMATION", "TF_INPUT"}
+    home = runner.calls[0][2]["HOME"]
+    assert home != os.environ.get("HOME") and Path(home).is_dir() and not any(Path(home).iterdir())
+    for argv, stdin, env in runner.calls[:3]:
+        assert set(env) - {"TMPDIR", "LANG", "LC_ALL", "CI"} == expected, sorted(env)
+        assert stdin is None and env["HOME"] == home
+        assert env["TF_ENCRYPTION"] == jev.encryption_config("k0", ROOT_VALUES["RENT_STATE_PASSPHRASE"])
+        assert env["AWS_ENDPOINT_URL_S3"] == jev.r2_endpoint(ACCOUNT_ID)
+        assert env["TF_VAR_service_token_duration"] == ROOT_VALUES["RENT_SERVICE_TOKEN_DURATION"]
+    # Each sops child gets only its recipient and the run's fresh HOME, and only its own values on stdin.
+    (rent_argv, rent_stdin, rent_env), (client_argv, client_stdin, client_env) = runner.calls[3:]
+    assert set(rent_env) <= SOPS_ENV_KEYS and rent_env["SOPS_AGE_RECIPIENTS"] == RECIPIENT and rent_env["HOME"] == home
+    assert set(client_env) <= SOPS_ENV_KEYS and client_env["SOPS_AGE_RECIPIENTS"] == ROOT_CLIENT_RECIPIENT \
+        and client_env["HOME"] == home
+    assert json.loads(rent_stdin) == {jev.RENT_KEY: TOKEN}
+    assert json.loads(client_stdin) == {"RENT_ACCESS_CLIENT_ID": CLIENT_ID, "RENT_ACCESS_CLIENT_SECRET": CLIENT_SECRET}
+    assert not any(value in json.dumps(result) for value in root_secrets())
+    contracts = jev.validate_contracts(root)
+    for plane in (jev.RENT_PLANE, jev.CLIENT_PLANE, jev.ROOT_PLANE):
+        assert contracts["environments"][plane]["migration_state"] == "ACTIVE"
+    for path in jev.repository_files(root):
+        data = path.read_bytes()
+        assert not any(value.encode() in data for value in root_secrets()), path
 
 
 def expect_root_red(values: dict[str, str], runner: RootRunner, *, prior: bool = False, mutate=None,
@@ -445,27 +446,24 @@ def expect_root_red(values: dict[str, str], runner: RootRunner, *, prior: bool =
     # A failure before the first write: RED, no destroy/import/retry, and every envelope and plane file unchanged.
     root = fixtures.copy_root()
     progress: dict[str, str] = {}
-    try:
-        if prior:
-            prior_envelopes(root)
-        if mutate is not None:
-            mutate(root)
-        before = snapshot(root)
-        with fixtures.environment(values):
-            try:
-                jev.rent_root(root, runner, progress)
-            except jev.EnvsError as exc:
-                message = str(exc)
-            else:
-                raise AssertionError("invalid rent root state was accepted")
-        assert not any(value in message for value in root_secrets()), message
-        assert snapshot(root) == before, "a failure before the first write changed a file"
-        assert progress["stage"] != "write"
-        assert bool(runner.calls) == children, runner.steps()
-        assert runner.steps().count("apply") <= 1 and not {"destroy", "import", "state"} & set(runner.steps())
-        return progress
-    finally:
-        shutil.rmtree(root.parent, ignore_errors=True)
+    if prior:
+        prior_envelopes(root)
+    if mutate is not None:
+        mutate(root)
+    before = snapshot(root)
+    with fixtures.environment(values):
+        try:
+            jev.rent_root(root, runner, progress)
+        except jev.EnvsError as exc:
+            message = str(exc)
+        else:
+            raise AssertionError("invalid rent root state was accepted")
+    assert not any(value in message for value in root_secrets()), message
+    assert snapshot(root) == before, "a failure before the first write changed a file"
+    assert progress["stage"] != "write"
+    assert bool(runner.calls) == children, runner.steps()
+    assert runner.steps().count("apply") <= 1 and not {"destroy", "import", "state"} & set(runner.steps())
+    return progress
 
 
 def test_root_red() -> None:
@@ -489,7 +487,7 @@ def test_root_red() -> None:
 
 
 def test_root_after_write() -> None:
-    # A failure at or after the first write fails the entry without claiming success; nothing is cleaned up.
+    # A failure at or after the first write fails the entry without claiming success; the written files stay.
     root = fixtures.copy_root()
     progress: dict[str, str] = {}
     original = jev.set_dev_active
@@ -506,11 +504,10 @@ def test_root_after_write() -> None:
                 pass
             else:
                 raise AssertionError("a failed plane update was reported as success")
-        assert progress["stage"] == "write"
-        assert (root / jev.RENT_CIPHERTEXT).is_file() and (root / jev.CLIENT_CIPHERTEXT).is_file()
     finally:
         jev.set_dev_active = original
-        shutil.rmtree(root.parent, ignore_errors=True)
+    assert progress["stage"] == "write"
+    assert (root / jev.RENT_CIPHERTEXT).is_file() and (root / jev.CLIENT_CIPHERTEXT).is_file()
 
 
 def test_root_main() -> None:
@@ -522,20 +519,17 @@ def test_root_main() -> None:
         progress["stage"] = "apply"
         raise KeyError(API_TOKEN)
 
-    try:
-        for values, patch, expected in ((root_env(RENT_HOSTNAME=""), None, "RENT_ROOT=RED: envs at gate\n"),
-                                        (root_env(), leaking, "RENT_ROOT=RED: other at apply\n")):
-            out, err = io.StringIO(), io.StringIO()
-            if patch is not None:
-                jev.rent_root = patch
-            try:
-                with fixtures.environment(values), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                    code = jev.main(["--root", str(root), "rent-root"])
-            finally:
-                jev.rent_root = original
-            assert code == 1 and out.getvalue() == "" and err.getvalue() == expected, (code, out.getvalue(), err.getvalue())
-    finally:
-        shutil.rmtree(root.parent, ignore_errors=True)
+    for values, patch, expected in ((root_env(RENT_HOSTNAME=""), None, "RENT_ROOT=RED: envs at gate\n"),
+                                    (root_env(), leaking, "RENT_ROOT=RED: other at apply\n")):
+        out, err = io.StringIO(), io.StringIO()
+        if patch is not None:
+            jev.rent_root = patch
+        try:
+            with fixtures.environment(values), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = jev.main(["--root", str(root), "rent-root"])
+        finally:
+            jev.rent_root = original
+        assert code == 1 and out.getvalue() == "" and err.getvalue() == expected, (code, out.getvalue(), err.getvalue())
 
 
 def run(argv: list[str], env: dict[str, str]) -> subprocess.CompletedProcess[bytes]:
@@ -711,10 +705,15 @@ def real_root_roundtrip(sops_bin: str, keygen_bin: str, tofu_bin: str) -> None:
             refused = decrypt(relative, other)
             assert refused.returncode != 0 and not any(
                 value.encode() in refused.stdout + refused.stderr for value in (TOKEN, CLIENT_ID, CLIENT_SECRET)), relative
-        print(f"real root output to both envelopes: PASS (tofu={tofu_path}, sops={sops_path})")
     finally:
-        shutil.rmtree(work, ignore_errors=True)
-        shutil.rmtree(root.parent, ignore_errors=True)
+        # Only the two throwaway private identities this run created are removed, each as one exact regular file. The
+        # fixture root, its encrypted state and the copied data root stay in the runner's temporary space.
+        for name in ("rent", "client"):
+            key = work / f"{name}.key"
+            if key.is_file() and not key.is_symlink():
+                key.unlink()
+    assert not any(os.path.lexists(work / f"{name}.key") for name in ("rent", "client")), "a throwaway identity remains"
+    print(f"real root output to both envelopes: PASS (tofu={tofu_path}, sops={sops_path}); identities removed")
 
 
 def main() -> None:

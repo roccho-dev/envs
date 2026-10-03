@@ -889,15 +889,17 @@ def retrieve_tunnel_token(account: str, tunnel: str, api_token: str, fetch: Fetc
     return token
 
 
-def encrypt_rent_token(token: str, recipient: str, tools: Mapping[str, str], runner: Runner = default_runner) -> bytes:
-    # The token reaches SOPS on stdin only; the ciphertext must name exactly this one recipient.
+def encrypt_rent_token(token: str, recipient: str, tools: Mapping[str, str], runner: Runner = default_runner,
+                       home: str | None = None) -> bytes:
+    # The token reaches SOPS on stdin only; the ciphertext must name exactly this one recipient. A given home replaces
+    # the inherited HOME (rent-root's fresh one); without it the standalone entries keep their existing environment.
     require(AGE_RECIPIENT.fullmatch(recipient) is not None, "rent tunnel needs exactly one age recipient")
     require(TUNNEL_TOKEN.fullmatch(token) is not None, "invalid tunnel token")
     payload = json.dumps({RENT_KEY: token}, separators=(",", ":")).encode() + b"\n"
     result = run_checked(
         [tools["sops"], "--encrypt", "--input-type", "json", "--output-type", "yaml", "/dev/stdin"],
         input_data=payload,
-        env=clean_env(tools, {"SOPS_AGE_RECIPIENTS": recipient}),
+        env=clean_env(tools, {"SOPS_AGE_RECIPIENTS": recipient, **({} if home is None else {"HOME": home})}),
         runner=runner,
         label="SOPS encryption",
     )
@@ -927,8 +929,9 @@ def rent_author(root: Path = ROOT, runner: Runner = default_runner, fetch: Fetch
 
 
 def encrypt_client_credential(client_id: str, secret: str, recipient: str, tools: Mapping[str, str],
-                              runner: Runner = default_runner) -> bytes:
+                              runner: Runner = default_runner, home: str | None = None) -> bytes:
     # Both values reach SOPS on stdin only; each must be one line of the windows slot rule, for exactly one recipient.
+    # A given home replaces the inherited HOME, as for encrypt_rent_token.
     require(AGE_RECIPIENT.fullmatch(recipient) is not None, "rent client needs exactly one age recipient")
     require(SLOT_LINE.fullmatch(client_id) is not None and SLOT_LINE.fullmatch(secret) is not None,
             "invalid Access client credential")
@@ -936,7 +939,7 @@ def encrypt_client_credential(client_id: str, secret: str, recipient: str, tools
     result = run_checked(
         [tools["sops"], "--encrypt", "--input-type", "json", "--output-type", "yaml", "/dev/stdin"],
         input_data=payload,
-        env=clean_env(tools, {"SOPS_AGE_RECIPIENTS": recipient}),
+        env=clean_env(tools, {"SOPS_AGE_RECIPIENTS": recipient, **({} if home is None else {"HOME": home})}),
         runner=runner,
         label="SOPS encryption",
     )
@@ -1006,8 +1009,10 @@ def seal_root_output(root: Path, tools: Mapping[str, str], work: Path, env: Mapp
     token = value["tunnel_token"]
     require(isinstance(token, str) and TUNNEL_TOKEN.fullmatch(token) is not None, "root output has no valid tunnel token")
     reject_live_values(root, RENT_KEY, [token])
-    sealed = ((RENT_CIPHERTEXT, encrypt_rent_token(token, rent_recipient, tools, runner)),
-              (CLIENT_CIPHERTEXT, encrypt_client_credential(client_id, secret, client_recipient, tools, runner)))
+    # The sops children share the run's fresh HOME, never the caller's, and get only their one recipient.
+    home = env["HOME"]
+    sealed = ((RENT_CIPHERTEXT, encrypt_rent_token(token, rent_recipient, tools, runner, home)),
+              (CLIENT_CIPHERTEXT, encrypt_client_credential(client_id, secret, client_recipient, tools, runner, home)))
     progress["stage"] = "write"
     for relative, data in sealed:
         target = root / relative
@@ -1034,20 +1039,21 @@ def rent_root(root: Path = ROOT, runner: Runner = default_runner, progress: dict
             f"{ROOT_PLANE}: RENT_STATE_PASSPHRASE is not 64 lowercase hex")
     for name in ROOT_SECRETS:
         reject_live_values(root, name, [inputs[name]])
-    with tempfile.TemporaryDirectory(prefix="envs-rent-root-") as temporary:
-        scratch = Path(temporary)
-        home, work = scratch / "home", scratch / "root"
-        home.mkdir(mode=0o700)
-        work.mkdir()
-        (work / "main.tf").write_bytes((root / ROOT_CONFIG).read_bytes())
-        env = root_env(tools, inputs, home)
-        progress["stage"] = "init"
-        tofu(tools, work, env, runner, "init", "-input=false", "-no-color",
-             f"-backend-config=bucket={inputs['RENT_STATE_BUCKET']}", f"-backend-config=key={inputs['RENT_STATE_KEY']}")
-        progress["stage"] = "apply"
-        tofu(tools, work, env, runner, "apply", "-input=false", "-auto-approve", "-no-color")
-        return seal_root_output(root, tools, work, env, runner, inputs["RENT_AGE_RECIPIENT"], inputs[CLIENT_RECIPIENT],
-                                progress)
+    # A fresh owner-only scratch per run (an empty HOME and the root's working copy). It is retained, never deleted:
+    # automated recursive deletion is forbidden, so it lasts as long as the runner's temporary space.
+    scratch = Path(tempfile.mkdtemp(prefix="envs-rent-root-"))
+    home, work = scratch / "home", scratch / "root"
+    home.mkdir(mode=0o700)
+    work.mkdir()
+    (work / "main.tf").write_bytes((root / ROOT_CONFIG).read_bytes())
+    env = root_env(tools, inputs, home)
+    progress["stage"] = "init"
+    tofu(tools, work, env, runner, "init", "-input=false", "-no-color",
+         f"-backend-config=bucket={inputs['RENT_STATE_BUCKET']}", f"-backend-config=key={inputs['RENT_STATE_KEY']}")
+    progress["stage"] = "apply"
+    tofu(tools, work, env, runner, "apply", "-input=false", "-auto-approve", "-no-color")
+    return seal_root_output(root, tools, work, env, runner, inputs["RENT_AGE_RECIPIENT"], inputs[CLIENT_RECIPIENT],
+                            progress)
 
 
 # A bounded client attempt returns ("exit", code, stdout) or ("timeout", -1, b""); stderr is never kept or logged.
