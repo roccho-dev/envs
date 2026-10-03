@@ -3,7 +3,7 @@
 # using only the image's own bash and coreutils. It reads the token on stdin only and replaces the one slot that
 # windows' rent-start checks: a regular file, owned 0:0, mode 600, 1 to 4096 bytes, not blank. An existing slot is
 # replaced only while it is exactly that owned shape under parents only root can change; any other object is refused
-# and left intact, and the same value changes nothing. It never prints the token. It holds no quote or backslash, so it travels as one argument unchanged.
+# and left intact, and the same value changes nothing. It never prints the token. It holds no double quote or backslash, so it travels as one argument unchanged.
 set -euo pipefail
 umask 077
 fail() { echo rent-receive: $* >&2; exit 2; }
@@ -14,6 +14,10 @@ state=/var/lib/rent
 dir=$state/cloudflared
 slot=$dir/token
 safe $state || fail the state volume is not a root-owned directory only its owner can write
+# One writer: the exclusive lock on the state root that rent-start, seed and state import take, held on fd 9 until
+# exit. Busy (flock exit 75) and any other lock failure are refused apart, before anything is created or read.
+exec 9<$state
+/bin/flock -x -n -E 75 9 || { [ $? = 75 ] && fail the state volume is in use by a running rent or another writer; fail the state lock could not be taken; }
 [ ! -L $dir ] || fail the slot directory is a link
 [ -e $dir ] || mkdir $dir
 safe $dir || fail the slot directory is not a root-owned directory only its owner can write
