@@ -68,10 +68,22 @@
         url = "https://github.com/getsops/sops/releases/download/v${pkgs.sops.version}/sops-v${pkgs.sops.version}.amd64.exe";
         hash = assert pkgs.sops.version == "3.13.2"; "sha256-y2/sduI8tKxWdxrDhHKw/hunmoSb8iAK7afJRnoEW3s=";
       };
-      placement-artifact = pkgs.runCommand "envs-placement" { } ''
-        mkdir -p "$out"
+      # The official Windows age release archive; only its age-keygen.exe is shipped, so a target can create its own
+      # identity in place and export only the public recipient. Its exact LICENSE ships alongside (LICENSES/).
+      age-windows = pkgs.fetchurl {
+        url = "https://github.com/FiloSottile/age/releases/download/v1.3.2/age-v1.3.2-windows-amd64.zip";
+        hash = "sha256-9I2Pj56+kDq1An7QZ2UvLMHblLwgaXZDATO5BdzY6Mc=";
+      };
+      placement-artifact = pkgs.runCommand "envs-placement" { nativeBuildInputs = [ pkgs.unzip ]; } ''
+        mkdir -p "$out" "$out/LICENSES"
         cp ${self}/adapters/place.ps1 ${self}/adapters/rent-receive.sh "$out/"
         cp ${sops-windows} "$out/sops.exe"
+        unzip -p ${age-windows} age/age-keygen.exe > "$out/age-keygen.exe"
+        # The committed license texts are exactly the ones these binaries come with.
+        unzip -p ${age-windows} age/LICENSE | cmp - ${self}/LICENSES/age-v1.3.2.txt
+        cmp ${pkgs.sops.src}/LICENSE ${self}/LICENSES/sops-v3.13.2.txt
+        cp ${self}/LICENSES/README.md ${self}/LICENSES/age-v1.3.2.txt ${self}/LICENSES/sops-v3.13.2.txt "$out/LICENSES/"
+        cp ${self}/THIRD_PARTY_NOTICES.md "$out/"
         echo ${rev} > "$out/SOURCE"
         if [ -d ${self}/ciphertexts ]; then cp -r ${self}/ciphertexts "$out/ciphertexts"; fi
       '';

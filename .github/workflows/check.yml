@@ -84,6 +84,12 @@ jobs:
           echo "cb6fec76e23cb4ac56771ac38472b0fe1ba79a849bf2200aeda7c9467a045b7b  $RUNNER_TEMP/placement/sops.exe" | sha256sum -c -
           cmp adapters/place.ps1 "$RUNNER_TEMP/placement/place.ps1"
           cmp adapters/rent-receive.sh "$RUNNER_TEMP/placement/rent-receive.sh"
+          # The redistributed binaries travel with their exact license texts and this repository's notice.
+          test -s "$RUNNER_TEMP/placement/age-keygen.exe"
+          cmp LICENSES/age-v1.3.2.txt "$RUNNER_TEMP/placement/LICENSES/age-v1.3.2.txt"
+          cmp LICENSES/sops-v3.13.2.txt "$RUNNER_TEMP/placement/LICENSES/sops-v3.13.2.txt"
+          cmp LICENSES/README.md "$RUNNER_TEMP/placement/LICENSES/README.md"
+          cmp THIRD_PARTY_NOTICES.md "$RUNNER_TEMP/placement/THIRD_PARTY_NOTICES.md"
           mkdir "$RUNNER_TEMP/provide-placement"
           cp -RL "$RUNNER_TEMP/placement/." "$RUNNER_TEMP/provide-placement/"
 
@@ -330,6 +336,71 @@ jobs:
             if ([Text.Encoding]::ASCII.GetString($bytes).Contains($values.client_secret)) { throw "a credential reached the file $($file.Name)" }
           }
           'place.ps1 -> released ReadRentAccessInput/Get-RentAccessProblem: exact slot bytes; wrong identity and tampered envelope refused before the writer; no credential in output, transcript, command lines or files'
+
+      # The bundled age-keygen.exe exactly as a target would use it, in Windows PowerShell 5.1 on a synthetic key in a
+      # fresh scratch directory: the key file inherits the directory's owner-only ACL (Windows ignores Go's 0600), only
+      # the public recipient leaves the tool, the bundled sops decrypts with the key, and an existing key is never
+      # overwritten. The key never leaves this runner; nothing of this step is uploaded.
+      - name: Bundled age-keygen.exe makes, reads back and never overwrites a target identity
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $placement = Join-Path $env:RUNNER_TEMP 'placement'
+          $keygen, $sops = (Join-Path $placement 'age-keygen.exe'), (Join-Path $placement 'sops.exe')
+          $seen = New-Object Text.StringBuilder
+          function Run([string]$Exe, [string[]]$Arguments, [hashtable]$Environment = @{}) {
+            $info = New-Object Diagnostics.ProcessStartInfo $Exe
+            $info.Arguments = (@($Arguments | ForEach-Object { '"' + $_ + '"' })) -join ' '
+            $info.UseShellExecute = $false; $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
+            foreach ($name in $Environment.Keys) { $info.EnvironmentVariables[$name] = $Environment[$name] }
+            $process = [Diagnostics.Process]::Start($info)
+            $out, $err = $process.StandardOutput.ReadToEndAsync(), $process.StandardError.ReadToEndAsync()
+            if (-not $process.WaitForExit(60000)) { $process.Kill(); throw "$Exe did not finish" }
+            $process.WaitForExit()
+            $null = $seen.Append($out.Result).Append($err.Result)
+            [pscustomobject]@{ code = $process.ExitCode; out = $out.Result; err = $err.Result }
+          }
+          $version = Run $keygen @('--version')
+          if ($version.code -ne 0 -or $version.out.Trim() -cnotmatch '^v?1\.3\.2$') { throw 'the bundled age-keygen.exe is not age 1.3.2' }
+          # An owner-only scratch directory: one inheritable full-control entry for this user, no inherited entries.
+          $me = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $scratch = Join-Path $env:RUNNER_TEMP ('age-target-' + [guid]::NewGuid().ToString('N'))
+          $null = New-Item -ItemType Directory -Path $scratch
+          $acl = New-Object Security.AccessControl.DirectorySecurity
+          $acl.SetOwner($me.User)
+          $acl.SetAccessRuleProtection($true, $false)
+          $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($me.User, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+          (New-Object IO.DirectoryInfo $scratch).SetAccessControl($acl)
+          $key = Join-Path $scratch 'target.key'
+          $made = Run $keygen @('-o', $key)
+          if ($made.code -ne 0 -or -not (Test-Path -LiteralPath $key -PathType Leaf)) { throw "age-keygen -o did not create the key (exit $($made.code))" }
+          if ($made.err -cnotmatch 'Public key: (age1[0-9a-z]{58})') { throw 'age-keygen -o did not report one public recipient' }
+          $recipient = $Matches[1]
+          if (@([IO.File]::ReadAllLines($key) | Where-Object { $_ -cmatch '^AGE-SECRET-KEY-1[0-9A-Z]+$' }).Count -ne 1) { throw 'the key file does not hold exactly one identity' }
+          $public = Run $keygen @('-y', $key)
+          if ($public.code -ne 0 -or $public.out.Trim() -cne $recipient) { throw 'age-keygen -y does not return the same public recipient' }
+          # The key file's security: owned as this token creates files, and only the directory's inherited entry.
+          $fileAcl = (New-Object IO.FileInfo $key).GetAccessControl()
+          $sid = [Security.Principal.SecurityIdentifier]
+          if ($fileAcl.GetOwner($sid) -ne $me.Owner) { throw 'the key file is not owned by the creating token owner' }
+          $rules = @($fileAcl.GetAccessRules($true, $true, $sid))
+          if ($rules.Count -lt 1 -or @($rules | Where-Object { $_.IdentityReference -ne $me.User -or -not $_.IsInherited -or $_.AccessControlType -ne 'Allow' }).Count) { throw 'the key file grants more than the owner-only directory entry' }
+          # The bundled sops: encrypt a synthetic value to the recipient, decrypt it with the key file.
+          $value = [guid]::NewGuid().ToString('N')
+          $plain, $sealed = (Join-Path $scratch 'synthetic.json'), (Join-Path $scratch 'synthetic.sops.json')
+          [IO.File]::WriteAllText($plain, '{"synthetic":"' + $value + '"}')
+          $encrypted = Run $sops @('--encrypt', '--age', $recipient, '--input-type', 'json', '--output-type', 'json', $plain)
+          if ($encrypted.code -ne 0 -or $encrypted.out.Contains($value)) { throw 'the bundled sops did not encrypt to the recipient' }
+          [IO.File]::WriteAllText($sealed, $encrypted.out)
+          $decrypted = Run $sops @('--decrypt', '--input-type', 'json', '--output-type', 'json', $sealed) @{ SOPS_AGE_KEY_FILE = $key }
+          if ($decrypted.code -ne 0 -or ($decrypted.out | ConvertFrom-Json).synthetic -cne $value) { throw 'the bundled sops did not decrypt with the key file' }
+          # An existing identity is never replaced: a second -o fails and leaves the bytes as they were.
+          $before = [IO.File]::ReadAllBytes($key)
+          $again = Run $keygen @('-o', $key)
+          if ($again.code -eq 0) { throw 'a second age-keygen -o succeeded over an existing key' }
+          if ([Convert]::ToBase64String([IO.File]::ReadAllBytes($key)) -cne [Convert]::ToBase64String($before)) { throw 'a second age-keygen -o changed the existing key' }
+          if ($seen.ToString().Contains('AGE-SECRET-KEY-1')) { throw 'an identity reached ordinary output' }
+          "bundled age-keygen.exe $($version.out.Trim()): owner-only inherited ACL, public recipient readback, sops roundtrip, second -o refused (exit $($again.code)) with the key unchanged"
 
   placement-rent:
     needs: [toolchain, placement-artifact, placement-author, placement-windows]
