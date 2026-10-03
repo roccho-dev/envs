@@ -42,6 +42,15 @@ CLIENT_PLANE = "dev.rent-client"
 CLIENT_CIPHERTEXT = Path("ciphertexts/dev-rent-client.sops.yaml")
 CLIENT_KEYS = ("RENT_ACCESS_CLIENT_ID", "RENT_ACCESS_CLIENT_SECRET")
 CLIENT_RECIPIENT = "RENT_CLIENT_AGE_RECIPIENT"
+# Persistent rent root (windows #8/#14): the declared Cloudflare root applied with standard OpenTofu on its native
+# encrypted and locked R2 backend; its sensitive credentials output is sealed in memory into the two envelopes above.
+ROOT_PLANE = "dev.rent-root"
+ROOT_CONFIG = Path("providers/dev-rent-cloudflare/main.tf")
+ROOT_SECRETS = ("CLOUDFLARE_API_TOKEN", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "RENT_STATE_PASSPHRASE")
+# One key provider and method name for the state's life (a rotation would add a new name with this one as fallback).
+ROOT_KEY_NAME = "k0"
+# The format secrets.token_hex(32) produces, placed inside an HCL string: a format check, not a strength proof.
+ROOT_PASSPHRASE = re.compile(r"^[0-9a-f]{64}$")
 # The windows slot rule (Get-RentAccessProblem) for each line: 1-1024 printable ASCII characters.
 SLOT_LINE = re.compile(r"^[!-~]{1,1024}$")
 WINDOWS_CONSUMER = "windows.rent.consumer"
@@ -267,6 +276,25 @@ def expected_client_boundary() -> dict[str, Any]:
     }
 
 
+def expected_root_boundary() -> dict[str, Any]:
+    # envs owns the entry that applies the declared root and seals its output; the effect, its authority, the state
+    # backend and key custody, the targets and their identities belong to others.
+    return {
+        "id": "dev.rent-root.provider",
+        "kind": "envs.providerConsumerBoundary.v1",
+        "role": "provider",
+        "repository": "roccho-dev/envs",
+        "stage": "dev",
+        "capability": "rent-root",
+        "source_kind": "provider_issued",
+        "target_kind": "public_sops",
+        "owns": ["contract", "root_orchestration_entry", "single_recipient_encryption", "ciphertext_handoff_pr"],
+        "does_not_own": ["provider_apply_authority", "state_backend_custody", "encryption_key_custody", "target_apply",
+                         "target_age_identity", "client_slot_writer", "unattended_ssh_acceptance"],
+        "handoff_ref_kind": "exact_commit_sha",
+    }
+
+
 def expected_windows_consumer(source: str) -> dict[str, Any]:
     # The exact windows source whose published Release (windows-<source>) the placement gate binds.
     return {
@@ -375,6 +403,21 @@ def expected_inputs() -> dict[str, dict[str, list[dict[str, str]]]]:
             "required_secrets": entries(),
             "required_variables": entries((CLIENT_RECIPIENT, "age_recipient", "persistent")),
         },
+        # The persistent root shares the rent tunnel Environment; its own plane names every input the apply reads.
+        ROOT_PLANE: {
+            "required_secrets": entries(*((name, "opaque", "persistent") for name in ROOT_SECRETS)),
+            "required_variables": entries(
+                ("CLOUDFLARE_ACCOUNT_ID", "cloudflare_account_id", "persistent"),
+                ("CLOUDFLARE_ZONE_ID", "cloudflare_zone_id", "persistent"),
+                ("RENT_HOSTNAME", "opaque", "persistent"),
+                ("RENT_ORIGIN_SERVICE", "opaque", "persistent"),
+                ("RENT_SERVICE_TOKEN_DURATION", "opaque", "persistent"),
+                ("RENT_STATE_BUCKET", "opaque", "persistent"),
+                ("RENT_STATE_KEY", "opaque", "persistent"),
+                ("RENT_AGE_RECIPIENT", "age_recipient", "persistent"),
+                (CLIENT_RECIPIENT, "age_recipient", "persistent"),
+            ),
+        },
         PROBE_PLANE: {
             "required_secrets": entries(("CLOUDFLARE_API_TOKEN", "opaque", "persistent")),
             "required_variables": entries(
@@ -425,7 +468,7 @@ def validate_contracts(root: Path = ROOT) -> dict[str, dict[str, dict[str, Any]]
     boundary = index(root / BOUNDARY)
 
     require(set(envs) == {
-        "dev.authoring", "dev.projection", "dev.runtime", RENT_PLANE, CLIENT_PLANE, PROBE_PLANE, STATE_PLANE,
+        "dev.authoring", "dev.projection", "dev.runtime", RENT_PLANE, CLIENT_PLANE, ROOT_PLANE, PROBE_PLANE, STATE_PLANE,
         "stg.projection", "stg.runtime", "prd.projection", "prd.runtime",
         "voice-ui.dev", "voice-ui.stg", "voice-ui.prd",
     }, "environment set differs")
@@ -496,6 +539,19 @@ def validate_contracts(root: Path = ROOT) -> dict[str, dict[str, dict[str, Any]]
         require(client["active_github_environment"] is None and client["migration_state"] == "NOT_CONFIGURED",
                 f"{CLIENT_PLANE} must be NOT_CONFIGURED without its ciphertext")
 
+    # The persistent root has no ciphertext of its own: ACTIVE records only that it sealed both envelopes above
+    # (declared plane state, not proof that the Environment, the provider or the backend is configured).
+    root_plane = envs[ROOT_PLANE]
+    require(root_plane["github_environment"] == rent["github_environment"] and root_plane["owner"] == "envs"
+            and root_plane["source_kind"] == "provider_issued" and root_plane["target_kind"] == "public_sops",
+            f"{ROOT_PLANE} plane differs")
+    if root_plane["migration_state"] == "ACTIVE":
+        require(root_plane["active_github_environment"] == "dev-rent-tunnel" and rent_cipher.is_file()
+                and client_cipher.is_file(), f"{ROOT_PLANE} is ACTIVE only with both envelopes")
+    else:
+        require(root_plane["active_github_environment"] is None and root_plane["migration_state"] == "NOT_CONFIGURED",
+                f"{ROOT_PLANE} must be NOT_CONFIGURED until it sealed both envelopes")
+
     probe = envs[PROBE_PLANE]
     require(probe["github_environment"] == "dev-rent-access-probe" and probe["owner"] == "envs"
             and probe["source_kind"] == "provider_issued" and probe["target_kind"] == "disposable_probe"
@@ -520,10 +576,11 @@ def validate_contracts(root: Path = ROOT) -> dict[str, dict[str, dict[str, Any]]
     require(set(boundary) == {
         "repository.branch-policy", "dev.jev-api.provider", "dev.rent-tunnel.provider", "dev.rent-access-probe.provider",
         "dev.rent-state-proof.provider", "dev.jev-api-oci-dev.provider", "apps.voice-ui.consumer", "ops.voice-ui.consumer",
-        "normal.consumer.path", "dev.rent-client.provider", WINDOWS_CONSUMER,
+        "normal.consumer.path", "dev.rent-client.provider", "dev.rent-root.provider", WINDOWS_CONSUMER,
     }, "provider-consumer boundary set differs")
     require(boundary["dev.rent-tunnel.provider"] == expected_rent_boundary(), "rent tunnel provider boundary differs")
     require(boundary["dev.rent-client.provider"] == expected_client_boundary(), "rent client provider boundary differs")
+    require(boundary["dev.rent-root.provider"] == expected_root_boundary(), "rent root provider boundary differs")
     source = boundary[WINDOWS_CONSUMER].get("distribution_source")
     require(isinstance(source, str) and SHA40.fullmatch(source) is not None
             and boundary[WINDOWS_CONSUMER] == expected_windows_consumer(source), "windows rent consumer boundary differs")
@@ -832,15 +889,17 @@ def retrieve_tunnel_token(account: str, tunnel: str, api_token: str, fetch: Fetc
     return token
 
 
-def encrypt_rent_token(token: str, recipient: str, tools: Mapping[str, str], runner: Runner = default_runner) -> bytes:
-    # The token reaches SOPS on stdin only; the ciphertext must name exactly this one recipient.
+def encrypt_rent_token(token: str, recipient: str, tools: Mapping[str, str], runner: Runner = default_runner,
+                       home: str | None = None) -> bytes:
+    # The token reaches SOPS on stdin only; the ciphertext must name exactly this one recipient. A given home replaces
+    # the inherited HOME (rent-root's fresh one); without it the standalone entries keep their existing environment.
     require(AGE_RECIPIENT.fullmatch(recipient) is not None, "rent tunnel needs exactly one age recipient")
     require(TUNNEL_TOKEN.fullmatch(token) is not None, "invalid tunnel token")
     payload = json.dumps({RENT_KEY: token}, separators=(",", ":")).encode() + b"\n"
     result = run_checked(
         [tools["sops"], "--encrypt", "--input-type", "json", "--output-type", "yaml", "/dev/stdin"],
         input_data=payload,
-        env=clean_env(tools, {"SOPS_AGE_RECIPIENTS": recipient}),
+        env=clean_env(tools, {"SOPS_AGE_RECIPIENTS": recipient, **({} if home is None else {"HOME": home})}),
         runner=runner,
         label="SOPS encryption",
     )
@@ -870,8 +929,9 @@ def rent_author(root: Path = ROOT, runner: Runner = default_runner, fetch: Fetch
 
 
 def encrypt_client_credential(client_id: str, secret: str, recipient: str, tools: Mapping[str, str],
-                              runner: Runner = default_runner) -> bytes:
+                              runner: Runner = default_runner, home: str | None = None) -> bytes:
     # Both values reach SOPS on stdin only; each must be one line of the windows slot rule, for exactly one recipient.
+    # A given home replaces the inherited HOME, as for encrypt_rent_token.
     require(AGE_RECIPIENT.fullmatch(recipient) is not None, "rent client needs exactly one age recipient")
     require(SLOT_LINE.fullmatch(client_id) is not None and SLOT_LINE.fullmatch(secret) is not None,
             "invalid Access client credential")
@@ -879,12 +939,22 @@ def encrypt_client_credential(client_id: str, secret: str, recipient: str, tools
     result = run_checked(
         [tools["sops"], "--encrypt", "--input-type", "json", "--output-type", "yaml", "/dev/stdin"],
         input_data=payload,
-        env=clean_env(tools, {"SOPS_AGE_RECIPIENTS": recipient}),
+        env=clean_env(tools, {"SOPS_AGE_RECIPIENTS": recipient, **({} if home is None else {"HOME": home})}),
         runner=runner,
         label="SOPS encryption",
     )
     validate_client_ciphertext(result.stdout, (client_id.encode(), secret.encode()), recipient)
     return result.stdout
+
+
+def client_pair(value: Any, root: Path) -> tuple[str, str]:
+    # The root's credentials object: its service token pair, each one line of the windows slot rule, never in Git.
+    require(isinstance(value, dict) and set(value) == set(PROBE_CREDENTIALS), "root output is not the credentials object")
+    client_id, secret = value["service_token_id"], value["service_token_value"]
+    require(isinstance(client_id, str) and isinstance(secret, str) and SLOT_LINE.fullmatch(client_id) is not None
+            and SLOT_LINE.fullmatch(secret) is not None, "invalid Access client credential")
+    reject_live_values(root, "rent client credential", [client_id, secret])
+    return client_id, secret
 
 
 def client_author(credentials: bytes, root: Path = ROOT, runner: Runner = default_runner) -> dict[str, Any]:
@@ -898,11 +968,7 @@ def client_author(credentials: bytes, root: Path = ROOT, runner: Runner = defaul
         value = json.loads(credentials)
     except (json.JSONDecodeError, UnicodeDecodeError):
         raise EnvsError("root output is not JSON") from None
-    require(isinstance(value, dict) and set(value) == set(PROBE_CREDENTIALS), "root output is not the credentials object")
-    client_id, secret = value["service_token_id"], value["service_token_value"]
-    require(isinstance(client_id, str) and isinstance(secret, str) and SLOT_LINE.fullmatch(client_id) is not None
-            and SLOT_LINE.fullmatch(secret) is not None, "invalid Access client credential")
-    reject_live_values(root, "rent client credential", [client_id, secret])
+    client_id, secret = client_pair(value, root)
     data = encrypt_client_credential(client_id, secret, inputs[CLIENT_RECIPIENT], tools, runner)
     target = root / CLIENT_CIPHERTEXT
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -913,6 +979,81 @@ def client_author(credentials: bytes, root: Path = ROOT, runner: Runner = defaul
         "kind": "envs.rentClientAuthoringResult.v1", "status": "PASS", "ciphertext": CLIENT_CIPHERTEXT.as_posix(),
         "recipient_count": 1, "target_apply": "NOT_RUN", "client_access": "UNPROVED",
     }
+
+
+def root_env(tools: Mapping[str, str], inputs: Mapping[str, str], home: Path) -> dict[str, str]:
+    # Only the OpenTofu child gets these: the API token, the backend credential and endpoint, the fixed encryption
+    # (pbkdf2 key provider and aes_gcm method, both k0, for state and plan) and the root's five inputs.
+    return clean_env(tools, {
+        "CLOUDFLARE_API_TOKEN": inputs["CLOUDFLARE_API_TOKEN"],
+        "AWS_ACCESS_KEY_ID": inputs["AWS_ACCESS_KEY_ID"], "AWS_SECRET_ACCESS_KEY": inputs["AWS_SECRET_ACCESS_KEY"],
+        "AWS_ENDPOINT_URL_S3": r2_endpoint(inputs["CLOUDFLARE_ACCOUNT_ID"]), "AWS_EC2_METADATA_DISABLED": "true",
+        "TF_ENCRYPTION": encryption_config(ROOT_KEY_NAME, inputs["RENT_STATE_PASSPHRASE"]),
+        "TF_VAR_account_id": inputs["CLOUDFLARE_ACCOUNT_ID"], "TF_VAR_zone_id": inputs["CLOUDFLARE_ZONE_ID"],
+        "TF_VAR_hostname": inputs["RENT_HOSTNAME"], "TF_VAR_origin_service": inputs["RENT_ORIGIN_SERVICE"],
+        "TF_VAR_service_token_duration": inputs["RENT_SERVICE_TOKEN_DURATION"],
+        "TF_IN_AUTOMATION": "1", "TF_INPUT": "0", "HOME": str(home),
+    })
+
+
+def seal_root_output(root: Path, tools: Mapping[str, str], work: Path, env: Mapping[str, str], runner: Runner,
+                     rent_recipient: str, client_recipient: str, progress: dict[str, str] | None = None) -> dict[str, Any]:
+    # The applied root's sensitive credentials output stays in this process: both envelopes are sealed before the
+    # first write. A failure before that write changes no file; one at or after it may leave an unpublished partial
+    # diff that is reported, never cleaned up or claimed.
+    progress = {} if progress is None else progress
+    progress["stage"] = "output"
+    value = output(tools, work, env, runner, "credentials", PROBE_CREDENTIALS)
+    progress["stage"] = "seal"
+    client_id, secret = client_pair(value, root)
+    token = value["tunnel_token"]
+    require(isinstance(token, str) and TUNNEL_TOKEN.fullmatch(token) is not None, "root output has no valid tunnel token")
+    reject_live_values(root, RENT_KEY, [token])
+    # The sops children share the run's fresh HOME, never the caller's, and get only their one recipient.
+    home = env["HOME"]
+    sealed = ((RENT_CIPHERTEXT, encrypt_rent_token(token, rent_recipient, tools, runner, home)),
+              (CLIENT_CIPHERTEXT, encrypt_client_credential(client_id, secret, client_recipient, tools, runner, home)))
+    progress["stage"] = "write"
+    for relative, data in sealed:
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+    set_dev_active(root, True, (RENT_PLANE, CLIENT_PLANE, ROOT_PLANE))
+    validate_contracts(root)
+    return {
+        "kind": "envs.rentRootResult.v1", "status": "PASS",
+        "ciphertexts": [RENT_CIPHERTEXT.as_posix(), CLIENT_CIPHERTEXT.as_posix()],
+        "target_apply": "NOT_RUN", "client_access": "UNPROVED",
+    }
+
+
+def rent_root(root: Path = ROOT, runner: Runner = default_runner, progress: dict[str, str] | None = None) -> dict[str, Any]:
+    # Standard OpenTofu applies the declared root on its native backend; no destroy, import, adoption or retry here.
+    # progress["stage"] names how far it got, so a failure is reported as a closed kind and stage only.
+    progress = {} if progress is None else progress
+    progress["stage"] = "gate"
+    contracts = validate_contracts(root)
+    tools = toolchain(root)
+    inputs = gate(root, contracts, ROOT_PLANE)
+    require(ROOT_PASSPHRASE.fullmatch(inputs["RENT_STATE_PASSPHRASE"]) is not None,
+            f"{ROOT_PLANE}: RENT_STATE_PASSPHRASE is not 64 lowercase hex")
+    for name in ROOT_SECRETS:
+        reject_live_values(root, name, [inputs[name]])
+    # A fresh owner-only scratch per run (an empty HOME and the root's working copy). It is retained, never deleted:
+    # automated recursive deletion is forbidden, so it lasts as long as the runner's temporary space.
+    scratch = Path(tempfile.mkdtemp(prefix="envs-rent-root-"))
+    home, work = scratch / "home", scratch / "root"
+    home.mkdir(mode=0o700)
+    work.mkdir()
+    (work / "main.tf").write_bytes((root / ROOT_CONFIG).read_bytes())
+    env = root_env(tools, inputs, home)
+    progress["stage"] = "init"
+    tofu(tools, work, env, runner, "init", "-input=false", "-no-color",
+         f"-backend-config=bucket={inputs['RENT_STATE_BUCKET']}", f"-backend-config=key={inputs['RENT_STATE_KEY']}")
+    progress["stage"] = "apply"
+    tofu(tools, work, env, runner, "apply", "-input=false", "-auto-approve", "-no-color")
+    return seal_root_output(root, tools, work, env, runner, inputs["RENT_AGE_RECIPIENT"], inputs[CLIENT_RECIPIENT],
+                            progress)
 
 
 # A bounded client attempt returns ("exit", code, stdout) or ("timeout", -1, b""); stderr is never kept or logged.
@@ -2053,6 +2194,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     sub.add_parser("rent-tunnel")
     # The root's sensitive credentials output on stdin only, never an argument, environment value or file.
     sub.add_parser("rent-client")
+    # Applies the persistent root and seals both envelopes; its inputs come only from the declared environment.
+    sub.add_parser("rent-root")
     sub.add_parser("rent-access-probe")
     sub.add_parser("rent-access-locate")
     sub.add_parser("rent-state-proof")
@@ -2086,6 +2229,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(rent_author(root), indent=2, sort_keys=True))
         elif args.command == "rent-client":
             print(json.dumps(client_author(sys.stdin.buffer.read(RESPONSE_LIMIT + 1), root), indent=2, sort_keys=True))
+        elif args.command == "rent-root":
+            # Only a closed kind and stage leave on failure: never a message, class name, traceback or value.
+            progress: dict[str, str] = {}
+            try:
+                result = rent_root(root, progress=progress)
+            except Exception as exc:
+                kind = failure_class(exc) if isinstance(exc, STATE_FAILURES) else "other"
+                print(f"RENT_ROOT=RED: {kind} at {progress.get('stage', 'start')}", file=sys.stderr)
+                return 1
+            print(json.dumps(result, indent=2, sort_keys=True))
         elif args.command in {"rent-access-probe", "rent-access-locate"}:
             result = access_probe(root, locate_only=args.command == "rent-access-locate")
             print(json.dumps(result, indent=2, sort_keys=True))

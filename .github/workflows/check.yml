@@ -608,12 +608,13 @@ jobs:
         run: '"$RUNNER_TEMP/envs-effect/bin/python3" -I checks/test_jev_api.py'
 
       # The locked closure sops encrypts and decrypts for real; check-only age makes throwaway identities in a temp dir.
+      # The closure tofu applies an encrypted schema-only fixture root whose real output reaches the production sealer.
       - name: Real locked SOPS roundtrip for the rent tunnel token
         run: |
           set -euo pipefail
           nix build .#check-age --no-update-lock-file --out-link "$RUNNER_TEMP/check-age"
           tool="$RUNNER_TEMP/envs-effect/bin"
-          "$tool/python3" -I checks/test_rent_tunnel.py --sops "$tool/sops" --age-keygen "$RUNNER_TEMP/check-age/bin/age-keygen"
+          "$tool/python3" -I checks/test_rent_tunnel.py --sops "$tool/sops" --age-keygen "$RUNNER_TEMP/check-age/bin/age-keygen" --tofu "$tool/tofu"
 
       # The same locked sops and check-only age prove the OCI dev target's single-recipient Jev ciphertext.
       - name: Real locked SOPS roundtrip for the OCI dev Jev key

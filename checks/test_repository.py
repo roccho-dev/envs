@@ -232,14 +232,27 @@ def main() -> None:
     expect_red(replace_text("README.md", "dev-projection/SOPS_AGE_KEY", "dev-projection/REMOVED"))
     expect_red(replace_text("README.md", "prd-projection/CLOUDFLARE_ACCOUNT_ID", "prd-projection/REMOVED"))
 
-    # The rent tunnel path is a manual effect workflow under the same rules, for exactly one target recipient.
+    # The rent workflow is a manual effect workflow under the same rules: it runs only the persistent root entry with
+    # exactly the dev.rent-root inputs and hands off both envelopes.
     rent = ".github/workflows/project-dev-rent-tunnel.yml"
     expect_red(replace_text(rent, "on:\n  workflow_dispatch:\n", "on:\n  workflow_dispatch:\n  push:\n"))
     expect_red(replace_text(rent, "environment: dev-rent-tunnel", "environment: dev-projection"))
     expect_red(replace_text(rent, "${{ vars.RENT_AGE_RECIPIENT }}", "${{ secrets.RENT_AGE_RECIPIENT }}"))
-    expect_red(replace_text(rent, "          RENT_TUNNEL_ID: ${{ vars.RENT_TUNNEL_ID }}\n", ""))
-    expect_red(replace_text(rent, f"{entry} rent-tunnel", "python3 adapters/jev_api.py rent-tunnel"))
+    expect_red(replace_text(rent, "          RENT_STATE_KEY: ${{ vars.RENT_STATE_KEY }}\n", ""))
+    expect_red(replace_text(rent, "          RENT_STATE_KEY: ${{ vars.RENT_STATE_KEY }}\n",
+                            "          RENT_STATE_KEY: ${{ vars.RENT_STATE_KEY }}\n          RENT_TUNNEL_ID: ${{ vars.RENT_TUNNEL_ID }}\n"))
+    expect_red(replace_text(rent, f"{entry} rent-root", "python3 adapters/jev_api.py rent-root"))
+    expect_red(replace_text(rent, f"{entry} rent-root", f"{entry} rent-tunnel"))
     expect_red(replace_text(rent, "contracts/environments.jsonl\n", "contracts/environments.jsonl README.md\n"))
+    expect_red(replace_text(rent, " ciphertexts/dev-rent-client.sops.yaml contracts/", " contracts/"))
+    expect_red(mutate_plane("dev.rent-root", lambda row: row["required_variables"].pop()))
+    expect_red(mutate_plane("dev.rent-root", lambda row: row.update({"github_environment": "dev-rent-client"})))
+    expect_red(mutate_plane("dev.rent-root", lambda row: row.update(
+        {"migration_state": "ACTIVE", "active_github_environment": "dev-rent-tunnel"})))
+    expect_red(replace_text("contracts/provider-consumer.jsonl", '"provider_apply_authority",', ""))
+    expect_red(replace_text("README.md", "dev-rent-tunnel/RENT_STATE_PASSPHRASE", "dev-rent-tunnel/REMOVED"))
+    expect_red(replace_text("README.md", "applied only by `rent-root` under a separate effect grant", "declaration only"))
+    expect_red(replace_text(check, ' --tofu "$tool/tofu"', ""))
     expect_red(mutate_plane("dev.rent-tunnel", lambda row: row["required_variables"].pop()))
     expect_red(mutate_plane("dev.rent-tunnel", lambda row: row["required_variables"][2].update({"type": "age_recipient_list"})))
     expect_red(mutate_plane("dev.rent-tunnel", lambda row: row.update({"source_kind": "public_sops"})))
