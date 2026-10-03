@@ -88,6 +88,7 @@ jobs:
           test -s "$RUNNER_TEMP/placement/age-keygen.exe"
           cmp LICENSES/age-v1.3.2.txt "$RUNNER_TEMP/placement/LICENSES/age-v1.3.2.txt"
           cmp LICENSES/sops-v3.13.2.txt "$RUNNER_TEMP/placement/LICENSES/sops-v3.13.2.txt"
+          cmp LICENSES/README.md "$RUNNER_TEMP/placement/LICENSES/README.md"
           cmp THIRD_PARTY_NOTICES.md "$RUNNER_TEMP/placement/THIRD_PARTY_NOTICES.md"
           mkdir "$RUNNER_TEMP/provide-placement"
           cp -RL "$RUNNER_TEMP/placement/." "$RUNNER_TEMP/provide-placement/"

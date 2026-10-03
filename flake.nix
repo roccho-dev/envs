@@ -82,7 +82,7 @@
         # The committed license texts are exactly the ones these binaries come with.
         unzip -p ${age-windows} age/LICENSE | cmp - ${self}/LICENSES/age-v1.3.2.txt
         cmp ${pkgs.sops.src}/LICENSE ${self}/LICENSES/sops-v3.13.2.txt
-        cp ${self}/LICENSES/age-v1.3.2.txt ${self}/LICENSES/sops-v3.13.2.txt "$out/LICENSES/"
+        cp ${self}/LICENSES/README.md ${self}/LICENSES/age-v1.3.2.txt ${self}/LICENSES/sops-v3.13.2.txt "$out/LICENSES/"
         cp ${self}/THIRD_PARTY_NOTICES.md "$out/"
         echo ${rev} > "$out/SOURCE"
         if [ -d ${self}/ciphertexts ]; then cp -r ${self}/ciphertexts "$out/ciphertexts"; fi
