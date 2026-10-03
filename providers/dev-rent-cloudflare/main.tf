@@ -1,11 +1,10 @@
 # Persistent Cloudflare SSH path for the windows-rent (windows #14-E): one named Tunnel with its ingress, the DNS
 # record, a self-hosted Access application and a Service Auth policy for exactly one service token.
 #
-# Declaration only. No workflow plans or applies this root, and none may until the later gates in README.md are
-# agreed: durable encrypted and locked managed state with its ownership and key custody, the backend credential
-# boundary, and the service-token lifetime, rotation and delivery plus the Tunnel-token placement. Its state will
-# hold both secrets even though the output is sensitive. Every input is required; nothing here adopts, imports or
-# moves an existing resource.
+# Applied only by the effect entry `rent-root` from the manual project-dev-rent-tunnel workflow, under a separate
+# effect grant that fixes the owned backend bucket, its credential, the state-key custody and the principal; CI only
+# validates it. Its state will hold both secrets even though the output is sensitive. Every input is required;
+# nothing here adopts, imports or moves an existing resource.
 
 terraform {
   required_providers {

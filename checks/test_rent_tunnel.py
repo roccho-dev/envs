@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import secrets
@@ -333,6 +335,209 @@ def test_client_red() -> None:
         expect_client_red(client_env(), credentials(), output=output, returncode=returncode)
 
 
+# Persistent root (windows #8/#14): every input generated per run; the client envelope has its own recipient.
+ROOT_CLIENT_RECIPIENT = "age1" + "".join(secrets.choice(fixtures.BECH32) for _ in range(58))
+ROOT_VALUES = {
+    "CLOUDFLARE_API_TOKEN": API_TOKEN, "AWS_ACCESS_KEY_ID": secrets.token_hex(16),
+    "AWS_SECRET_ACCESS_KEY": secrets.token_hex(32), "RENT_STATE_PASSPHRASE": secrets.token_hex(32),
+    "CLOUDFLARE_ACCOUNT_ID": ACCOUNT_ID, "CLOUDFLARE_ZONE_ID": secrets.token_hex(16),
+    "RENT_HOSTNAME": f"rent-{secrets.token_hex(4)}.example.invalid", "RENT_ORIGIN_SERVICE": f"ssh://origin-{secrets.token_hex(4)}:2222",
+    "RENT_SERVICE_TOKEN_DURATION": f"{1000 + secrets.randbelow(8000)}h", "RENT_STATE_BUCKET": f"rent-state-{secrets.token_hex(6)}",
+    "RENT_STATE_KEY": f"state/{secrets.token_hex(6)}.tfstate", "RENT_AGE_RECIPIENT": RECIPIENT,
+    jev.CLIENT_RECIPIENT: ROOT_CLIENT_RECIPIENT,
+}
+ROOT_SECRET_VALUES = [ROOT_VALUES[name] for name in jev.ROOT_SECRETS]
+
+
+def root_env(**overrides: str) -> dict[str, str]:
+    values = {"ENVS_EFFECT_TOOLCHAIN": fixtures.MANIFEST, **ROOT_VALUES}
+    values.update(overrides)
+    return values
+
+
+class RootRunner:
+    # Fake OpenTofu and sops: fail names one step (init, apply, output, sops-rent, sops-client) to return non-zero.
+    def __init__(self, fail: str | None = None, output: bytes | None = None) -> None:
+        self.fail = fail
+        self.output = credentials() if output is None else output
+        self.calls: list[tuple[list[str], bytes | None, dict[str, str]]] = []
+
+    def __call__(self, argv, input_data, env):
+        self.calls.append((list(argv), input_data, dict(env or {})))
+        recipient = (env or {}).get("SOPS_AGE_RECIPIENTS", "")
+        step = argv[2] if argv[0] == fixtures.TOOLS["tofu"] else "sops-rent" if recipient == RECIPIENT else "sops-client"
+        if step == self.fail:
+            return subprocess.CompletedProcess(argv, 1, stdout=b"", stderr=b"")
+        body = {"output": self.output, "sops-rent": ciphertext((recipient,)),
+                "sops-client": client_ciphertext((recipient,))}.get(step, b"")
+        return subprocess.CompletedProcess(argv, 0, stdout=body, stderr=b"")
+
+    def steps(self) -> list[str]:
+        return [argv[2] if argv[0] == fixtures.TOOLS["tofu"] else "sops" for argv, _, _ in self.calls]
+
+
+def root_secrets() -> list[str]:
+    return [*ROOT_SECRET_VALUES, TOKEN, CLIENT_ID, CLIENT_SECRET]
+
+
+def prior_envelopes(root: Path) -> None:
+    # A previous run's envelopes and plane state, which a failure before the first write must leave byte-identical.
+    for relative, data in ((jev.RENT_CIPHERTEXT, ciphertext()), (jev.CLIENT_CIPHERTEXT, client_ciphertext())):
+        (root / relative).parent.mkdir(parents=True, exist_ok=True)
+        (root / relative).write_bytes(data)
+    jev.set_dev_active(root, True, (jev.RENT_PLANE, jev.CLIENT_PLANE, jev.ROOT_PLANE))
+    jev.validate_contracts(root)
+
+
+def snapshot(root: Path) -> dict[str, bytes | None]:
+    return {str(path): (root / path).read_bytes() if (root / path).is_file() else None
+            for path in (jev.ENVIRONMENTS, jev.RENT_CIPHERTEXT, jev.CLIENT_CIPHERTEXT)}
+
+
+def test_root_author() -> None:
+    root = fixtures.copy_root()
+    runner = RootRunner()
+    try:
+        with fixtures.environment(root_env()):
+            result = jev.rent_root(root, runner)
+        assert result == {
+            "kind": "envs.rentRootResult.v1", "status": "PASS",
+            "ciphertexts": [jev.RENT_CIPHERTEXT.as_posix(), jev.CLIENT_CIPHERTEXT.as_posix()],
+            "target_apply": "NOT_RUN", "client_access": "UNPROVED",
+        }
+        assert runner.steps() == ["init", "apply", "output", "sops", "sops"], runner.steps()
+        init = runner.calls[0][0]
+        assert init[3:] == ["-input=false", "-no-color", f"-backend-config=bucket={ROOT_VALUES['RENT_STATE_BUCKET']}",
+                            f"-backend-config=key={ROOT_VALUES['RENT_STATE_KEY']}"], init
+        assert runner.calls[2][0][3:] == ["-json", "credentials"]
+        # Every child's argv is free of values; each OpenTofu child gets exactly the root environment.
+        assert not any(value in item for value in root_secrets() for argv, _, _ in runner.calls for item in argv)
+        expected = {"PATH", "HOME", "CLOUDFLARE_API_TOKEN", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+                    "AWS_ENDPOINT_URL_S3", "AWS_EC2_METADATA_DISABLED", "TF_ENCRYPTION", "TF_VAR_account_id",
+                    "TF_VAR_zone_id", "TF_VAR_hostname", "TF_VAR_origin_service", "TF_VAR_service_token_duration",
+                    "TF_IN_AUTOMATION", "TF_INPUT"}
+        for argv, stdin, env in runner.calls[:3]:
+            assert set(env) - {"TMPDIR", "LANG", "LC_ALL", "CI"} == expected, sorted(env)
+            assert stdin is None
+            assert env["TF_ENCRYPTION"] == jev.encryption_config("k0", ROOT_VALUES["RENT_STATE_PASSPHRASE"])
+            assert env["AWS_ENDPOINT_URL_S3"] == jev.r2_endpoint(ACCOUNT_ID)
+            assert env["TF_VAR_service_token_duration"] == ROOT_VALUES["RENT_SERVICE_TOKEN_DURATION"]
+            assert env["HOME"] != os.environ.get("HOME")
+        # Each sops child gets only its recipient, and only its own values on stdin.
+        (rent_argv, rent_stdin, rent_env), (client_argv, client_stdin, client_env) = runner.calls[3:]
+        assert set(rent_env) <= SOPS_ENV_KEYS and rent_env["SOPS_AGE_RECIPIENTS"] == RECIPIENT
+        assert set(client_env) <= SOPS_ENV_KEYS and client_env["SOPS_AGE_RECIPIENTS"] == ROOT_CLIENT_RECIPIENT
+        assert json.loads(rent_stdin) == {jev.RENT_KEY: TOKEN}
+        assert json.loads(client_stdin) == {"RENT_ACCESS_CLIENT_ID": CLIENT_ID, "RENT_ACCESS_CLIENT_SECRET": CLIENT_SECRET}
+        assert not any(value in json.dumps(result) for value in root_secrets())
+        contracts = jev.validate_contracts(root)
+        for plane in (jev.RENT_PLANE, jev.CLIENT_PLANE, jev.ROOT_PLANE):
+            assert contracts["environments"][plane]["migration_state"] == "ACTIVE"
+        for path in jev.repository_files(root):
+            data = path.read_bytes()
+            assert not any(value.encode() in data for value in root_secrets()), path
+    finally:
+        shutil.rmtree(root.parent, ignore_errors=True)
+
+
+def expect_root_red(values: dict[str, str], runner: RootRunner, *, prior: bool = False, mutate=None,
+                    children: bool = True) -> dict[str, str]:
+    # A failure before the first write: RED, no destroy/import/retry, and every envelope and plane file unchanged.
+    root = fixtures.copy_root()
+    progress: dict[str, str] = {}
+    try:
+        if prior:
+            prior_envelopes(root)
+        if mutate is not None:
+            mutate(root)
+        before = snapshot(root)
+        with fixtures.environment(values):
+            try:
+                jev.rent_root(root, runner, progress)
+            except jev.EnvsError as exc:
+                message = str(exc)
+            else:
+                raise AssertionError("invalid rent root state was accepted")
+        assert not any(value in message for value in root_secrets()), message
+        assert snapshot(root) == before, "a failure before the first write changed a file"
+        assert progress["stage"] != "write"
+        assert bool(runner.calls) == children, runner.steps()
+        assert runner.steps().count("apply") <= 1 and not {"destroy", "import", "state"} & set(runner.steps())
+        return progress
+    finally:
+        shutil.rmtree(root.parent, ignore_errors=True)
+
+
+def test_root_red() -> None:
+    # Inputs are RED before any child: each missing input, a malformed passphrase, a live value already in Git.
+    for name in ROOT_VALUES:
+        assert expect_root_red(root_env(**{name: ""}), RootRunner(), children=False)["stage"] == "gate"
+    for passphrase in (ROOT_VALUES["RENT_STATE_PASSPHRASE"].upper(), ROOT_VALUES["RENT_STATE_PASSPHRASE"][:-1],
+                       ROOT_VALUES["RENT_STATE_PASSPHRASE"] + "0", "z" * 64):
+        expect_root_red(root_env(RENT_STATE_PASSPHRASE=passphrase), RootRunner(), children=False)
+    for value in (ROOT_VALUES["AWS_SECRET_ACCESS_KEY"], ROOT_VALUES["RENT_STATE_BUCKET"]):
+        expect_root_red(root_env(), RootRunner(), children=False,
+                        mutate=lambda root, value=value: fixtures.append(root / "README.md", f"\n{value}\n"))
+    # Each step failing, and a malformed root output, before the first write: new and prior envelopes alike.
+    for prior in (False, True):
+        for fail, stage in (("init", "init"), ("apply", "apply"), ("output", "output"), ("sops-rent", "seal"),
+                            ("sops-client", "seal")):
+            assert expect_root_red(root_env(), RootRunner(fail), prior=prior)["stage"] == stage
+        for body in (b"not json", credentials(extra="x"), credentials(tunnel_token="two words"),
+                     credentials(tunnel_token=None), credentials(service_token_id=""), credentials(service_token_value=7)):
+            expect_root_red(root_env(), RootRunner(output=body), prior=prior)
+
+
+def test_root_after_write() -> None:
+    # A failure at or after the first write fails the entry without claiming success; nothing is cleaned up.
+    root = fixtures.copy_root()
+    progress: dict[str, str] = {}
+    original = jev.set_dev_active
+
+    def broken(*_args, **_kwargs) -> None:
+        raise OSError("plane state not written")
+
+    jev.set_dev_active = broken
+    try:
+        with fixtures.environment(root_env()):
+            try:
+                jev.rent_root(root, RootRunner(), progress)
+            except OSError:
+                pass
+            else:
+                raise AssertionError("a failed plane update was reported as success")
+        assert progress["stage"] == "write"
+        assert (root / jev.RENT_CIPHERTEXT).is_file() and (root / jev.CLIENT_CIPHERTEXT).is_file()
+    finally:
+        jev.set_dev_active = original
+        shutil.rmtree(root.parent, ignore_errors=True)
+
+
+def test_root_main() -> None:
+    # The production entry: a refusal and an unexpected exception print only a closed kind and stage.
+    root = fixtures.copy_root()
+    original = jev.rent_root
+
+    def leaking(_root, progress):
+        progress["stage"] = "apply"
+        raise KeyError(API_TOKEN)
+
+    try:
+        for values, patch, expected in ((root_env(RENT_HOSTNAME=""), None, "RENT_ROOT=RED: envs at gate\n"),
+                                        (root_env(), leaking, "RENT_ROOT=RED: other at apply\n")):
+            out, err = io.StringIO(), io.StringIO()
+            if patch is not None:
+                jev.rent_root = patch
+            try:
+                with fixtures.environment(values), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    code = jev.main(["--root", str(root), "rent-root"])
+            finally:
+                jev.rent_root = original
+            assert code == 1 and out.getvalue() == "" and err.getvalue() == expected, (code, out.getvalue(), err.getvalue())
+    finally:
+        shutil.rmtree(root.parent, ignore_errors=True)
+
+
 def run(argv: list[str], env: dict[str, str]) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, shell=False)
 
@@ -421,12 +626,105 @@ def real_roundtrip(sops_bin: str, keygen_bin: str) -> None:
         shutil.rmtree(work, ignore_errors=True)
 
 
+# A schema-only stand-in for the persistent root: the same enforced encryption and the same sensitive credentials
+# output, but no provider, resource or backend. Its values arrive only as TF_VAR_credentials in the OpenTofu child.
+ROOT_FIXTURE = """terraform {
+  encryption {
+    state {
+      enforced = true
+    }
+    plan {
+      enforced = true
+    }
+  }
+}
+
+variable "credentials" {
+  type      = object({ tunnel_token = string, service_token_id = string, service_token_value = string })
+  sensitive = true
+}
+
+output "credentials" {
+  sensitive = true
+  value     = var.credentials
+}
+"""
+
+
+def real_root_roundtrip(sops_bin: str, keygen_bin: str, tofu_bin: str) -> None:
+    # The closure tofu applies the fixture on encrypted local state; the production seal_root_output then reads the
+    # real `tofu output -json credentials` and the real sops seals both envelopes, each for its own throwaway identity.
+    sops_path, keygen, tofu_path = (os.path.realpath(item) for item in (sops_bin, keygen_bin, tofu_bin))
+    for path in (sops_path, keygen, tofu_path):
+        assert path.startswith("/nix/store/") and os.access(path, os.X_OK), f"not a locked store tool: {path}"
+    assert not any(value in ROOT_FIXTURE for value in (TOKEN, CLIENT_ID, CLIENT_SECRET))
+    work = Path(tempfile.mkdtemp(prefix="envs-rent-root-real-"))
+    root = fixtures.copy_root()
+    base = {"PATH": os.path.dirname(sops_path), "HOME": str(work)}
+    try:
+        identities: dict[str, tuple[Path, str]] = {}
+        for name in ("rent", "client"):
+            key = work / f"{name}.key"
+            assert run([keygen, "-o", str(key)], base).returncode == 0, "age-keygen failed"
+            public = run([keygen, "-y", str(key)], base)
+            assert public.returncode == 0, "age-keygen -y failed"
+            identities[name] = (key, public.stdout.decode().strip())
+        fixture, home = work / "root", work / "home"
+        fixture.mkdir()
+        home.mkdir(mode=0o700)
+        (fixture / "main.tf").write_text(ROOT_FIXTURE, encoding="utf-8")
+        tools = {"tofu": tofu_path, "sops": sops_path}
+        env = jev.clean_env(tools, {
+            "HOME": str(home), "TF_IN_AUTOMATION": "1", "TF_INPUT": "0",
+            "TF_ENCRYPTION": jev.encryption_config(jev.ROOT_KEY_NAME, secrets.token_hex(32)),
+            "TF_VAR_credentials": credentials().decode(),
+        })
+        calls: list[list[str]] = []
+
+        def runner(argv, input_data, child_env):
+            calls.append(list(argv))
+            return jev.default_runner(argv, input_data, child_env)
+
+        jev.tofu(tools, fixture, env, runner, "init", "-input=false", "-no-color")
+        jev.tofu(tools, fixture, env, runner, "apply", "-input=false", "-auto-approve", "-no-color")
+        state = (fixture / "terraform.tfstate").read_bytes()
+        assert not any(value.encode() in state for value in (TOKEN, CLIENT_ID, CLIENT_SECRET)), "fixture state is plaintext"
+        result = jev.seal_root_output(root, tools, fixture, env, runner, identities["rent"][1], identities["client"][1])
+        assert [argv[2] if argv[0] == tofu_path else "sops" for argv in calls] == ["init", "apply", "output", "sops", "sops"]
+        assert not any(value in item for value in (TOKEN, CLIENT_ID, CLIENT_SECRET) for argv in calls for item in argv)
+        assert not any(value in json.dumps(result) for value in (TOKEN, CLIENT_ID, CLIENT_SECRET))
+        contracts = jev.validate_contracts(root)
+        assert all(contracts["environments"][plane]["migration_state"] == "ACTIVE"
+                   for plane in (jev.RENT_PLANE, jev.CLIENT_PLANE, jev.ROOT_PLANE))
+
+        def decrypt(relative: Path, identity: str) -> subprocess.CompletedProcess[bytes]:
+            return run([sops_path, "--decrypt", "--input-type", "yaml", "--output-type", "json", str(root / relative)],
+                       {**base, "SOPS_AGE_KEY_FILE": str(identities[identity][0])})
+
+        expected = {jev.RENT_CIPHERTEXT: ({jev.RENT_KEY: TOKEN}, "rent", "client"),
+                    jev.CLIENT_CIPHERTEXT: (dict(zip(jev.CLIENT_KEYS, (CLIENT_ID, CLIENT_SECRET))), "client", "rent")}
+        for relative, (values, own, other) in expected.items():
+            data = (root / relative).read_bytes()
+            assert not any(value.encode() in data for value in (TOKEN, CLIENT_ID, CLIENT_SECRET)), relative
+            opened = decrypt(relative, own)
+            assert opened.returncode == 0 and json.loads(opened.stdout) == values, f"{relative} differs"
+            refused = decrypt(relative, other)
+            assert refused.returncode != 0 and not any(
+                value.encode() in refused.stdout + refused.stderr for value in (TOKEN, CLIENT_ID, CLIENT_SECRET)), relative
+        print(f"real root output to both envelopes: PASS (tofu={tofu_path}, sops={sops_path})")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+        shutil.rmtree(root.parent, ignore_errors=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--sops")
     parser.add_argument("--age-keygen")
+    parser.add_argument("--tofu")
     args = parser.parse_args()
-    assert (args.sops is None) == (args.age_keygen is None), "--sops and --age-keygen go together"
+    assert (args.sops is None) == (args.age_keygen is None) == (args.tofu is None), \
+        "--sops, --age-keygen and --tofu go together"
     try:
         jev.validate_contracts(ROOT)
         test_rent_author()
@@ -437,10 +735,15 @@ def main() -> None:
         test_fetch_boundary()
         test_client_author()
         test_client_red()
+        test_root_author()
+        test_root_red()
+        test_root_after_write()
+        test_root_main()
         if args.sops is None:
-            print("real SOPS roundtrip: NOT RUN (the check workflow runs it with --sops and --age-keygen)")
+            print("real SOPS roundtrip: NOT RUN (the check workflow runs it with --sops, --age-keygen and --tofu)")
         else:
             real_roundtrip(args.sops, args.age_keygen)
+            real_root_roundtrip(args.sops, args.age_keygen, args.tofu)
     finally:
         shutil.rmtree(fixtures.STORE, ignore_errors=True)
     print("rent tunnel adapter self-test: PASS")

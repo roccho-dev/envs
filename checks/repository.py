@@ -147,7 +147,8 @@ INPUT_REFERENCE = re.compile(r"\$\{\{\s*(secrets|vars)\.([A-Za-z0-9_]+)\s*\}\}")
 EFFECT_WORKFLOWS = {
     "author-dev-jev-api.yml": "dev.authoring",
     "project-dev-jev-api.yml": "dev.projection",
-    "project-dev-rent-tunnel.yml": "dev.rent-tunnel",
+    # The rent workflow applies the persistent root; the standalone rent-tunnel GET stays an entry without a workflow.
+    "project-dev-rent-tunnel.yml": "dev.rent-root",
     "probe-dev-rent-access-ssh.yml": "dev.rent-access-probe",
     "probe-dev-rent-state.yml": "dev.rent-state-proof",
 }
@@ -187,10 +188,11 @@ CIPHERTEXTS = {
     "ciphertexts/dev-jev-api.sops.yaml", "ciphertexts/dev-rent-tunnel.sops.yaml", "ciphertexts/dev-jev-api.oci-dev.sops.yaml",
     "ciphertexts/dev-rent-client.sops.yaml",
 }
-# The real SOPS roundtrip runs the locked sops with a check-only age that never enters the effect toolchain.
+# The real SOPS roundtrip runs the locked sops with a check-only age that never enters the effect toolchain; the
+# closure tofu joins it so a real root output reaches the production sealing path.
 CHECK_AGE_BUILD = 'nix build .#check-age --no-update-lock-file --out-link "$RUNNER_TEMP/check-age"'
 REAL_ROUNDTRIP = ('"$tool/python3" -I checks/test_rent_tunnel.py --sops "$tool/sops"'
-                  ' --age-keygen "$RUNNER_TEMP/check-age/bin/age-keygen"')
+                  ' --age-keygen "$RUNNER_TEMP/check-age/bin/age-keygen" --tofu "$tool/tofu"')
 OCI_ROUNDTRIP = ('"$tool/python3" -I checks/test_jev_api.py --sops "$tool/sops"'
                  ' --age-keygen "$RUNNER_TEMP/check-age/bin/age-keygen"')
 # The author dispatch names one declared binding; each has exactly one literal step carrying only its own inputs.
@@ -650,9 +652,11 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]],
     check_author_targets(texts["author-dev-jev-api.yml"], author_targets)
     require(f"{EFFECT_ENTRY} project" in texts["project-dev-jev-api.yml"], "project workflow entry call missing")
     rent = texts["project-dev-rent-tunnel.yml"]
-    require(f"run: '{EFFECT_ENTRY} rent-tunnel'" in rent, "rent tunnel workflow entry call missing")
-    require('"$tool/git" add ciphertexts/dev-rent-tunnel.sops.yaml contracts/environments.jsonl\n' in rent,
-            "rent tunnel handoff must stage only its ciphertext and plane state")
+    require(f"run: '{EFFECT_ENTRY} rent-root'" in rent and rent.count(f"{EFFECT_ENTRY} rent-") == 1,
+            "rent workflow must run only the persistent root entry")
+    require('"$tool/git" add ciphertexts/dev-rent-tunnel.sops.yaml ciphertexts/dev-rent-client.sops.yaml '
+            'contracts/environments.jsonl\n' in rent and rent.count('"$tool/git" add ') == 1,
+            "rent handoff must stage only both ciphertexts and plane state")
     probe = texts["probe-dev-rent-access-ssh.yml"]
     require(f"run: '{EFFECT_ENTRY} rent-access-probe'" in probe, "access probe workflow entry call missing")
     require("permissions:\n  actions: read\n  contents: read\n" in probe and "write" not in probe,
@@ -753,7 +757,7 @@ def check_readme(root: Path, environments: dict[str, dict[str, Any]]) -> None:
         "checks/test_rent_tunnel.py",
         PROBE_CONFIG,
         RENT_CONFIG,
-        "declaration only: no workflow plans or applies it",
+        "applied only by `rent-root` under a separate effect grant",
         "checks/test_rent_access_probe.py",
         "name lookup locates candidates and never proves ownership",
         STATE_CONFIG,

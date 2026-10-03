@@ -61,6 +61,16 @@ THIRD_PARTY_NOTICES.md
 | `dev-rent-tunnel/CLOUDFLARE_ACCOUNT_ID` | variable | cloudflare_account_id | persistent |
 | `dev-rent-tunnel/RENT_TUNNEL_ID` | variable | cloudflare_tunnel_id | persistent |
 | `dev-rent-tunnel/RENT_AGE_RECIPIENT` | variable | age_recipient | persistent |
+| `dev-rent-tunnel/AWS_ACCESS_KEY_ID` | secret | opaque | persistent |
+| `dev-rent-tunnel/AWS_SECRET_ACCESS_KEY` | secret | opaque | persistent |
+| `dev-rent-tunnel/RENT_STATE_PASSPHRASE` | secret | opaque | persistent |
+| `dev-rent-tunnel/CLOUDFLARE_ZONE_ID` | variable | cloudflare_zone_id | persistent |
+| `dev-rent-tunnel/RENT_HOSTNAME` | variable | opaque | persistent |
+| `dev-rent-tunnel/RENT_ORIGIN_SERVICE` | variable | opaque | persistent |
+| `dev-rent-tunnel/RENT_SERVICE_TOKEN_DURATION` | variable | opaque | persistent |
+| `dev-rent-tunnel/RENT_STATE_BUCKET` | variable | opaque | persistent |
+| `dev-rent-tunnel/RENT_STATE_KEY` | variable | opaque | persistent |
+| `dev-rent-tunnel/RENT_CLIENT_AGE_RECIPIENT` | variable | age_recipient | persistent |
 | `dev-rent-client/RENT_CLIENT_AGE_RECIPIENT` | variable | age_recipient | persistent |
 | `dev-rent-access-probe/CLOUDFLARE_API_TOKEN` | secret | opaque | persistent |
 | `dev-rent-access-probe/CLOUDFLARE_ACCOUNT_ID` | variable | cloudflare_account_id | persistent |
@@ -73,6 +83,8 @@ THIRD_PARTY_NOTICES.md
 | `prd-projection/JEV_API_KEY` | secret | opaque | persistent |
 | `prd-projection/CLOUDFLARE_API_TOKEN` | secret | opaque | persistent |
 | `prd-projection/CLOUDFLARE_ACCOUNT_ID` | variable | cloudflare_account_id | persistent |
+
+`dev-rent-tunnel` also carries two planes: the standalone tunnel token GET (`dev.rent-tunnel`) and the persistent root (`dev.rent-root`), which the workflow runs and which reads every `dev-rent-tunnel` input above except `RENT_TUNNEL_ID`. `opaque` inputs are checked only for presence and for not appearing in the repository; OpenTofu and the provider decide whether a hostname, origin service or duration is valid, so this document names inputs and never their values.
 
 There are no stg or prd authoring Environments. `dev-rent-access-probe` carries two planes: the Access probe reads `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ZONE_ID`, the state proof (`dev.rent-state-proof`) reads `R2_PARENT_API_TOKEN` and `R2_PARENT_ACCESS_KEY_ID`, both read `CLOUDFLARE_ACCOUNT_ID`, and neither reads the other's secret.
 
@@ -122,7 +134,7 @@ The rent OCI host runs `cloudflared` from a token file. envs owns only the step 
 
 ```text
 dev-rent-tunnel/CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, RENT_TUNNEL_ID, RENT_AGE_RECIPIENT
-→ project-dev-rent-tunnel (manual dispatch on proposals only)
+→ envs-effect rent-tunnel (the standalone entry; the workflow now runs rent-root below)
 → one bounded GET of the tunnel token (30 s, 64 KiB, no redirect, entry-owned CA bundle)
 → token in memory → sops stdin, SOPS_AGE_RECIPIENTS = the one target recipient
 → ciphertexts/dev-rent-tunnel.sops.yaml + dev.rent-tunnel ACTIVE
@@ -161,21 +173,35 @@ dev-rent-access-probe/CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_ZO
 
 Not proven here: that `cloudflared` 2026.6.1 honours a service token (a reported 2026.6.0 regression, cloudflare/cloudflared#1673, is a risk), any real Cloudflare resource or Access decision, the API token scope, unattended SSH to the rent, or G6I3 credential selection. The live run needs the `dev-rent-access-probe` Environment and its own contract.
 
-Not proven here, and not owned by envs: a real provider retrieval or dispatch of this workflow, the Cloudflare API token scope it needs, whether Actions may open the handoff PR (a PR opened with the workflow token does not trigger `check`), the target's age identity, applying the ciphertext on the target, the client credential, and unattended SSH.
+Not proven here, and not owned by envs: a real provider retrieval or dispatch of this workflow, the Cloudflare API token scope it needs, whether Actions may open the handoff PR and whether `check` then runs for it, the target's age identity, applying the ciphertext on the target, the client credential, and unattended SSH.
 
 ## Dev rent persistent Cloudflare root (windows #14-E)
 
 `providers/dev-rent-cloudflare/main.tf` declares the persistent SSH path the rent will use: one named Tunnel (`config_src = "cloudflare"`) with its ingress, the DNS CNAME, a self-hosted Access application and a Service Auth (`non_identity`) policy for exactly one service token. It reuses the resource shape the disposable probe ran against the real provider, without its `create` gate, and pins the same standard provider (5.21.1). Account, zone, hostname, origin service and `service_token_duration` are required inputs with no default; nothing adopts, imports or moves an existing resource.
 
-It is declaration only: no workflow plans or applies it. `check` initializes it without its backend and validates it with network access closed, and the repository check refuses the four things native validation accepts: a local (plaintext) backend instead of the locked native S3 backend, unenforced state or plan encryption, a credentials output that is not sensitive, and a service-token lifetime fixed in source. The output being sensitive does not keep the secrets out of state: the Tunnel token and the service-token secret will be stored there.
+It is applied only by `rent-root` under a separate effect grant: the manual `project-dev-rent-tunnel` workflow runs that one entry from the verified artifact, and nothing else plans or applies it. `check` initializes it without its backend and validates it with network access closed, and the repository check refuses the four things native validation accepts: a local (plaintext) backend instead of the locked native S3 backend, unenforced state or plan encryption, a credentials output that is not sensitive, and a service-token lifetime fixed in source. The output being sensitive does not keep the secrets out of state: the Tunnel token and the service-token secret are stored there, encrypted.
 
-No plan or apply until three later gates are agreed, in no implied order:
+```text
+dev-rent-tunnel/CLOUDFLARE_API_TOKEN, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, RENT_STATE_PASSPHRASE,
+  CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_ZONE_ID, RENT_HOSTNAME, RENT_ORIGIN_SERVICE, RENT_SERVICE_TOKEN_DURATION,
+  RENT_STATE_BUCKET, RENT_STATE_KEY, RENT_AGE_RECIPIENT, RENT_CLIENT_AGE_RECIPIENT
+→ project-dev-rent-tunnel (manual dispatch on proposals only) → envs-effect rent-root
+→ tofu init (-backend-config bucket and key; the R2 endpoint of CLOUDFLARE_ACCOUNT_ID) → tofu apply
+   TF_ENCRYPTION is built from RENT_STATE_PASSPHRASE with the fixed key provider and method name k0
+→ tofu output -json credentials, in memory → tunnel token sealed to RENT_AGE_RECIPIENT and the service token
+   pair to RENT_CLIENT_AGE_RECIPIENT, both before any write
+→ ciphertexts/dev-rent-tunnel.sops.yaml + ciphertexts/dev-rent-client.sops.yaml
+   + dev.rent-tunnel, dev.rent-client and dev.rent-root ACTIVE → ciphertext handoff PR
+```
 
-- the persistent state: which root creates and owns the bucket (the S3 backend needs an existing one), how that ownership state itself persists encrypted and locked, and the key custody;
-- the backend credential boundary (adrs#443);
-- the service-token lifetime, rotation and delivery to the Windows client, and the Tunnel-token placement into the rent's token slot.
+- Secrets reach only the OpenTofu and SOPS children, by environment; the root output exists only in captured process memory. No value enters argv, the outer log, the result JSON, a plain file, a PR or an artifact; a failure prints `RENT_ROOT=RED: <kind> at <stage>`, nothing else.
+- `RENT_STATE_PASSPHRASE` must be 64 lowercase hex characters, the format `secrets.token_hex(32)` produces. That is a format check, not proof of strength or of a recoverable copy: the owner keeps its recovery custody, the name `k0` is fixed for the state's life, and rotation is not part of this entry.
+- Failures: before the first write (init, apply, output, parse, either seal), existing ciphertext and plane-state files are unchanged. At or after a write, a filesystem, plane-update or validation failure can leave an unpublished partial diff; the run fails, no handoff PR is opened and nothing is claimed. Nothing is cleaned up or rolled back, and a successful apply's provider resources and encrypted remote state stay as they are: no destroy, import, adoption or retry.
+- `ACTIVE` records only that the envelopes were sealed (declared plane state); it does not prove that the Environment, the provider or the backend is configured.
+- The handoff commit names the repository owner (roccho); the pushing actor is the workflow token and the commit is unsigned. GitHub documents that a pull request opened by the workflow token gets `check` runs that wait for approval. Before merge, the handoff's exact head must have successful `check` runs, from that approval or, only if no such run exists after reconciliation, from a separately authorized `check` dispatch on that branch, never both.
+- `checks/test_rent_tunnel.py` proves the entry's routing, refusals, ordering, scoped environments, redaction and failure semantics with fakes; in `check` the closure `tofu` applies an encrypted schema-only fixture root whose synthetic credentials arrive only as `TF_VAR_credentials`, and the production sealer turns its real output into both envelopes with the real sops.
 
-The disposable R2 proof below is design evidence only; it does not prove that production state survives. A denied connection still needs provider Access evidence, and the exact Windows client, reboot and cutover are later windows #14/#8 gates.
+Not proven here: a real Cloudflare apply, the R2 backend's existence, ownership, locking and durability, the state key's recovery, real issued values, credential rotation, any dispatch or approval, and anything on a target. The existing owned bucket, a least-scoped principal, the backend credential, the state-key custody and each target's own age identity are owner prerequisites of the effect grant. The disposable R2 proof below is design evidence only; a denied connection still needs provider Access evidence, and the exact Windows client, reboot and cutover are later windows #14/#8 gates.
 
 ## Dev rent placement (windows #14-E)
 
@@ -195,7 +221,7 @@ place.ps1 -Target rent -Identity <identity> -RentImage ghcr.io/roccho-dev/window
 ```
 
 - The plaintext exists only in `place.ps1`'s memory and its private child pipes: never printed, logged, in argv, environment or a file. The writer's exit code is the only result; a refusal is one fixed line. `rent-receive.sh` uses only the image's own bash and coreutils, holds no quote or backslash so it travels as one argument, and replaces the slot rent-start checks (regular file, 0:0, mode 600, 1-4096 bytes, not blank) only while an existing one is exactly that owned shape; any other object is refused and kept, and the same value changes nothing. Both `/var/lib/rent` and `/var/lib/rent/cloudflared` must be real directories owned by uid 0 with no group or other write bit (rent-start lays the state root out 0:0 755; any such mode is accepted), so no other user can redirect or replace the slot. `place.ps1` reads each decrypted value into one fixed buffer of its bound (1024 per client line, 4096 for the token) plus a line break, stops sops beyond it, and discards every other child stream unread.
-- `rent-client` projects only the service token pair; the persistent root is still declaration only and nothing here plans or applies it. Until the owner configures `dev-rent-client`, the plane is `NOT_CONFIGURED`.
+- `rent-client` projects only the service token pair from a root output given on stdin and never applies the root; `rent-root` above applies it and seals both envelopes. Until an envelope is sealed, its plane is `NOT_CONFIGURED`.
 - `placement-gate` in `check` uses each platform's actual CI output from one run: `placement-artifact` builds the Windows distribution, `placement-author` seals synthetic values with the provided Linux artifact, `placement-windows` binds the exact published windows Release named in `contracts/provider-consumer.jsonl` (the tag names that commit; github-actions[bot] published it from a push run whose scope, build, Windows proof, rent image and publish jobs passed; every asset equals GitHub's digest; the ZIP equals its `.sha256`; `rent-image.json` names that source) and runs `place.ps1` in Windows PowerShell 5.1 into windows' own released `ReadRentAccessInput` and `Get-RentAccessProblem`, and `placement-rent` runs `rent-receive.sh` in the rent image that Release names, by digest, after the registry tag resolves to it. Until that Release exists the gate is RED, never assumed.
 
 Not proven here: the production `-Mode RentAccess` glue (G6I3 normal-user caller, ledger lock, owner-only write; the windows proof covers the writer functions), WSLC (Docker stands in for the receiver), the target identities and their bootstrap, real issuance or placement, Cloudflare acceptance and denial, no-browser behaviour, and packaged Windows Codex.
