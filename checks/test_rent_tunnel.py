@@ -356,10 +356,13 @@ def root_env(**overrides: str) -> dict[str, str]:
 
 
 class RootRunner:
-    # Fake OpenTofu and sops: fail names one step (init, apply, output, sops-rent, sops-client) to return non-zero.
-    def __init__(self, fail: str | None = None, output: bytes | None = None) -> None:
+    # Fake OpenTofu and sops: fail names one step (init, apply, output, sops-rent, sops-client) to return non-zero,
+    # with the synthetic (stdout, stderr) of failure.
+    def __init__(self, fail: str | None = None, output: bytes | None = None,
+                 failure: tuple[bytes, bytes] = (b"", b"")) -> None:
         self.fail = fail
         self.output = credentials() if output is None else output
+        self.failure = failure
         self.calls: list[tuple[list[str], bytes | None, dict[str, str]]] = []
 
     def __call__(self, argv, input_data, env):
@@ -367,7 +370,7 @@ class RootRunner:
         recipient = (env or {}).get("SOPS_AGE_RECIPIENTS", "")
         step = argv[2] if argv[0] == fixtures.TOOLS["tofu"] else "sops-rent" if recipient == RECIPIENT else "sops-client"
         if step == self.fail:
-            return subprocess.CompletedProcess(argv, 1, stdout=b"", stderr=b"")
+            return subprocess.CompletedProcess(argv, 1, stdout=self.failure[0], stderr=self.failure[1])
         body = {"output": self.output, "sops-rent": ciphertext((recipient,)),
                 "sops-client": client_ciphertext((recipient,))}.get(step, b"")
         return subprocess.CompletedProcess(argv, 0, stdout=body, stderr=b"")
@@ -530,6 +533,76 @@ def test_root_main() -> None:
         finally:
             jev.rent_root = original
         assert code == 1 and out.getvalue() == "" and err.getvalue() == expected, (code, out.getvalue(), err.getvalue())
+
+
+# Synthetic init output carries this canary and every root secret, none of which may reach the CLI's output.
+INIT_CANARY = "init-canary-" + secrets.token_hex(16)
+
+
+def root_main(runner: RootRunner, prior: bool) -> tuple[int, str, str, bool]:
+    # The production CLI with its own progress, over the fake children; returns code, stdout, stderr and whether the
+    # three snapshot files are byte-identical afterwards.
+    root = fixtures.copy_root()
+    if prior:
+        prior_envelopes(root)
+    before = snapshot(root)
+    original = jev.rent_root
+    jev.rent_root = lambda data_root, progress: original(data_root, runner, progress)
+    out, err = io.StringIO(), io.StringIO()
+    try:
+        with fixtures.environment(root_env()), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = jev.main(["--root", str(root), "rent-root"])
+    finally:
+        jev.rent_root = original
+    return code, out.getvalue(), err.getvalue(), snapshot(root) == before
+
+
+def test_root_init_hint() -> None:
+    # A captured non-zero init child adds exactly one closed, unverified line after the unchanged first line: the
+    # observed status, AccessDenied marker and transport-like text, never its output, wording or a cause.
+    planted = " ".join([INIT_CANARY, *root_secrets()]).encode()
+    for stdout, stderr, hint in (
+        (b"", b"operation error S3: HeadObject, https response error StatusCode: 401, RequestID: r",
+         "status=401 access_denied=false transient=false"),
+        (b"", b"https response error StatusCode: 403, api error AccessDenied: Access Denied",
+         "status=403 access_denied=true transient=false"),
+        (b"", b"https response error StatusCode: 403, api error SignatureDoesNotMatch",
+         "status=403 access_denied=false transient=false"),
+        (b"", b"StatusCode: 403, api error AccessDenied\nStatusCode: 500, api error InternalError",
+         "status=multiple access_denied=true transient=false"),
+        (b"", b"https response error StatusCode: 503, api error ServiceUnavailable",
+         "status=5xx access_denied=false transient=false"),
+        (b"", b"https response error StatusCode: 404, api error NoSuchBucket",
+         "status=other access_denied=false transient=false"),
+        (b"", b"dial tcp: lookup example.invalid: no such host", "status=none access_denied=false transient=true"),
+        (b"https response error StatusCode: 401", b"", "status=401 access_denied=false transient=false"),
+        (b"", b"", "status=none access_denied=false transient=false"),
+        # Unrelated encryption and credential wording is neither a word nor a cause: only the absent facts.
+        (b"Initializing the backend...", b"Error: the encryption method is not configured; credentials are set",
+         "status=none access_denied=false transient=false"),
+    ):
+        for prior in (False, True):
+            runner = RootRunner("init", failure=(stdout + b"\n" + planted, stderr + b"\n" + planted))
+            code, out, err, unchanged = root_main(runner, prior)
+            expected = f"RENT_ROOT=RED: envs at init\nRENT_ROOT_INIT_HINT_UNVERIFIED={hint}\n"
+            assert code == 1 and out == "" and err == expected, (code, out, err)
+            assert runner.steps() == ["init"] and unchanged, runner.steps()
+            assert not any(value in err for value in [INIT_CANARY, *root_secrets()])
+
+    # No hint without a captured non-zero init: an init child that never launched, and a later child's failure.
+    class Unlaunched(RootRunner):
+        def __call__(self, argv, input_data, env):
+            self.calls.append((list(argv), input_data, dict(env or {})))
+            raise OSError(INIT_CANARY)
+
+    status = b"https response error StatusCode: 403, api error AccessDenied\n" + planted
+    for runner, expected, steps in (
+        (Unlaunched(), "RENT_ROOT=RED: os at init\n", ["init"]),
+        (RootRunner("apply", failure=(status, status)), "RENT_ROOT=RED: envs at apply\n", ["init", "apply"]),
+    ):
+        code, out, err, unchanged = root_main(runner, False)
+        assert code == 1 and out == "" and err == expected, (code, out, err)
+        assert runner.steps() == steps and unchanged, runner.steps()
 
 
 def run(argv: list[str], env: dict[str, str]) -> subprocess.CompletedProcess[bytes]:
@@ -738,6 +811,7 @@ def main() -> None:
         test_root_red()
         test_root_after_write()
         test_root_main()
+        test_root_init_hint()
         if args.sops is None:
             print("real SOPS roundtrip: NOT RUN (the check workflow runs it with --sops, --age-keygen and --tofu)")
         else:

@@ -1029,7 +1029,8 @@ def seal_root_output(root: Path, tools: Mapping[str, str], work: Path, env: Mapp
 
 def rent_root(root: Path = ROOT, runner: Runner = default_runner, progress: dict[str, str] | None = None) -> dict[str, Any]:
     # Standard OpenTofu applies the declared root on its native backend; no destroy, import, adoption or retry here.
-    # progress["stage"] names how far it got, so a failure is reported as a closed kind and stage only.
+    # progress["stage"] names how far it got, so a failure is reported as a closed kind and stage only; a captured
+    # non-zero init child also leaves progress["init_hint"], its closed and unverified failure facts.
     progress = {} if progress is None else progress
     progress["stage"] = "gate"
     contracts = validate_contracts(root)
@@ -1048,7 +1049,18 @@ def rent_root(root: Path = ROOT, runner: Runner = default_runner, progress: dict
     (work / "main.tf").write_bytes((root / ROOT_CONFIG).read_bytes())
     env = root_env(tools, inputs, home)
     progress["stage"] = "init"
-    tofu(tools, work, env, runner, "init", "-input=false", "-no-color",
+
+    def init_runner(argv: Sequence[str], input_data: bytes | None,
+                    child_env: Mapping[str, str] | None) -> subprocess.CompletedProcess[bytes]:
+        # Observed text patterns only, not a cause: the status enum and two booleans, never output or wording.
+        result = runner(argv, input_data, child_env)
+        if result.returncode != 0:
+            facts = failure_facts(result)
+            progress["init_hint"] = (f"status={facts['status']} access_denied={str(facts['access_denied']).lower()} "
+                                     f"transient={str(facts['transient']).lower()}")
+        return result
+
+    tofu(tools, work, env, init_runner, "init", "-input=false", "-no-color",
          f"-backend-config=bucket={inputs['RENT_STATE_BUCKET']}", f"-backend-config=key={inputs['RENT_STATE_KEY']}")
     progress["stage"] = "apply"
     tofu(tools, work, env, runner, "apply", "-input=false", "-auto-approve", "-no-color")
@@ -2230,13 +2242,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "rent-client":
             print(json.dumps(client_author(sys.stdin.buffer.read(RESPONSE_LIMIT + 1), root), indent=2, sort_keys=True))
         elif args.command == "rent-root":
-            # Only a closed kind and stage leave on failure: never a message, class name, traceback or value.
+            # Only a closed kind and stage leave on failure, plus a failed init child's closed unverified hint line:
+            # never a message, class name, traceback, child output or value.
             progress: dict[str, str] = {}
             try:
                 result = rent_root(root, progress=progress)
             except Exception as exc:
                 kind = failure_class(exc) if isinstance(exc, STATE_FAILURES) else "other"
                 print(f"RENT_ROOT=RED: {kind} at {progress.get('stage', 'start')}", file=sys.stderr)
+                if "init_hint" in progress:
+                    print(f"RENT_ROOT_INIT_HINT_UNVERIFIED={progress['init_hint']}", file=sys.stderr)
                 return 1
             print(json.dumps(result, indent=2, sort_keys=True))
         elif args.command in {"rent-access-probe", "rent-access-locate"}:
