@@ -1,0 +1,16 @@
+RENT_TUNNEL_TOKEN: ENC[AES256_GCM,data:CS0S5MxZynVDPbAlNM6KNYkfAOzq6DdirIeI7NVCP3vIPFF44WvdueuxiVv125i4SYkeMLUhkefLzyKaboYP4vEFCR+9G8maiP35Lh2DeQkc5UQlSnNQu0R0HTjzXgg31CfbPtAOgeP4WD+fEhUB3OXlJ8FBsJCsvmPAXvtCFbFHthNyWmHcitE2zR5C1aHPesZR0wqDtM7uX9VwwNPuXFOiOQ5ilvxaDlPKNDHOFaBUs9zu+OgTDmAI6JexIYRTNlxxHT+1Pk/1QBAbAlqc6HUzSadXGr470nIlhtNBG1XcxBXJIWXlBvPg8c8iS/M+,iv:nhTMI1ieKaltWDrhesUIJmN7OJ4E7Jyh8RnusR/ZKOw=,tag:nmfUJQvRFDBAHyh1ktqTLA==,type:str]
+sops:
+    age:
+        - enc: |
+            -----BEGIN AGE ENCRYPTED FILE-----
+            YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSBIMWJOTExjVDhycTduQXJk
+            RzZVbERseTVHNTlRbytwbUtvRGNIUU55MGtJClIwczd4S3lNS3Bkc0l6c3B2SWJq
+            MFQzZ0lCbFhuYWwrTHBaemw3dWdqbU0KLS0tIC9LcDE3dllWWjVUc1poMHhwWG9q
+            NkN6VHg4TkorM3pURUpyR1EwT2pLL0kKeunhsl6OXxb3QX5uRxMW84j8y5vEWZX2
+            EBPH0w5wFh4z3SCkOLtJnQyJkuxTT0CF/MxQjkCbf1EGs0fJQa+bRg==
+            -----END AGE ENCRYPTED FILE-----
+          recipient: age1clpf23p0rldhz02wdun2fj5da98qqpx4t77wktm8r50tva8uz99s87g855
+    lastmodified: "2026-10-04T23:02:36Z"
+    mac: ENC[AES256_GCM,data:HBYTesgBJgV2WcB4zTASL/4oeDbINNmT+NEZ7iugwEWidGTXtH2h6eVK4TfWfBmWdHt7DkSaAysL3e+oZ33Ufn/hHRskK2wJhGLKLe2aC3pDHsJR1FVjq4L8HW2Sh9AphxzitTs6e3vcmoeOtJQQE4pQKahcpagc4WD2DgiuT6g=,iv:qRbCny8OSaueUPaB6vtfYvoKRkhqpJAVCAL6ItqbIl4=,tag:U2pmI7tzeF1x/aUOZN26sg==,type:str]
+    unencrypted_suffix: _unencrypted
+    version: 3.13.2
