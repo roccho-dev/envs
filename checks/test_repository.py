@@ -325,7 +325,7 @@ def main() -> None:
     expect_red(replace_text(rent, 'output "credentials" {\n  sensitive = true\n', 'output "credentials" {\n'))
     expect_red(replace_text(rent, "  duration   = var.service_token_duration\n", '  duration   = "1h"\n'))
     expect_red(replace_text(rent, 'variable "service_token_duration" {\n  type = string\n}\n',
-                            'variable "service_token_duration" {\n  type    = string\n  default = "8760h"\n}\n'))
+                            'variable "service_token_duration" {\n  type    = string\n  default = "1h"\n}\n'))
     expect_red(replace_text(".github/workflows/check.yml", '"$tool/tofu" -chdir="$rent" validate -no-color\n', ""))
     # A second, fixed lifetime elsewhere is refused; harmless comments on and around the one assignment are not.
     expect_red(replace_text(rent, '\ndata "cloudflare_zero_trust_tunnel_cloudflared_token" "rent" {',
