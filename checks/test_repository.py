@@ -52,6 +52,17 @@ def mutate_plane(identity: str, change):
     return mutate
 
 
+def fresh_rent(root: Path) -> None:
+    # The rent planes before their first handoff: no envelope and all three NOT_CONFIGURED. The copy must pass the
+    # production inspection first, so a following mutation's refusal is its own and not an inherited state.
+    for relative in ("ciphertexts/dev-rent-tunnel.sops.yaml", "ciphertexts/dev-rent-client.sops.yaml"):
+        (root / relative).unlink(missing_ok=True)
+    for identity in ("dev.rent-tunnel", "dev.rent-client", "dev.rent-root"):
+        mutate_plane(identity, lambda row: row.update({"migration_state": "NOT_CONFIGURED",
+                                                       "active_github_environment": None}))(root)
+    assert repository.inspect(root)["status"] == "PASS"
+
+
 def replace_text(relative: str, old: str, new: str):
     def mutate(root: Path) -> None:
         path = root / relative
@@ -247,8 +258,10 @@ def main() -> None:
     expect_red(replace_text(rent, " ciphertexts/dev-rent-client.sops.yaml contracts/", " contracts/"))
     expect_red(mutate_plane("dev.rent-root", lambda row: row["required_variables"].pop()))
     expect_red(mutate_plane("dev.rent-root", lambda row: row.update({"github_environment": "dev-rent-client"})))
-    expect_red(mutate_plane("dev.rent-root", lambda row: row.update(
-        {"migration_state": "ACTIVE", "active_github_environment": "dev-rent-tunnel"})))
+    # The root activated without its envelopes, from a valid fresh preimage: on a tree that already holds the
+    # accepted handoff the same row change alone would be a no-op.
+    expect_red(lambda root: (fresh_rent(root), mutate_plane("dev.rent-root", lambda row: row.update(
+        {"migration_state": "ACTIVE", "active_github_environment": "dev-rent-tunnel"}))(root)))
     expect_red(replace_text("contracts/provider-consumer.jsonl", '"provider_apply_authority",', ""))
     expect_red(replace_text("README.md", "dev-rent-tunnel/RENT_STATE_PASSPHRASE", "dev-rent-tunnel/REMOVED"))
     expect_red(replace_text("README.md", "applied only by `rent-root` under a separate effect grant", "declaration only"))

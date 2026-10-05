@@ -45,9 +45,10 @@ def rent_env(**overrides: str) -> dict[str, str]:
     return values
 
 
-def ciphertext(recipients: tuple[str, ...] = (RECIPIENT,), key: str = jev.RENT_KEY, extra: str = "") -> bytes:
+def ciphertext(recipients: tuple[str, ...] = (RECIPIENT,), key: str = jev.RENT_KEY, extra: str = "",
+               data: str = "fixture") -> bytes:
     lines = "".join(f"    - recipient: {item}\n" for item in recipients)
-    return f"{key}: ENC[AES256_GCM,data:fixture]\n{extra}sops:\n  age:\n{lines}".encode()
+    return f"{key}: ENC[AES256_GCM,data:{data}]\n{extra}sops:\n  age:\n{lines}".encode()
 
 
 def provider(body: object) -> bytes:
@@ -84,10 +85,47 @@ def no_secret_in_tree(root: Path) -> None:
             assert value.encode() not in data, f"{path.relative_to(root)} carries a live value"
 
 
-def test_rent_author() -> None:
+def fresh_root() -> Path:
+    # The rent planes before their first handoff, whatever the checkout holds: no rent or client envelope and the three
+    # rent planes NOT_CONFIGURED. The production validator accepts it before any case mutates it.
     root = fixtures.copy_root()
+    for relative in (jev.RENT_CIPHERTEXT, jev.CLIENT_CIPHERTEXT):
+        (root / relative).unlink(missing_ok=True)
+    jev.set_dev_active(root, False, (jev.RENT_PLANE, jev.CLIENT_PLANE, jev.ROOT_PLANE))
+    jev.validate_contracts(root)
+    return root
+
+
+def retained_root() -> Path:
+    # A previous handoff's synthetic envelopes and ACTIVE planes on the fresh preimage, never the checkout's live ones.
+    root = fresh_root()
+    prior_envelopes(root)
+    return root
+
+
+STATES = (fresh_root, retained_root)
+
+
+def planes(root: Path) -> dict[str, dict]:
+    return {row["id"]: row for row in jev.load_jsonl(root / jev.ENVIRONMENTS)}
+
+
+def unrelated_unchanged(before: dict[str, dict], root: Path, changed: tuple[str, ...]) -> None:
+    after = planes(root)
+    assert {key: row for key, row in after.items() if key not in changed} == \
+        {key: row for key, row in before.items() if key not in changed}, "an unrelated plane changed"
+
+
+def test_rent_author() -> None:
+    for state in STATES:
+        rent_author_case(state())
+
+
+def rent_author_case(root: Path) -> None:
     fetch = Provider(provider({"success": True, "errors": [], "messages": [], "result": TOKEN}))
     sops = Sops(ciphertext())
+    before, envelopes = planes(root), snapshot(root)
+    rent, client = str(jev.RENT_CIPHERTEXT), str(jev.CLIENT_CIPHERTEXT)
     try:
         with fixtures.environment(rent_env()):
             result = jev.rent_author(root, sops, fetch)
@@ -108,24 +146,37 @@ def test_rent_author() -> None:
         assert TOKEN not in json.dumps(result)
         contracts = jev.validate_contracts(root)
         assert contracts["environments"][jev.RENT_PLANE]["migration_state"] == "ACTIVE"
-        assert contracts["environments"]["dev.authoring"]["migration_state"] == "NOT_CONFIGURED"
+        unrelated_unchanged(before, root, (jev.RENT_PLANE,))
+        # The rent envelope is this run's output (not a retained one left in place); the client envelope is untouched.
+        after = snapshot(root)
+        assert after[rent] == ciphertext() and after[client] == envelopes[client], "envelopes differ from this run"
         no_secret_in_tree(root)
         # A second run (rotation) over the committed ciphertext is accepted: its recipient metadata is not a leak.
+        rotated = ciphertext(data="rotated")
         with fixtures.environment(rent_env()):
-            jev.rent_author(root, Sops(ciphertext()), Provider(provider({"success": True, "result": TOKEN})))
+            jev.rent_author(root, Sops(rotated), Provider(provider({"success": True, "result": TOKEN})))
+        after = snapshot(root)
+        assert after[rent] == rotated and after[client] == envelopes[client], "the rotation did not replace only rent"
     finally:
         shutil.rmtree(root.parent, ignore_errors=True)
 
 
 def expect_rent_red(values: dict[str, str], *, mutate=None, body: bytes | Exception | None = None,
                     output: bytes | None = None, returncode: int = 0, fetched: bool = False) -> None:
-    root = fixtures.copy_root()
+    # A refusal leaves both envelopes and the plane state byte-identical: still absent on a fresh tree, a previous
+    # handoff's own bytes on a retained one.
+    for state in STATES:
+        rent_red_case(state(), values, mutate, body, output, returncode, fetched)
+
+
+def rent_red_case(root: Path, values: dict[str, str], mutate, body: bytes | Exception | None, output: bytes | None,
+                  returncode: int, fetched: bool) -> None:
     fetch = Provider(provider({"success": True, "result": TOKEN}) if body is None else body)
     sops = Sops(ciphertext() if output is None else output, returncode)
     try:
         if mutate is not None:
             mutate(root)
-        before = (root / jev.ENVIRONMENTS).read_bytes()
+        before = snapshot(root)
         with fixtures.environment(values):
             try:
                 jev.rent_author(root, sops, fetch)
@@ -136,8 +187,7 @@ def expect_rent_red(values: dict[str, str], *, mutate=None, body: bytes | Except
         assert not any(value in message for value in (TOKEN, API_TOKEN, ACCOUNT_ID, TUNNEL_ID)), message
         assert len(fetch.calls) == (1 if fetched else 0), "provider was called before the input gate"
         assert output is not None or not sops.calls, "sops ran before a valid provider token"
-        assert not (root / jev.RENT_CIPHERTEXT).exists()
-        assert (root / jev.ENVIRONMENTS).read_bytes() == before
+        assert snapshot(root) == before, "a refused rent tunnel run changed an envelope or plane state"
     finally:
         shutil.rmtree(root.parent, ignore_errors=True)
 
@@ -202,6 +252,7 @@ def test_rent_ciphertext_red() -> None:
 
 
 def test_committed_state_red() -> None:
+    # Each case starts from a preimage the validator accepts (fresh or retained) and creates exactly one inconsistency.
     def ciphertext_without_state(root: Path) -> None:
         (root / "ciphertexts").mkdir(exist_ok=True)
         (root / jev.RENT_CIPHERTEXT).write_bytes(ciphertext())
@@ -214,8 +265,20 @@ def test_committed_state_red() -> None:
         (root / jev.RENT_CIPHERTEXT).write_bytes(ciphertext((RECIPIENT, OTHER_RECIPIENT)))
         jev.set_dev_active(root, True, (jev.RENT_PLANE,))
 
-    for mutate in (ciphertext_without_state, state_without_ciphertext, two_recipients):
-        root = fixtures.copy_root()
+    # Retained: an ACTIVE plane loses its envelope, or its envelope gains a second recipient.
+    def retained_without_rent(root: Path) -> None:
+        (root / jev.RENT_CIPHERTEXT).unlink()
+
+    def retained_without_client(root: Path) -> None:
+        (root / jev.CLIENT_CIPHERTEXT).unlink()
+
+    def retained_two_recipients(root: Path) -> None:
+        (root / jev.RENT_CIPHERTEXT).write_bytes(ciphertext((RECIPIENT, OTHER_RECIPIENT)))
+
+    for state, mutate in ((fresh_root, ciphertext_without_state), (fresh_root, state_without_ciphertext),
+                          (fresh_root, two_recipients), (retained_root, retained_without_rent),
+                          (retained_root, retained_without_client), (retained_root, retained_two_recipients)):
+        root = state()
         try:
             mutate(root)
             try:
@@ -251,9 +314,10 @@ def credentials(**overrides: object) -> bytes:
     return json.dumps({key: item for key, item in value.items() if item is not None}).encode()
 
 
-def client_ciphertext(recipients: tuple[str, ...] = (RECIPIENT,), keys: tuple[str, ...] = jev.CLIENT_KEYS, extra: str = "") -> bytes:
+def client_ciphertext(recipients: tuple[str, ...] = (RECIPIENT,), keys: tuple[str, ...] = jev.CLIENT_KEYS, extra: str = "",
+                      data: str = "fixture") -> bytes:
     lines = "".join(f"    - recipient: {item}\n" for item in recipients)
-    fields = "".join(f"{key}: ENC[AES256_GCM,data:fixture]\n" for key in keys)
+    fields = "".join(f"{key}: ENC[AES256_GCM,data:{data}]\n" for key in keys)
     return f"{fields}{extra}sops:\n  age:\n{lines}".encode()
 
 
@@ -264,8 +328,14 @@ def client_env(**overrides: str) -> dict[str, str]:
 
 
 def test_client_author() -> None:
-    root = fixtures.copy_root()
+    for state in STATES:
+        client_author_case(state())
+
+
+def client_author_case(root: Path) -> None:
     sops = Sops(client_ciphertext())
+    before, envelopes = planes(root), snapshot(root)
+    rent, client = str(jev.RENT_CIPHERTEXT), str(jev.CLIENT_CIPHERTEXT)
     try:
         with fixtures.environment(client_env()):
             result = jev.client_author(credentials(), root, sops)
@@ -283,7 +353,10 @@ def test_client_author() -> None:
         assert not any(value in json.dumps(result) for value in (CLIENT_ID, CLIENT_SECRET))
         contracts = jev.validate_contracts(root)
         assert contracts["environments"][jev.CLIENT_PLANE]["migration_state"] == "ACTIVE"
-        assert contracts["environments"][jev.RENT_PLANE]["migration_state"] == "NOT_CONFIGURED"
+        unrelated_unchanged(before, root, (jev.CLIENT_PLANE,))
+        # The client envelope is this run's output; the rent envelope is untouched.
+        after = snapshot(root)
+        assert after[client] == client_ciphertext() and after[rent] == envelopes[rent], "envelopes differ from this run"
         for path in jev.repository_files(root):
             data = path.read_bytes()
             assert not any(value.encode() in data for value in (CLIENT_ID, CLIENT_SECRET, TOKEN)), path
@@ -293,12 +366,18 @@ def test_client_author() -> None:
 
 def expect_client_red(values: dict[str, str], body: bytes, *, mutate=None, output: bytes | None = None,
                       returncode: int = 0) -> None:
-    root = fixtures.copy_root()
+    # As for the tunnel: a refusal leaves envelopes and plane state byte-identical on fresh and retained trees.
+    for state in STATES:
+        client_red_case(state(), values, body, mutate, output, returncode)
+
+
+def client_red_case(root: Path, values: dict[str, str], body: bytes, mutate, output: bytes | None,
+                    returncode: int) -> None:
     sops = Sops(client_ciphertext() if output is None else output, returncode)
     try:
         if mutate is not None:
             mutate(root)
-        before = (root / jev.ENVIRONMENTS).read_bytes()
+        before = snapshot(root)
         with fixtures.environment(values):
             try:
                 jev.client_author(body, root, sops)
@@ -308,8 +387,7 @@ def expect_client_red(values: dict[str, str], body: bytes, *, mutate=None, outpu
                 raise AssertionError("invalid rent client state was accepted")
         assert not any(value in message for value in (CLIENT_ID, CLIENT_SECRET, TOKEN)), message
         assert output is not None or not sops.calls, "sops ran before a valid credential"
-        assert not (root / jev.CLIENT_CIPHERTEXT).exists()
-        assert (root / jev.ENVIRONMENTS).read_bytes() == before
+        assert snapshot(root) == before, "a refused rent client run changed an envelope or plane state"
     finally:
         shutil.rmtree(root.parent, ignore_errors=True)
 
@@ -385,7 +463,9 @@ def root_secrets() -> list[str]:
 
 def prior_envelopes(root: Path) -> None:
     # A previous run's envelopes and plane state, which a failure before the first write must leave byte-identical.
-    for relative, data in ((jev.RENT_CIPHERTEXT, ciphertext()), (jev.CLIENT_CIPHERTEXT, client_ciphertext())):
+    # Their data differs from every new output, so a later run that skips its write cannot pass as a rewrite.
+    for relative, data in ((jev.RENT_CIPHERTEXT, ciphertext(data="prior")),
+                           (jev.CLIENT_CIPHERTEXT, client_ciphertext(data="prior"))):
         (root / relative).parent.mkdir(parents=True, exist_ok=True)
         (root / relative).write_bytes(data)
     jev.set_dev_active(root, True, (jev.RENT_PLANE, jev.CLIENT_PLANE, jev.ROOT_PLANE))
@@ -400,7 +480,13 @@ def snapshot(root: Path) -> dict[str, bytes | None]:
 # The rent-root cases delete nothing (no recursive deletion in reusable automation): each copied data root and each
 # run's scratch stays in the CI runner's temporary space, which ends with the runner.
 def test_root_author() -> None:
-    root = fixtures.copy_root()
+    # The first handoff (fresh) and a later one over a previous handoff (retained) both end with both envelopes.
+    for state in STATES:
+        root_author_case(state())
+
+
+def root_author_case(root: Path) -> None:
+    before = planes(root)
     runner = RootRunner()
     with fixtures.environment(root_env()):
         result = jev.rent_root(root, runner)
@@ -439,6 +525,11 @@ def test_root_author() -> None:
     contracts = jev.validate_contracts(root)
     for plane in (jev.RENT_PLANE, jev.CLIENT_PLANE, jev.ROOT_PLANE):
         assert contracts["environments"][plane]["migration_state"] == "ACTIVE"
+    unrelated_unchanged(before, root, (jev.RENT_PLANE, jev.CLIENT_PLANE, jev.ROOT_PLANE))
+    # Both envelopes are this run's sealed outputs, replacing any retained ones.
+    after = snapshot(root)
+    assert after[str(jev.RENT_CIPHERTEXT)] == ciphertext((RECIPIENT,)) and \
+        after[str(jev.CLIENT_CIPHERTEXT)] == client_ciphertext((ROOT_CLIENT_RECIPIENT,)), "envelopes differ from this run"
     for path in jev.repository_files(root):
         data = path.read_bytes()
         assert not any(value.encode() in data for value in root_secrets()), path
@@ -447,7 +538,8 @@ def test_root_author() -> None:
 def expect_root_red(values: dict[str, str], runner: RootRunner, *, prior: bool = False, mutate=None,
                     children: bool = True) -> dict[str, str]:
     # A failure before the first write: RED, no destroy/import/retry, and every envelope and plane file unchanged.
-    root = fixtures.copy_root()
+    # prior selects the retained state explicitly; otherwise the tree is fresh whatever the checkout holds.
+    root = fresh_root()
     progress: dict[str, str] = {}
     if prior:
         prior_envelopes(root)
@@ -490,8 +582,9 @@ def test_root_red() -> None:
 
 
 def test_root_after_write() -> None:
-    # A failure at or after the first write fails the entry without claiming success; the written files stay.
-    root = fixtures.copy_root()
+    # A failure at or after the first write fails the entry without claiming success; the written files stay. The tree
+    # starts fresh, so both envelopes found afterwards are this run's.
+    root = fresh_root()
     progress: dict[str, str] = {}
     original = jev.set_dev_active
 
@@ -515,7 +608,7 @@ def test_root_after_write() -> None:
 
 def test_root_main() -> None:
     # The production entry: a refusal and an unexpected exception print only a closed kind and stage.
-    root = fixtures.copy_root()
+    root = fresh_root()
     original = jev.rent_root
 
     def leaking(_root, progress):
@@ -541,8 +634,8 @@ INIT_CANARY = "init-canary-" + secrets.token_hex(16)
 
 def root_main(runner: RootRunner, prior: bool) -> tuple[int, str, str, bool]:
     # The production CLI with its own progress, over the fake children; returns code, stdout, stderr and whether the
-    # three snapshot files are byte-identical afterwards.
-    root = fixtures.copy_root()
+    # three snapshot files are byte-identical afterwards. prior selects the retained state explicitly.
+    root = fresh_root()
     if prior:
         prior_envelopes(root)
     before = snapshot(root)
@@ -726,7 +819,7 @@ def real_root_roundtrip(sops_bin: str, keygen_bin: str, tofu_bin: str) -> None:
         assert path.startswith("/nix/store/") and os.access(path, os.X_OK), f"not a locked store tool: {path}"
     assert not any(value in ROOT_FIXTURE for value in (TOKEN, CLIENT_ID, CLIENT_SECRET))
     work = Path(tempfile.mkdtemp(prefix="envs-rent-root-real-"))
-    root = fixtures.copy_root()
+    root = fresh_root()
     base = {"PATH": os.path.dirname(sops_path), "HOME": str(work)}
     try:
         identities: dict[str, tuple[Path, str]] = {}
