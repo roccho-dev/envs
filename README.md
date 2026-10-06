@@ -72,6 +72,7 @@ THIRD_PARTY_NOTICES.md
 | `dev-rent-tunnel/RENT_STATE_KEY` | variable | opaque | persistent |
 | `dev-rent-tunnel/RENT_CLIENT_AGE_RECIPIENT` | variable | age_recipient | persistent |
 | `dev-rent-client/RENT_CLIENT_AGE_RECIPIENT` | variable | age_recipient | persistent |
+| `dev-linode-read-probe/LINODE_API_TOKEN` | secret | opaque | persistent |
 | `dev-rent-access-probe/CLOUDFLARE_API_TOKEN` | secret | opaque | persistent |
 | `dev-rent-access-probe/CLOUDFLARE_ACCOUNT_ID` | variable | cloudflare_account_id | persistent |
 | `dev-rent-access-probe/CLOUDFLARE_ZONE_ID` | variable | cloudflare_zone_id | persistent |
