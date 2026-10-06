@@ -690,8 +690,11 @@ jobs:
             --title "envs placement $ENVS_SOURCE_SHA" \
             --notes "The envs-placement-$ENVS_SOURCE_SHA distribution every check job of this push run tested, as one verified ZIP. Download it without credentials and accept it only when its SHA-256 equals this asset's GitHub digest and its SOURCE names $ENVS_SOURCE_SHA." \
             || echo "release creation failed or its effect is unknown; reading it back once, no retry" >&2
-          test "$(api "${release_query[@]}")" = "$expected"
-          test "$(api "${tag_query[@]}")" = "commit $ENVS_SOURCE_SHA"
+          # Plain assignments keep api's own status under set -e: a failed read stops even when its output would match.
+          after="$(api "${release_query[@]}")"
+          test "$after" = "$expected"
+          after="$(api "${tag_query[@]}")"
+          test "$after" = "commit $ENVS_SOURCE_SHA"
           echo "published $tag at $ENVS_SOURCE_SHA: $(cut -d ' ' -f 1 "$zip.sha256")"
 
   toolchain:
