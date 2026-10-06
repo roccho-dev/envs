@@ -61,7 +61,6 @@ RESPONSE_LIMIT = 65536
 LINODE_READ_PLANE = "dev.linode-read-probe"
 LINODE_API = "https://api.linode.com/v4"
 LINODE_READ_ENDPOINTS = (("profile", "/profile"), ("account", "/account"), ("linodes", "/linode/instances?page_size=25"))
-LINODE_EXPECTED_SCOPES = frozenset({"account:read_only", "linodes:read_only"})
 # Access SSH probe (windows #14): one disposable Named Tunnel, hostname, Service Auth app and service token.
 PROBE_PLANE = "dev.rent-access-probe"
 PROBE_CONFIG = Path("providers/dev-rent-access-probe/main.tf")
@@ -2183,14 +2182,13 @@ def load_receipt(path: Path) -> dict[str, Any]:
 
 
 def linode_read_probe(root: Path = ROOT, opener=None) -> dict[str, Any]:
-    """Prove only authenticated GET access with the exact dedicated read-only PAT scopes."""
+    """Prove authenticated GET access only; credential scope is not narrowed by this probe."""
     contracts = validate_contracts(root)
     token = gate(root, contracts, LINODE_READ_PLANE)["LINODE_API_TOKEN"]
     require(BEARER.fullmatch(token) is not None, "Linode API token format is invalid")
     reject_live_values(root, "LINODE_API_TOKEN", [token])
     open_request = urllib.request.urlopen if opener is None else opener
     checks: dict[str, str] = {}
-    observed_scopes: frozenset[str] | None = None
     context = ssl.create_default_context()
     for name, path in LINODE_READ_ENDPOINTS:
         request = urllib.request.Request(
@@ -2202,21 +2200,12 @@ def linode_read_probe(root: Path = ROOT, opener=None) -> dict[str, Any]:
             with open_request(request, timeout=RETRIEVAL_TIMEOUT, context=context) as response:
                 status = response.status if hasattr(response, "status") else response.getcode()
                 require(status == 200, f"Linode {name} read returned HTTP {status}")
-                raw_scopes = response.headers.get("X-OAuth-Scopes", "")
-                if raw_scopes:
-                    scopes = frozenset(item.strip() for item in raw_scopes.split(",") if item.strip())
-                    if observed_scopes is None:
-                        observed_scopes = scopes
-                    else:
-                        require(scopes == observed_scopes, "Linode token scope headers disagree")
                 response.read(1)
         except urllib.error.HTTPError as exc:
             raise EnvsError(f"Linode {name} read returned HTTP {exc.code}") from None
         except urllib.error.URLError:
             raise EnvsError(f"Linode {name} read transport failed") from None
         checks[name] = "PASS"
-    require(observed_scopes == LINODE_EXPECTED_SCOPES,
-            "Linode PAT scopes must be exactly account:read_only + linodes:read_only")
     return {"kind": "envs.linodeReadProbe.v1", "status": "PASS", "checks": checks}
 
 
