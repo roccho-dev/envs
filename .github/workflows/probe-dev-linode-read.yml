@@ -63,8 +63,8 @@ jobs:
       - name: Record effect toolchain identity
         run: '"$ENVS_EFFECT_BIN/envs-effect" --root "$GITHUB_WORKSPACE" toolchain'
 
-      # Dedicated read-only PAT: GET only, response bodies stay out of logs, and the provider-advertised scopes
-      # must be exactly account:read_only + linodes:read_only.
+      # The probe itself is read-only: it issues GET only and never prints response bodies or the credential.
+      # The existing dev provider credential may carry broader authority for later runtime operations.
       - name: Probe Linode read-only API
         env:
           LINODE_API_TOKEN: ${{ secrets.LINODE_API_TOKEN }}
