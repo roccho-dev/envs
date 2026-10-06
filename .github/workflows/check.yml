@@ -48,6 +48,9 @@ jobs:
       - name: Test state proof adapter
         run: python3 checks/test_rent_state_proof.py
 
+      - name: Test Linode read probe adapter
+        run: python3 checks/test_linode_read_probe.py
+
       - name: Verify explicit main compatibility refresh
         if: github.ref_name == 'main'
         run: python3 checks/repository.py --verify-main-compatibility-refresh
@@ -677,6 +680,9 @@ jobs:
 
       - name: Test Jev adapter on the toolchain interpreter
         run: '"$RUNNER_TEMP/envs-effect/bin/python3" -I checks/test_jev_api.py'
+
+      - name: Test Linode read probe on the toolchain interpreter
+        run: '"$RUNNER_TEMP/envs-effect/bin/python3" -I checks/test_linode_read_probe.py'
 
       # The locked closure sops encrypts and decrypts for real; check-only age makes throwaway identities in a temp dir.
       # The closure tofu applies an encrypted schema-only fixture root whose real output reaches the production sealer.

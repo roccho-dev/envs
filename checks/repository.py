@@ -20,6 +20,7 @@ REQUIRED_FILES = {
     ".github/workflows/project-dev-rent-tunnel.yml",
     ".github/workflows/probe-dev-rent-access-ssh.yml",
     ".github/workflows/probe-dev-rent-state.yml",
+    ".github/workflows/probe-dev-linode-read.yml",
     ".gitignore",
     "LICENSE_POLICY.md",
     "LICENSES/README.md",
@@ -32,6 +33,7 @@ REQUIRED_FILES = {
     "checks/test_jev_api.py",
     "checks/test_rent_access_probe.py",
     "checks/test_rent_state_proof.py",
+    "checks/test_linode_read_probe.py",
     "checks/test_rent_tunnel.py",
     "checks/test_repository.py",
     "contracts/bindings.jsonl",
@@ -151,6 +153,7 @@ EFFECT_WORKFLOWS = {
     "project-dev-rent-tunnel.yml": "dev.rent-root",
     "probe-dev-rent-access-ssh.yml": "dev.rent-access-probe",
     "probe-dev-rent-state.yml": "dev.rent-state-proof",
+    "probe-dev-linode-read.yml": "dev.linode-read-probe",
 }
 PROBE_CONFIG = "providers/dev-rent-access-probe/main.tf"
 RENT_CONFIG = "providers/dev-rent-cloudflare/main.tf"
@@ -525,6 +528,7 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]],
     require("run: python3 checks/test_rent_tunnel.py\n" in check, "check workflow must test the rent tunnel adapter")
     require("run: python3 checks/test_rent_access_probe.py\n" in check, "check workflow must test the access probe adapter")
     require("run: python3 checks/test_rent_state_proof.py\n" in check, "check workflow must test the state proof adapter")
+    require("run: python3 checks/test_linode_read_probe.py\n" in check, "check workflow must test the Linode read probe")
     require(TOOLCHAIN_BUILD in check, "check workflow must reconstruct the effect toolchain")
     require(f'{TOOLCHAIN_BIN}envs-effect" toolchain' in check, "check workflow must execute the effect entry")
     require(f'{TOOLCHAIN_BIN}python3" -I checks/test_jev_api.py' in check,
@@ -677,6 +681,11 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]],
     # One Environment, two meanings kept apart: neither workflow maps the other's secret.
     require("CLOUDFLARE_API_TOKEN" not in state and "R2_PARENT_" not in probe,
             "the access probe and state proof secrets must stay distinct")
+    linode = texts["probe-dev-linode-read.yml"]
+    require(f"run: '{EFFECT_ENTRY} linode-read-probe'" in linode and linode.count(" linode-read-probe'") == 1,
+            "Linode read workflow entry call missing")
+    require("permissions:\n  actions: read\n  contents: read\n" in linode and "write" not in linode,
+            "Linode read workflow must be read-only on the repository")
 
 
 def check_toolchain(root: Path, adapter) -> None:

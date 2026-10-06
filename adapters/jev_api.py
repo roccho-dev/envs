@@ -57,6 +57,11 @@ WINDOWS_CONSUMER = "windows.rent.consumer"
 CLOUDFLARE_API = "https://api.cloudflare.com/client/v4"
 RETRIEVAL_TIMEOUT = 30.0
 RESPONSE_LIMIT = 65536
+# Linode/Akamai Cloud read-only connectivity probe: no create/update/delete operation exists here.
+LINODE_READ_PLANE = "dev.linode-read-probe"
+LINODE_API = "https://api.linode.com/v4"
+LINODE_READ_ENDPOINTS = (("profile", "/profile"), ("account", "/account"), ("linodes", "/linode/instances?page_size=25"))
+LINODE_EXPECTED_SCOPES = frozenset({"account:read_only", "linodes:read_only"})
 # Access SSH probe (windows #14): one disposable Named Tunnel, hostname, Service Auth app and service token.
 PROBE_PLANE = "dev.rent-access-probe"
 PROBE_CONFIG = Path("providers/dev-rent-access-probe/main.tf")
@@ -433,6 +438,10 @@ def expected_inputs() -> dict[str, dict[str, list[dict[str, str]]]]:
             ),
             "required_variables": entries(("CLOUDFLARE_ACCOUNT_ID", "cloudflare_account_id", "persistent")),
         },
+        LINODE_READ_PLANE: {
+            "required_secrets": entries(("LINODE_API_TOKEN", "opaque", "persistent")),
+            "required_variables": entries(),
+        },
     }
 
 
@@ -469,6 +478,7 @@ def validate_contracts(root: Path = ROOT) -> dict[str, dict[str, dict[str, Any]]
 
     require(set(envs) == {
         "dev.authoring", "dev.projection", "dev.runtime", RENT_PLANE, CLIENT_PLANE, ROOT_PLANE, PROBE_PLANE, STATE_PLANE,
+        LINODE_READ_PLANE,
         "stg.projection", "stg.runtime", "prd.projection", "prd.runtime",
         "voice-ui.dev", "voice-ui.stg", "voice-ui.prd",
     }, "environment set differs")
@@ -566,6 +576,12 @@ def validate_contracts(root: Path = ROOT) -> dict[str, dict[str, dict[str, Any]]
     probe_secrets = {entry["name"] for entry in probe["required_secrets"]}
     require(not probe_secrets & {entry["name"] for entry in state["required_secrets"]},
             f"{STATE_PLANE} must not reuse the access probe secret")
+
+    linode = envs[LINODE_READ_PLANE]
+    require(linode["github_environment"] == "dev-projection" and linode["owner"] == "envs"
+            and linode["source_kind"] == "provider_issued" and linode["target_kind"] == "read_probe"
+            and linode["active_github_environment"] is None and linode["migration_state"] == "NOT_CONFIGURED",
+            f"{LINODE_READ_PLANE} must be a NOT_CONFIGURED read-only probe plane")
 
     # The OCI target has no state of its own: its ciphertext, when present, is simply valid or RED.
     oci_cipher = root / OCI_CIPHERTEXT
@@ -2166,6 +2182,44 @@ def load_receipt(path: Path) -> dict[str, Any]:
     return value
 
 
+def linode_read_probe(root: Path = ROOT, opener=None) -> dict[str, Any]:
+    """Prove only authenticated GET access with the exact dedicated read-only PAT scopes."""
+    contracts = validate_contracts(root)
+    token = gate(root, contracts, LINODE_READ_PLANE)["LINODE_API_TOKEN"]
+    require(BEARER.fullmatch(token) is not None, "Linode API token format is invalid")
+    reject_live_values(root, "LINODE_API_TOKEN", [token])
+    open_request = urllib.request.urlopen if opener is None else opener
+    checks: dict[str, str] = {}
+    observed_scopes: frozenset[str] | None = None
+    context = ssl.create_default_context()
+    for name, path in LINODE_READ_ENDPOINTS:
+        request = urllib.request.Request(
+            LINODE_API + path,
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            method="GET",
+        )
+        try:
+            with open_request(request, timeout=RETRIEVAL_TIMEOUT, context=context) as response:
+                status = response.status if hasattr(response, "status") else response.getcode()
+                require(status == 200, f"Linode {name} read returned HTTP {status}")
+                raw_scopes = response.headers.get("X-OAuth-Scopes", "")
+                if raw_scopes:
+                    scopes = frozenset(item.strip() for item in raw_scopes.split(",") if item.strip())
+                    if observed_scopes is None:
+                        observed_scopes = scopes
+                    else:
+                        require(scopes == observed_scopes, "Linode token scope headers disagree")
+                response.read(1)
+        except urllib.error.HTTPError as exc:
+            raise EnvsError(f"Linode {name} read returned HTTP {exc.code}") from None
+        except urllib.error.URLError:
+            raise EnvsError(f"Linode {name} read transport failed") from None
+        checks[name] = "PASS"
+    require(observed_scopes == LINODE_EXPECTED_SCOPES,
+            "Linode PAT scopes must be exactly account:read_only + linodes:read_only")
+    return {"kind": "envs.linodeReadProbe.v1", "status": "PASS", "checks": checks}
+
+
 def readiness(root: Path = ROOT) -> dict[str, Any]:
     validate_contracts(root)
     cipher, handoff = root / CIPHERTEXT, root / HANDOFF
@@ -2211,6 +2265,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     sub.add_parser("rent-access-probe")
     sub.add_parser("rent-access-locate")
     sub.add_parser("rent-state-proof")
+    sub.add_parser("linode-read-probe")
     project_parser = sub.add_parser("project")
     project_parser.add_argument("--envs-sha", required=True)
     project_parser.add_argument("--run-id", type=int, required=True)
@@ -2260,6 +2315,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             passed = result["status"] == "NONE_LOCATED" if args.command == "rent-access-locate" else (
                 result["status"] == "TOKEN_REACHED_NEGATIVES_REFUSED" and result.get("cleanup") == "ABSENT")
             return 0 if passed else 1
+        elif args.command == "linode-read-probe":
+            print(json.dumps(linode_read_probe(root), indent=2, sort_keys=True))
+            return 0
         elif args.command == "rent-state-proof":
             # Its failure line names only a closed kind; no exception text, class name or traceback reaches the log.
             try:
@@ -2278,7 +2336,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps({"kind": receipt["kind"], "status": "PASS", "output": str(args.output)}, sort_keys=True))
     except (EnvsError, OSError) as exc:
         label = {"rent-tunnel": "RENT_TUNNEL", "rent-client": "RENT_CLIENT", "rent-access-probe": "RENT_ACCESS_PROBE",
-                 "rent-access-locate": "RENT_ACCESS_PROBE", "rent-state-proof": "RENT_STATE_PROOF"}.get(args.command, "JEV_API")
+                 "rent-access-locate": "RENT_ACCESS_PROBE", "rent-state-proof": "RENT_STATE_PROOF",
+                 "linode-read-probe": "LINODE_READ_PROBE"}.get(args.command, "JEV_API")
         print(f"{label}=RED: {exc}", file=sys.stderr)
         return 1
     return 0
