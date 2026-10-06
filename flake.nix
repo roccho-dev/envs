@@ -46,9 +46,20 @@
         exec ${tools.python3} -I ${self}/adapters/jev_api.py "$@"
       '';
 
+      # Public facts only. Bound source arguments come last and cannot be overridden by a caller.
+      projection-entry = pkgs.writeShellScriptBin "envs-contract-projection" ''
+        exec ${pkgs.python3}/bin/python3 -I ${self}/adapters/contract_projection.py "$@" --root ${self} --revision ${rev}
+      '';
+      # The existing producer CI builds this dependency: tests cannot be omitted while shipping the entry.
+      contract-projection = pkgs.runCommand "envs-contract-projection" { } ''
+        ${pkgs.python3}/bin/python3 -I ${self}/checks/test_contract_projection.py
+        mkdir -p "$out/bin"
+        ln -s ${projection-entry}/bin/envs-contract-projection "$out/bin/envs-contract-projection"
+      '';
+
       effect-toolchain = pkgs.buildEnv {
         name = "envs-effect-toolchain";
-        paths = [ entry ] ++ packages;
+        paths = [ entry contract-projection ] ++ packages;
       };
 
       # Provided artifact: the complete store closure plus ENTRY and SOURCE, deterministic so CI can hand it off by digest.
@@ -91,9 +102,11 @@
     {
       packages.${system} = {
         inherit effect-toolchain effect-artifact placement-artifact;
+        inherit contract-projection;
         default = effect-toolchain;
         # Check-only: a throwaway identity for the real SOPS roundtrip; never in the effect toolchain or artifact.
         check-age = pkgs.age;
       };
+      checks.${system}.contract-projection = contract-projection;
     };
 }
