@@ -484,7 +484,11 @@ def workers_root(target: dict[str, str] | None = None) -> Path:
 
 
 class FakeProviderResponse:
-    def __init__(self, status: int = 200, body: bytes = b'{}'):
+    def __init__(
+        self,
+        status: int = 200,
+        body: bytes = b'{"success":true,"result":{"name":"JEV_API_KEY","type":"secret_text"}}',
+    ):
         self.status = status
         self._body = body
 
@@ -775,6 +779,39 @@ def test_workers_missing_or_deleted_worker_never_creates_draft() -> None:
         shutil.rmtree(root.parent, ignore_errors=True)
 
 
+def test_workers_put_response_protocol() -> None:
+    cases = [
+        ("success-false", b'{"success":false,"result":{"name":"JEV_API_KEY","type":"secret_text"}}', False),
+        ("malformed-json", b'not-json', False),
+        ("wrong-name", b'{"success":true,"result":{"name":"NOT_JEV_API_KEY","type":"secret_text"}}', False),
+        ("wrong-type", b'{"success":true,"result":{"name":"JEV_API_KEY","type":"plain_text"}}', False),
+        ("missing-result", b'{"success":true}', False),
+        ("exact", b'{"success":true,"result":{"name":"JEV_API_KEY","type":"secret_text"}}', True),
+    ]
+    for label, body, accepted in cases:
+        calls = []
+        def opener(request, **_kwargs):
+            calls.append(request)
+            return FakeProviderResponse(body=body)
+
+        try:
+            jev._workers_secret_put(
+                account_id=ACCOUNT_ID,
+                worker_name=WORKER_NAME,
+                secret_name="JEV_API_KEY",
+                secret="fixture-secret",
+                token="provider-token-fixture",
+                opener=opener,
+            )
+        except jev.EnvsError:
+            if accepted:
+                raise AssertionError(f"valid provider response was rejected: {label}")
+        else:
+            if not accepted:
+                raise AssertionError(f"invalid provider response was accepted: {label}")
+        assert len(calls) == 1
+
+
 def test_workers_readback_exact_json_only() -> None:
     # Pure parser: exact target name succeeds; aliases, duplicates and malformed shapes do not.
     assert jev.parse_workers_secret_list(
@@ -782,6 +819,9 @@ def test_workers_readback_exact_json_only() -> None:
     )[0]["name"] == "JEV_API_KEY"
     rejected = [
         b'[{"name":"NOT_JEV_API_KEY","type":"secret_text"}]\n',
+        b'[{"name":"JEV_API_KEY","type":"plain_text"}]\n',
+        b'[{"name":"JEV_API_KEY","type":"unknown"}]\n',
+        b'[{"name":"JEV_API_KEY","type":"secret_key"}]\n',
         b'JEV_API_KEY\n',
         b'{"name":"JEV_API_KEY","type":"secret_text"}\n',
         b'[{"name":"JEV_API_KEY","type":"secret_text"},{"name":"JEV_API_KEY","type":"secret_text"}]\n',
@@ -952,6 +992,7 @@ def main() -> None:
         test_project_red_inputs()
         test_workers_exact_readback_and_no_wrangler_create_path()
         test_workers_missing_or_deleted_worker_never_creates_draft()
+        test_workers_put_response_protocol()
         test_workers_readback_exact_json_only()
         test_workers_target_and_receipt_binding()
         test_toolchain_red()

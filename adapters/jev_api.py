@@ -2135,7 +2135,10 @@ def parse_workers_secret_list(stdout: bytes, expected_name: str | None = None) -
         names.add(name)
         rows.append({"name": name, "type": kind})
     if expected_name is not None:
-        require(expected_name in names, f"Workers secret list lacks exact {expected_name}")
+        target = next((row for row in rows if row["name"] == expected_name), None)
+        require(target is not None, f"Workers secret list lacks exact {expected_name}")
+        require(target["type"] == "secret_text",
+                f"Workers secret list exact {expected_name} binding type differs")
     return rows
 
 
@@ -2168,8 +2171,21 @@ def _workers_secret_put(*, account_id: str, worker_name: str, secret_name: str,
         with open_request(request, timeout=RETRIEVAL_TIMEOUT, context=ssl.create_default_context()) as response:
             status = response.status if hasattr(response, "status") else response.getcode()
             require(200 <= status < 300, f"Cloudflare Workers secret put returned HTTP {status}")
-            require(len(response.read(RESPONSE_LIMIT + 1)) <= RESPONSE_LIMIT,
+            response_body = response.read(RESPONSE_LIMIT + 1)
+            require(len(response_body) <= RESPONSE_LIMIT,
                     "Cloudflare Workers secret put response too large")
+            try:
+                envelope = json.loads(response_body.decode("utf-8"))
+            except (UnicodeError, json.JSONDecodeError) as exc:
+                raise EnvsError("Cloudflare Workers secret put response is not JSON") from exc
+            require(isinstance(envelope, dict), "Cloudflare Workers secret put response shape differs")
+            require(envelope.get("success") is True, "Cloudflare Workers secret put did not report success")
+            result = envelope.get("result")
+            require(isinstance(result, dict), "Cloudflare Workers secret put result missing")
+            require(result.get("name") == secret_name,
+                    "Cloudflare Workers secret put result name differs")
+            require(result.get("type") == "secret_text",
+                    "Cloudflare Workers secret put result type differs")
     except urllib.error.HTTPError as exc:
         raise EnvsError(f"Cloudflare Workers secret put returned HTTP {exc.code}") from None
     except urllib.error.URLError:
