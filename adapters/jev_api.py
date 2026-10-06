@@ -705,14 +705,16 @@ def repository_files(root: Path) -> list[Path]:
     )
 
 
-def reject_live_values(root: Path, name: str, values: list[str]) -> None:
+def reject_live_values(root: Path, name: str, values: list[str],
+                       allowed_paths: tuple[str, ...] = ()) -> None:
     for path in repository_files(root):
         relative = path.relative_to(root).as_posix()
         data = path.read_bytes()
         if relative in {CIPHERTEXT.as_posix(), RENT_CIPHERTEXT.as_posix(), CLIENT_CIPHERTEXT.as_posix(), OCI_CIPHERTEXT.as_posix()}:
             data = without_recipient_metadata(data.decode("utf-8", errors="replace")).encode()
         for value in values:
-            require(value.encode() not in data, f"{relative}: live {name} value is stored in Git")
+            if value.encode() in data:
+                require(relative in allowed_paths, f"{relative}: live {name} value is stored in Git")
 
 
 def gate(root: Path, contracts: dict[str, dict[str, dict[str, Any]]], plane: str) -> dict[str, str]:
@@ -727,7 +729,16 @@ def gate(root: Path, contracts: dict[str, dict[str, dict[str, Any]]], plane: str
     for entry in row["required_variables"]:
         value = values[entry["name"]]
         live = recipient_items(value) if entry["type"] == "age_recipient_list" else [value]
-        reject_live_values(root, entry["name"], live or [])
+        allowed_paths: tuple[str, ...] = ()
+        if entry["name"] == "CLOUDFLARE_ACCOUNT_ID":
+            target = contracts["bindings"]["jev-api"]["target"]
+            if target.get("provider") == "cloudflare-workers":
+                require(value == target["account_id"], "Workers target account differs from projection account")
+                # Account ID is a non-secret target identifier. It may occur only in the
+                # closed selected binding and its non-secret handoff receipt; every other
+                # repository occurrence remains rejected.
+                allowed_paths = (BINDINGS.as_posix(), HANDOFF.as_posix())
+        reject_live_values(root, entry["name"], live or [], allowed_paths)
     return values
 
 
