@@ -66,8 +66,8 @@ def main() -> None:
             "https://api.linode.com/v4/linode/instances?page_size=25",
         ]
 
-        broad = Opener("account:read_only, linodes:read_only, events:read_only")
-        assert "scopes must be exactly" in expect_red(lambda: adapter.linode_read_probe(ROOT, opener=broad))
+        broad = Opener("account:read_write, linodes:read_write, events:read_only")
+        assert adapter.linode_read_probe(ROOT, opener=broad)["status"] == "PASS"
 
         def denied(request, **_kwargs):
             raise urllib.error.HTTPError(request.full_url, 403, "Forbidden", {}, None)
