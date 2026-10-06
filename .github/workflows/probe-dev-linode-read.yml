@@ -16,7 +16,7 @@ jobs:
     if: github.repository == 'roccho-dev/envs' && github.ref_name == 'proposals'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    environment: dev-linode-read-probe
+    environment: dev-projection
     steps:
       - name: Checkout exact canonical revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
