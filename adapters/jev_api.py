@@ -578,7 +578,7 @@ def validate_contracts(root: Path = ROOT) -> dict[str, dict[str, dict[str, Any]]
             f"{STATE_PLANE} must not reuse the access probe secret")
 
     linode = envs[LINODE_READ_PLANE]
-    require(linode["github_environment"] == "dev-linode-read-probe" and linode["owner"] == "envs"
+    require(linode["github_environment"] == "dev-projection" and linode["owner"] == "envs"
             and linode["source_kind"] == "provider_issued" and linode["target_kind"] == "read_probe"
             and linode["active_github_environment"] is None and linode["migration_state"] == "NOT_CONFIGURED",
             f"{LINODE_READ_PLANE} must be a NOT_CONFIGURED read-only probe plane")
