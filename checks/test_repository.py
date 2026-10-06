@@ -246,7 +246,7 @@ def main() -> None:
     # The rent workflow is a manual effect workflow under the same rules: it runs only the persistent root entry with
     # exactly the dev.rent-root inputs and hands off both envelopes.
     linode = ".github/workflows/probe-dev-linode-read.yml"
-    expect_red(replace_text(linode, "environment: dev-linode-read-probe", "environment: dev-projection"))
+    expect_red(replace_text(linode, "environment: dev-projection", "environment: dev-authoring"))
     expect_red(replace_text(linode, "${{ secrets.LINODE_API_TOKEN }}", "${{ secrets.CLOUDFLARE_API_TOKEN }}"))
     expect_red(replace_text(linode, f"{entry} linode-read-probe", f"{entry} rent-access-probe"))
     expect_red(mutate_plane("dev.linode-read-probe", lambda row: row["required_secrets"][0].update(
