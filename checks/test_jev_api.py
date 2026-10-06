@@ -101,6 +101,19 @@ def project_env(**overrides: str) -> dict[str, str]:
     return values
 
 
+PAGES_TARGET = {"provider": "cloudflare-pages", "project": "voice-ui", "secret_name": "JEV_API_KEY"}
+WORKER_NAME = "voice-ui-worker-fixture"
+
+
+def worker_target(account_id: str = ACCOUNT_ID, worker_name: str = WORKER_NAME) -> dict[str, str]:
+    return {
+        "provider": "cloudflare-workers",
+        "account_id": account_id,
+        "worker_name": worker_name,
+        "secret_name": "JEV_API_KEY",
+    }
+
+
 @contextmanager
 def environment(values: dict[str, str]):
     old = {key: os.environ.get(key) for key in values}
@@ -459,6 +472,36 @@ def active_root() -> Path:
     return root
 
 
+def workers_root(target: dict[str, str] | None = None) -> Path:
+    root = active_root()
+    rows = jev.load_jsonl(root / jev.BINDINGS)
+    for row in rows:
+        if row.get("id") == "jev-api":
+            row["target"] = worker_target() if target is None else target
+    jev.write_jsonl(root / jev.BINDINGS, rows)
+    jev.validate_contracts(root)
+    return root
+
+
+class FakeProviderResponse:
+    def __init__(
+        self,
+        status: int = 200,
+        body: bytes = b'{"success":true,"result":{"name":"JEV_API_KEY","type":"secret_text"}}',
+    ):
+        self.status = status
+        self._body = body
+
+    def read(self, size: int = -1) -> bytes:
+        return self._body if size < 0 else self._body[:size]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+
 def test_project() -> None:
     root = active_root()
     calls: list[tuple[list[str], bytes | None]] = []
@@ -618,10 +661,271 @@ def test_decrypt_failure_has_no_provider_effect() -> None:
         shutil.rmtree(root.parent, ignore_errors=True)
 
 
+
+def test_workers_exact_readback_and_no_wrangler_create_path() -> None:
+    root = workers_root()
+    calls: list[list[str]] = []
+    provider_requests = []
+    list_count = 0
+    try:
+        def runner(argv, input_data, env):
+            nonlocal list_count
+            command = list(argv)
+            calls.append(command)
+            if command[0] == TOOLS["wrangler"]:
+                assert command == [
+                    TOOLS["wrangler"], "secret", "list", "--name", WORKER_NAME, "--format", "json",
+                ]
+                list_count += 1
+                output = b'[]\n' if list_count == 1 else b'[{"name":"JEV_API_KEY","type":"secret_text"}]\n'
+                # stderr is deliberately misleading; it is never positive presence evidence.
+                return subprocess.CompletedProcess(argv, 0, stdout=output, stderr=b"JEV_API_KEY is missing")
+            if command[0] == TOOLS["sops"]:
+                return subprocess.CompletedProcess(argv, 0, stdout=b'{"JEV_API_KEY":"fixture-secret"}\n', stderr=b"")
+            raise AssertionError(command)
+
+        def opener(request, **_kwargs):
+            provider_requests.append(request)
+            return FakeProviderResponse()
+
+        with environment(project_env()):
+            receipt = jev.project(
+                envs_sha="a" * 40, run_id=123, run_attempt=1, created_at=CREATED_AT,
+                output=jev.HANDOFF, root=root, runner=runner, opener=opener,
+            )
+        jev.validate_receipt(receipt, worker_target())
+        assert receipt["target"] == worker_target()
+        assert receipt["effect"] == {"operation": "cloudflare_workers_secret_put", "status": "PASS"}
+        assert list_count == 2
+        assert not any(command[0] == TOOLS["wrangler"] and "put" in command for command in calls)
+        assert len(provider_requests) == 1
+        request = provider_requests[0]
+        assert request.get_method() == "PUT"
+        assert request.full_url.endswith(f"/accounts/{ACCOUNT_ID}/workers/scripts/{WORKER_NAME}/secrets")
+        assert json.loads(request.data) == {"name": "JEV_API_KEY", "text": "fixture-secret", "type": "secret_text"}
+        assert jev.readiness(root)["provider_handoff_ready"] is True
+    finally:
+        shutil.rmtree(root.parent, ignore_errors=True)
+
+
+def test_workers_missing_or_deleted_worker_never_creates_draft() -> None:
+    # Preflight not-found: no decrypt, no secret write, no receipt.
+    root = workers_root()
+    calls: list[list[str]] = []
+    writes = []
+    try:
+        def missing_runner(argv, input_data, env):
+            calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 1, stdout=b"", stderr=b"Worker not found")
+
+        def opener(request, **_kwargs):
+            writes.append(request)
+            return FakeProviderResponse()
+
+        with environment(project_env()):
+            try:
+                jev.project(
+                    envs_sha="a" * 40, run_id=1, run_attempt=1, created_at=CREATED_AT,
+                    output=jev.HANDOFF, root=root, runner=missing_runner, opener=opener,
+                )
+            except jev.EnvsError:
+                pass
+            else:
+                raise AssertionError("missing Worker was accepted")
+        assert calls == [[TOOLS["wrangler"], "secret", "list", "--name", WORKER_NAME, "--format", "json"]]
+        assert not writes
+        assert not (root / jev.HANDOFF).exists()
+    finally:
+        shutil.rmtree(root.parent, ignore_errors=True)
+
+    # Deletion after preflight: direct provider PUT returns 404. Wrangler secret put
+    # is never invoked, so its createDraftWorker fallback is unreachable.
+    root = workers_root()
+    calls = []
+    writes = []
+    try:
+        list_count = 0
+
+        def race_runner(argv, input_data, env):
+            nonlocal list_count
+            command = list(argv)
+            calls.append(command)
+            if command[0] == TOOLS["wrangler"]:
+                list_count += 1
+                assert list_count == 1
+                return subprocess.CompletedProcess(argv, 0, stdout=b'[]\n', stderr=b"")
+            if command[0] == TOOLS["sops"]:
+                return subprocess.CompletedProcess(argv, 0, stdout=b'{"JEV_API_KEY":"fixture-secret"}\n', stderr=b"")
+            raise AssertionError(command)
+
+        def gone_opener(request, **_kwargs):
+            writes.append(request)
+            return FakeProviderResponse(status=404)
+
+        with environment(project_env()):
+            try:
+                jev.project(
+                    envs_sha="a" * 40, run_id=1, run_attempt=1, created_at=CREATED_AT,
+                    output=jev.HANDOFF, root=root, runner=race_runner, opener=gone_opener,
+                )
+            except jev.EnvsError:
+                pass
+            else:
+                raise AssertionError("deleted Worker write was accepted")
+        assert len(writes) == 1
+        assert not any(command[0] == TOOLS["wrangler"] and "put" in command for command in calls)
+        assert not (root / jev.HANDOFF).exists()
+    finally:
+        shutil.rmtree(root.parent, ignore_errors=True)
+
+
+def test_workers_put_response_protocol() -> None:
+    cases = [
+        ("success-false", b'{"success":false,"result":{"name":"JEV_API_KEY","type":"secret_text"}}', False),
+        ("malformed-json", b'not-json', False),
+        ("wrong-name", b'{"success":true,"result":{"name":"NOT_JEV_API_KEY","type":"secret_text"}}', False),
+        ("wrong-type", b'{"success":true,"result":{"name":"JEV_API_KEY","type":"plain_text"}}', False),
+        ("missing-result", b'{"success":true}', False),
+        ("exact", b'{"success":true,"result":{"name":"JEV_API_KEY","type":"secret_text"}}', True),
+    ]
+    for label, body, accepted in cases:
+        calls = []
+        def opener(request, **_kwargs):
+            calls.append(request)
+            return FakeProviderResponse(body=body)
+
+        try:
+            jev._workers_secret_put(
+                account_id=ACCOUNT_ID,
+                worker_name=WORKER_NAME,
+                secret_name="JEV_API_KEY",
+                secret="fixture-secret",
+                token="provider-token-fixture",
+                opener=opener,
+            )
+        except jev.EnvsError:
+            if accepted:
+                raise AssertionError(f"valid provider response was rejected: {label}")
+        else:
+            if not accepted:
+                raise AssertionError(f"invalid provider response was accepted: {label}")
+        assert len(calls) == 1
+
+
+def test_workers_readback_exact_json_only() -> None:
+    # Pure parser: exact target name succeeds; aliases, duplicates and malformed shapes do not.
+    assert jev.parse_workers_secret_list(
+        b'[{"name":"JEV_API_KEY","type":"secret_text"}]\n', "JEV_API_KEY"
+    )[0]["name"] == "JEV_API_KEY"
+    rejected = [
+        b'[{"name":"NOT_JEV_API_KEY","type":"secret_text"}]\n',
+        b'[{"name":"JEV_API_KEY","type":"plain_text"}]\n',
+        b'[{"name":"JEV_API_KEY","type":"unknown"}]\n',
+        b'[{"name":"JEV_API_KEY","type":"secret_key"}]\n',
+        b'JEV_API_KEY\n',
+        b'{"name":"JEV_API_KEY","type":"secret_text"}\n',
+        b'[{"name":"JEV_API_KEY","type":"secret_text"},{"name":"JEV_API_KEY","type":"secret_text"}]\n',
+        b'[{"name":"JEV_API_KEY","type":"secret_text","extra":"x"}]\n',
+    ]
+    for output in rejected:
+        try:
+            jev.parse_workers_secret_list(output, "JEV_API_KEY")
+        except jev.EnvsError:
+            pass
+        else:
+            raise AssertionError(f"invalid Workers list output was accepted: {output!r}")
+
+    # A negative stderr string never compensates for stdout lacking the exact entry.
+    root = workers_root()
+    writes = []
+    list_count = 0
+    try:
+        def runner(argv, input_data, env):
+            nonlocal list_count
+            command = list(argv)
+            if command[0] == TOOLS["wrangler"]:
+                list_count += 1
+                return subprocess.CompletedProcess(
+                    argv, 0, stdout=b'[]\n',
+                    stderr=b"JEV_API_KEY is missing" if list_count == 2 else b"",
+                )
+            if command[0] == TOOLS["sops"]:
+                return subprocess.CompletedProcess(argv, 0, stdout=b'{"JEV_API_KEY":"fixture-secret"}\n', stderr=b"")
+            raise AssertionError(command)
+
+        def opener(request, **_kwargs):
+            writes.append(request)
+            return FakeProviderResponse()
+
+        with environment(project_env()):
+            try:
+                jev.project(
+                    envs_sha="a" * 40, run_id=1, run_attempt=1, created_at=CREATED_AT,
+                    output=jev.HANDOFF, root=root, runner=runner, opener=opener,
+                )
+            except jev.EnvsError:
+                pass
+            else:
+                raise AssertionError("stderr description was accepted as presence")
+        assert len(writes) == 1
+        assert not (root / jev.HANDOFF).exists()
+    finally:
+        shutil.rmtree(root.parent, ignore_errors=True)
+
+
+def test_workers_target_and_receipt_binding() -> None:
+    # Environment account mismatch stops before any provider/decrypt command.
+    root = workers_root()
+    calls = []
+    try:
+        def runner(argv, input_data, env):
+            calls.append(list(argv))
+            raise AssertionError("tool ran before account binding")
+
+        with environment(project_env(CLOUDFLARE_ACCOUNT_ID="f" * 32)):
+            try:
+                jev.project(
+                    envs_sha="a" * 40, run_id=1, run_attempt=1, created_at=CREATED_AT,
+                    output=jev.HANDOFF, root=root, runner=runner,
+                )
+            except jev.EnvsError:
+                pass
+            else:
+                raise AssertionError("wrong Workers account was accepted")
+        assert not calls
+    finally:
+        shutil.rmtree(root.parent, ignore_errors=True)
+
+    target = worker_target()
+    base = jev.build_receipt(
+        envs_sha="a" * 40, ciphertext_sha256="b" * 64, target=target,
+        run_id=123, run_attempt=1, created_at=CREATED_AT,
+    )
+    jev.validate_receipt(base, target)
+    mutations = []
+    value = copy.deepcopy(base); value["target"]["account_id"] = "f" * 32; mutations.append(value)
+    value = copy.deepcopy(base); value["target"]["worker_name"] = "other-worker"; mutations.append(value)
+    value = copy.deepcopy(base); value["target"]["secret_name"] = "OTHER"; mutations.append(value)
+    value = copy.deepcopy(base); value["effect"]["operation"] = "cloudflare_pages_secret_put"; mutations.append(value)
+    pages = jev.build_receipt(
+        envs_sha="a" * 40, ciphertext_sha256="b" * 64, target=PAGES_TARGET,
+        run_id=123, run_attempt=1, created_at=CREATED_AT,
+    )
+    mutations.append(pages)
+    for value in mutations:
+        try:
+            jev.validate_receipt(value, target)
+        except jev.EnvsError:
+            pass
+        else:
+            raise AssertionError("mismatched Workers receipt was accepted")
+
+
 def test_receipt_mutations() -> None:
     base = jev.build_receipt(
         envs_sha="a" * 40,
         ciphertext_sha256="b" * 64,
+        target=PAGES_TARGET,
         run_id=123,
         run_attempt=1,
         created_at=CREATED_AT,
@@ -686,6 +990,11 @@ def main() -> None:
         test_author_target_cli()
         test_project()
         test_project_red_inputs()
+        test_workers_exact_readback_and_no_wrangler_create_path()
+        test_workers_missing_or_deleted_worker_never_creates_draft()
+        test_workers_put_response_protocol()
+        test_workers_readback_exact_json_only()
+        test_workers_target_and_receipt_binding()
         test_toolchain_red()
         test_decrypt_failure_has_no_provider_effect()
         test_receipt_mutations()

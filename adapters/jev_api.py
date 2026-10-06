@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ElementTree
 from datetime import datetime, timezone
@@ -130,6 +131,7 @@ SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 AGE_RECIPIENT = re.compile(r"^age1[02-9ac-hj-np-z]{58}$")
 AGE_IDENTITY = re.compile(r"^AGE-SECRET-KEY-1[02-9AC-HJ-NP-Z]{58}$")
 CLOUDFLARE_ACCOUNT_ID = re.compile(r"^[0-9a-f]{32}$")
+CLOUDFLARE_WORKER_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 CLOUDFLARE_TUNNEL_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 CLOUDFLARE_TOKEN_ID = re.compile(r"^[0-9a-f]{32}$")
 # The target's token file gate accepts 1-4096 non-blank bytes; the provider returns base64 text.
@@ -143,7 +145,7 @@ PRIVATE_MATERIAL = (
 )
 FORBIDDEN_RECEIPT_KEYS = {
     "secret", "secret_value", "plaintext", "private_key", "age_identity",
-    "decrypted_value", "secret_hash", "account_id",
+    "decrypted_value", "secret_hash",
 }
 SECRET_PLANE_KEYS = {
     "id", "kind", "stage_id", "plane_id", "owner", "github_environment",
@@ -202,7 +204,31 @@ def index(path: Path) -> dict[str, dict[str, Any]]:
     return result
 
 
-def expected_bindings() -> dict[str, dict[str, Any]]:
+def validate_jev_target(target: Any) -> dict[str, Any]:
+    require(isinstance(target, dict), "Jev target must be an object")
+    provider = target.get("provider")
+    if provider == "cloudflare-pages":
+        require(target == {
+            "provider": "cloudflare-pages", "project": "voice-ui", "secret_name": "JEV_API_KEY",
+        }, "Pages Jev target differs")
+    elif provider == "cloudflare-workers":
+        require(set(target) == {"provider", "account_id", "worker_name", "secret_name"},
+                "Workers Jev target fields differ")
+        require(isinstance(target.get("account_id"), str)
+                and CLOUDFLARE_ACCOUNT_ID.fullmatch(target["account_id"]) is not None,
+                "Workers account id invalid")
+        require(isinstance(target.get("worker_name"), str)
+                and CLOUDFLARE_WORKER_NAME.fullmatch(target["worker_name"]) is not None,
+                "Workers name invalid")
+        require(target.get("secret_name") == "JEV_API_KEY", "Workers secret name differs")
+    else:
+        raise EnvsError("Jev target provider unsupported")
+    return target
+
+
+def expected_bindings(jev_target: dict[str, Any] | None = None) -> dict[str, dict[str, Any]]:
+    target = {"provider": "cloudflare-pages", "project": "voice-ui", "secret_name": "JEV_API_KEY"} \
+        if jev_target is None else validate_jev_target(jev_target)
     return {
         "voice-ui": {
             "id": "voice-ui",
@@ -215,11 +241,7 @@ def expected_bindings() -> dict[str, dict[str, Any]]:
             "capability": "jev-api",
             "ciphertext": CIPHERTEXT.as_posix(),
             "source_key": "JEV_API_KEY",
-            "target": {
-                "provider": "cloudflare-pages",
-                "project": "voice-ui",
-                "secret_name": "JEV_API_KEY",
-            },
+            "target": dict(target),
         },
         "rent-tunnel": {
             "id": "rent-tunnel",
@@ -587,7 +609,8 @@ def validate_contracts(root: Path = ROOT) -> dict[str, dict[str, dict[str, Any]]
     if oci_cipher.is_file():
         validate_oci_ciphertext(oci_cipher.read_bytes(), None, None)
 
-    require(bindings == expected_bindings(), "binding set differs")
+    jev_target = validate_jev_target(bindings.get("jev-api", {}).get("target"))
+    require(bindings == expected_bindings(jev_target), "binding set differs")
     require(set(boundary) == {
         "repository.branch-policy", "dev.jev-api.provider", "dev.rent-tunnel.provider", "dev.rent-access-probe.provider",
         "dev.rent-state-proof.provider", "dev.jev-api-oci-dev.provider", "apps.voice-ui.consumer", "ops.voice-ui.consumer",
@@ -682,14 +705,16 @@ def repository_files(root: Path) -> list[Path]:
     )
 
 
-def reject_live_values(root: Path, name: str, values: list[str]) -> None:
+def reject_live_values(root: Path, name: str, values: list[str],
+                       allowed_paths: tuple[str, ...] = ()) -> None:
     for path in repository_files(root):
         relative = path.relative_to(root).as_posix()
         data = path.read_bytes()
         if relative in {CIPHERTEXT.as_posix(), RENT_CIPHERTEXT.as_posix(), CLIENT_CIPHERTEXT.as_posix(), OCI_CIPHERTEXT.as_posix()}:
             data = without_recipient_metadata(data.decode("utf-8", errors="replace")).encode()
         for value in values:
-            require(value.encode() not in data, f"{relative}: live {name} value is stored in Git")
+            if value.encode() in data:
+                require(relative in allowed_paths, f"{relative}: live {name} value is stored in Git")
 
 
 def gate(root: Path, contracts: dict[str, dict[str, dict[str, Any]]], plane: str) -> dict[str, str]:
@@ -704,7 +729,16 @@ def gate(root: Path, contracts: dict[str, dict[str, dict[str, Any]]], plane: str
     for entry in row["required_variables"]:
         value = values[entry["name"]]
         live = recipient_items(value) if entry["type"] == "age_recipient_list" else [value]
-        reject_live_values(root, entry["name"], live or [])
+        allowed_paths: tuple[str, ...] = ()
+        if entry["name"] == "CLOUDFLARE_ACCOUNT_ID":
+            target = contracts["bindings"]["jev-api"]["target"]
+            if target.get("provider") == "cloudflare-workers":
+                require(value == target["account_id"], "Workers target account differs from projection account")
+                # Account ID is a non-secret target identifier. It may occur only in the
+                # closed selected binding and its non-secret handoff receipt; every other
+                # repository occurrence remains rejected.
+                allowed_paths = (BINDINGS.as_posix(), HANDOFF.as_posix())
+        reject_live_values(root, entry["name"], live or [], allowed_paths)
     return values
 
 
@@ -2076,7 +2110,89 @@ def walk_receipt(value: Any) -> None:
         require(not any(pattern.search(value) for pattern in PRIVATE_MATERIAL), "private material found in receipt")
 
 
-def validate_receipt(receipt: dict[str, Any]) -> None:
+def _receipt_operation(target: dict[str, Any]) -> str:
+    validate_jev_target(target)
+    return "cloudflare_workers_secret_put" if target["provider"] == "cloudflare-workers" \
+        else "cloudflare_pages_secret_put"
+
+
+def parse_workers_secret_list(stdout: bytes, expected_name: str | None = None) -> list[dict[str, str]]:
+    require(len(stdout) <= RESPONSE_LIMIT, "Workers secret list output too large")
+    try:
+        value = json.loads(stdout.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise EnvsError("Workers secret list output is not JSON") from exc
+    require(isinstance(value, list) and len(value) <= 10000, "Workers secret list shape differs")
+    names: set[str] = set()
+    rows: list[dict[str, str]] = []
+    for item in value:
+        require(isinstance(item, dict) and set(item) == {"name", "type"},
+                "Workers secret list entry fields differ")
+        name, kind = item["name"], item["type"]
+        require(isinstance(name, str) and name and isinstance(kind, str) and kind,
+                "Workers secret list entry differs")
+        require(name not in names, "Workers secret list contains duplicate names")
+        names.add(name)
+        rows.append({"name": name, "type": kind})
+    if expected_name is not None:
+        target = next((row for row in rows if row["name"] == expected_name), None)
+        require(target is not None, f"Workers secret list lacks exact {expected_name}")
+        require(target["type"] == "secret_text",
+                f"Workers secret list exact {expected_name} binding type differs")
+    return rows
+
+
+def _workers_secret_put(*, account_id: str, worker_name: str, secret_name: str,
+                        secret: str, token: str, opener=None) -> None:
+    # Wrangler 4.93.0 secret put may create a draft Worker on not-found. We deliberately
+    # bypass that convenience branch and call the same provider secret endpoint directly.
+    # A missing/deleted Worker therefore fails instead of creating infrastructure.
+    require(CLOUDFLARE_ACCOUNT_ID.fullmatch(account_id) is not None, "Workers account id invalid")
+    require(CLOUDFLARE_WORKER_NAME.fullmatch(worker_name) is not None, "Workers name invalid")
+    require(secret_name == "JEV_API_KEY" and isinstance(secret, str) and secret, "Workers secret input invalid")
+    open_request = urllib.request.urlopen if opener is None else opener
+    url = (CLOUDFLARE_API + "/accounts/" + account_id + "/workers/scripts/"
+           + urllib.parse.quote(worker_name, safe="") + "/secrets")
+    body = json.dumps(
+        {"name": secret_name, "text": secret, "type": "secret_text"},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+        method="PUT",
+    )
+    try:
+        with open_request(request, timeout=RETRIEVAL_TIMEOUT, context=ssl.create_default_context()) as response:
+            status = response.status if hasattr(response, "status") else response.getcode()
+            require(200 <= status < 300, f"Cloudflare Workers secret put returned HTTP {status}")
+            response_body = response.read(RESPONSE_LIMIT + 1)
+            require(len(response_body) <= RESPONSE_LIMIT,
+                    "Cloudflare Workers secret put response too large")
+            try:
+                envelope = json.loads(response_body.decode("utf-8"))
+            except (UnicodeError, json.JSONDecodeError) as exc:
+                raise EnvsError("Cloudflare Workers secret put response is not JSON") from exc
+            require(isinstance(envelope, dict), "Cloudflare Workers secret put response shape differs")
+            require(envelope.get("success") is True, "Cloudflare Workers secret put did not report success")
+            result = envelope.get("result")
+            require(isinstance(result, dict), "Cloudflare Workers secret put result missing")
+            require(result.get("name") == secret_name,
+                    "Cloudflare Workers secret put result name differs")
+            require(result.get("type") == "secret_text",
+                    "Cloudflare Workers secret put result type differs")
+    except urllib.error.HTTPError as exc:
+        raise EnvsError(f"Cloudflare Workers secret put returned HTTP {exc.code}") from None
+    except urllib.error.URLError:
+        raise EnvsError("Cloudflare Workers secret put transport failed") from None
+
+
+def validate_receipt(receipt: dict[str, Any], expected_target: dict[str, Any] | None = None) -> None:
     require(set(receipt) == {
         "kind", "status", "envs_sha", "environment", "capability", "source",
         "target", "projector", "effect", "readback", "workflow", "created_at",
@@ -2087,14 +2203,16 @@ def validate_receipt(receipt: dict[str, Any]) -> None:
     source = receipt["source"]
     require(source.get("kind") == "public_sops" and source.get("ref") == CIPHERTEXT.as_posix(), "receipt source differs")
     require(isinstance(source.get("sha256"), str) and SHA256.fullmatch(source["sha256"]), "invalid ciphertext digest")
-    require(receipt["target"] == {
-        "provider": "cloudflare-pages", "project": "voice-ui", "secret_name": "JEV_API_KEY",
-    }, "receipt target differs")
+    target = validate_jev_target(receipt["target"])
+    if expected_target is not None:
+        require(target == validate_jev_target(expected_target), "receipt target differs")
     require(receipt["projector"] == {
         "workflow": ".github/workflows/project-dev-jev-api.yml", "adapter": "adapters/jev_api.py",
     }, "projector identity differs")
-    require(receipt["effect"] == {"operation": "cloudflare_pages_secret_put", "status": "PASS"}, "provider effect is not PASS")
-    require(receipt["readback"] == {"kind": "secret_name_presence", "status": "PASS", "present": True}, "provider readback is not PASS")
+    require(receipt["effect"] == {"operation": _receipt_operation(target), "status": "PASS"},
+            "provider effect is not PASS")
+    require(receipt["readback"] == {"kind": "secret_name_presence", "status": "PASS", "present": True},
+            "provider readback is not PASS")
     workflow = receipt["workflow"]
     require(workflow.get("repository") == "roccho-dev/envs" and workflow.get("ref") == "proposals", "workflow identity differs")
     require(isinstance(workflow.get("run_id"), int) and workflow["run_id"] > 0, "invalid workflow run id")
@@ -2108,27 +2226,29 @@ def validate_receipt(receipt: dict[str, Any]) -> None:
     walk_receipt(receipt)
 
 
-def build_receipt(*, envs_sha: str, ciphertext_sha256: str,
+def build_receipt(*, envs_sha: str, ciphertext_sha256: str, target: dict[str, Any],
                   run_id: int, run_attempt: int, created_at: str) -> dict[str, Any]:
+    target = dict(validate_jev_target(target))
     receipt = {
         "kind": RECEIPT_KIND, "status": "PASS", "envs_sha": envs_sha,
         "environment": "dev", "capability": "jev-api",
         "source": {"kind": "public_sops", "ref": CIPHERTEXT.as_posix(), "sha256": "sha256:" + ciphertext_sha256},
-        "target": {"provider": "cloudflare-pages", "project": "voice-ui", "secret_name": "JEV_API_KEY"},
+        "target": target,
         "projector": {"workflow": ".github/workflows/project-dev-jev-api.yml", "adapter": "adapters/jev_api.py"},
-        "effect": {"operation": "cloudflare_pages_secret_put", "status": "PASS"},
+        "effect": {"operation": _receipt_operation(target), "status": "PASS"},
         "readback": {"kind": "secret_name_presence", "status": "PASS", "present": True},
         "workflow": {"repository": "roccho-dev/envs", "ref": "proposals", "run_id": run_id, "run_attempt": run_attempt},
         "created_at": created_at,
     }
-    validate_receipt(receipt)
+    validate_receipt(receipt, target)
     return receipt
 
 
 def project(*, envs_sha: str, run_id: int, run_attempt: int, created_at: str,
-            output: Path, root: Path = ROOT, runner: Runner = default_runner) -> dict[str, Any]:
+            output: Path, root: Path = ROOT, runner: Runner = default_runner, opener=None) -> dict[str, Any]:
     contracts = validate_contracts(root)
     require(SHA40.fullmatch(envs_sha) is not None, "expected exact envs SHA")
+    target = validate_jev_target(contracts["bindings"]["jev-api"]["target"])
     cipher = root / CIPHERTEXT
     require(cipher.is_file(), "ciphertext is not configured")
     tools = toolchain(root)
@@ -2136,6 +2256,19 @@ def project(*, envs_sha: str, run_id: int, run_attempt: int, created_at: str,
     age_key = inputs["SOPS_AGE_KEY"]
     account = inputs["CLOUDFLARE_ACCOUNT_ID"]
     token = inputs["CLOUDFLARE_API_TOKEN"]
+    provider_env = clean_env(tools, {"CLOUDFLARE_ACCOUNT_ID": account, "CLOUDFLARE_API_TOKEN": token})
+    wrangler = tools["wrangler"]
+
+    # Workers must already exist. This read-only call fails on a missing Worker before
+    # decryption or any write. Direct provider PUT below also cannot enter Wrangler's
+    # createDraftWorker() fallback, closing the deletion race between preflight and put.
+    if target["provider"] == "cloudflare-workers":
+        require(account == target["account_id"], "Workers target account differs from projection account")
+        preflight = run_checked(
+            [wrangler, "secret", "list", "--name", target["worker_name"], "--format", "json"],
+            env=provider_env, runner=runner, label="Cloudflare Workers existence preflight",
+        )
+        parse_workers_secret_list(preflight.stdout)
 
     decrypted = run_checked(
         [tools["sops"], "--decrypt", "--output-type", "json", str(cipher)],
@@ -2149,21 +2282,35 @@ def project(*, envs_sha: str, run_id: int, run_attempt: int, created_at: str,
     secret = payload["JEV_API_KEY"]
     require(isinstance(secret, str) and secret, "decrypted JEV_API_KEY is empty")
 
-    provider_env = clean_env(tools, {"CLOUDFLARE_ACCOUNT_ID": account, "CLOUDFLARE_API_TOKEN": token})
-    wrangler = tools["wrangler"]
-    run_checked(
-        [wrangler, "pages", "secret", "put", "JEV_API_KEY", "--project-name", "voice-ui"],
-        input_data=secret.encode(), env=provider_env, runner=runner, label="Cloudflare secret projection",
-    )
-    readback = run_checked(
-        [wrangler, "pages", "secret", "list", "--project-name", "voice-ui"],
-        env=provider_env, runner=runner, label="Cloudflare secret readback",
-    )
-    require(b"JEV_API_KEY" in readback.stdout + readback.stderr, "provider readback did not contain JEV_API_KEY")
+    if target["provider"] == "cloudflare-workers":
+        _workers_secret_put(
+            account_id=target["account_id"], worker_name=target["worker_name"],
+            secret_name=target["secret_name"], secret=secret, token=token, opener=opener,
+        )
+        readback = run_checked(
+            [wrangler, "secret", "list", "--name", target["worker_name"], "--format", "json"],
+            env=provider_env, runner=runner, label="Cloudflare Workers secret readback",
+        )
+        # Wrangler 4.93.0 JSON stdout is the sole presence evidence. stderr may
+        # contain diagnostics/warnings but is never interpreted as a positive.
+        parse_workers_secret_list(readback.stdout, target["secret_name"])
+    else:
+        run_checked(
+            [wrangler, "pages", "secret", "put", "JEV_API_KEY", "--project-name", target["project"]],
+            input_data=secret.encode(), env=provider_env, runner=runner, label="Cloudflare secret projection",
+        )
+        readback = run_checked(
+            [wrangler, "pages", "secret", "list", "--project-name", target["project"]],
+            env=provider_env, runner=runner, label="Cloudflare secret readback",
+        )
+        # Pages stays legacy-compatible in this source slice. It is never a
+        # Workers receipt and cannot satisfy #443's Workers handoff.
+        require(b"JEV_API_KEY" in readback.stdout + readback.stderr,
+                "provider readback did not contain JEV_API_KEY")
 
     receipt = build_receipt(
         envs_sha=envs_sha, ciphertext_sha256=hashlib.sha256(cipher.read_bytes()).hexdigest(),
-        run_id=run_id, run_attempt=run_attempt, created_at=created_at,
+        target=target, run_id=run_id, run_attempt=run_attempt, created_at=created_at,
     )
     destination = root / output
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -2171,13 +2318,13 @@ def project(*, envs_sha: str, run_id: int, run_attempt: int, created_at: str,
     return receipt
 
 
-def load_receipt(path: Path) -> dict[str, Any]:
+def load_receipt(path: Path, expected_target: dict[str, Any] | None = None) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise EnvsError("handoff receipt is invalid JSON") from exc
     require(isinstance(value, dict), "handoff receipt must be an object")
-    validate_receipt(value)
+    validate_receipt(value, expected_target)
     return value
 
 
@@ -2210,7 +2357,7 @@ def linode_read_probe(root: Path = ROOT, opener=None) -> dict[str, Any]:
 
 
 def readiness(root: Path = ROOT) -> dict[str, Any]:
-    validate_contracts(root)
+    contracts = validate_contracts(root)
     cipher, handoff = root / CIPHERTEXT, root / HANDOFF
     configured = cipher.is_file()
     physical, state = ("NOT_RUN", "ABSENT") if configured else ("NOT_CONFIGURED", "ABSENT")
@@ -2218,7 +2365,7 @@ def readiness(root: Path = ROOT) -> dict[str, Any]:
     receipt_digest = None
     if handoff.is_file():
         require(configured, "handoff cannot exist without ciphertext")
-        receipt_digest = load_receipt(handoff)["source"]["sha256"]
+        receipt_digest = load_receipt(handoff, contracts["bindings"]["jev-api"]["target"])["source"]["sha256"]
         physical = state = "PASS" if receipt_digest == current else "STALE"
     return {
         "kind": "envs.providerReadiness.v1", "repository": "roccho-dev/envs",
@@ -2265,9 +2412,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     root = args.root.resolve()
     try:
         if args.command == "check":
-            validate_contracts(root)
+            contracts = validate_contracts(root)
             if (root / HANDOFF).is_file():
-                load_receipt(root / HANDOFF)
+                load_receipt(root / HANDOFF, contracts["bindings"]["jev-api"]["target"])
             print("JEV_API_CONTRACT=PASS")
         elif args.command == "readiness":
             print(json.dumps(readiness(root), indent=2, sort_keys=True))
