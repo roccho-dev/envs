@@ -569,6 +569,112 @@ jobs:
           test -z "$(slot 'ls -A /s/cloudflared | grep -v ^token$ || true')"
           echo "rent-receive.sh in $RENT_IMAGE: placed 0:0 600 exact token; refused another token with the exact busy line and left the whole volume, slot included, identical while a holder held the state-root lock, then after its removal placed that token and the original again; same value unchanged, rotated; blank, whitespace, oversized and drifted (mode, owner) slots and writable or foreign parents (slot directory and state root) refused and kept; a 755 parent accepted"
 
+  # One public Release per canonical proposals push, only after every job of this run passed: the exact directory
+  # placement-artifact provided and the placement-gate jobs consumed, as one ZIP verified once and published unchanged
+  # with its checksum. Only this job may write; pull requests, main and manual dispatch never publish.
+  placement-publish:
+    needs: [repository, placement-artifact, placement-author, placement-windows, placement-rent, toolchain, effect-shape, clean-start]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/proposals' && github.repository == 'roccho-dev/envs'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      ENVS_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - name: Checkout exact source commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Obtain the Windows placement distribution of this run
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: envs-placement-${{ env.ENVS_SOURCE_SHA }}
+          path: ${{ runner.temp }}/placement
+
+      - name: Verify the distribution and one ZIP of it
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$ENVS_SOURCE_SHA"
+          python3 - "$RUNNER_TEMP/placement" "$RUNNER_TEMP/release" <<'EOF'
+          import hashlib, io, os, sys, zipfile
+          from pathlib import Path
+
+          tested, out = Path(sys.argv[1]), Path(sys.argv[2])
+          source = os.environ["ENVS_SOURCE_SHA"]
+
+          def members(root):
+              return sorted(p.relative_to(root).as_posix() for p in root.rglob("*") if not p.is_dir())
+
+          # The closed member set: what flake.nix's placement-artifact makes from this commit, every committed ciphertext.
+          from_source = {"place.ps1": "adapters/place.ps1", "rent-receive.sh": "adapters/rent-receive.sh",
+                         "THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md", "LICENSES/README.md": "LICENSES/README.md",
+                         "LICENSES/age-v1.3.2.txt": "LICENSES/age-v1.3.2.txt",
+                         "LICENSES/sops-v3.13.2.txt": "LICENSES/sops-v3.13.2.txt"}
+          from_source.update({f"ciphertexts/{name}": f"ciphertexts/{name}" for name in members(Path("ciphertexts"))})
+          expected = sorted([*from_source, "SOURCE", "sops.exe", "age-keygen.exe"])
+          names = members(tested)
+          assert names == expected, f"distribution members differ: {names}"
+          assert "ciphertexts/dev-rent-tunnel.sops.yaml" in names, "the rent envelope is missing"
+          assert all((tested / name).is_file() and not (tested / name).is_symlink() for name in names), "non-regular member"
+          assert (tested / "SOURCE").read_bytes() == f"{source}\n".encode(), "SOURCE is not this commit"
+          for name, path in from_source.items():
+              assert (tested / name).read_bytes() == Path(path).read_bytes(), f"{name} differs from the source"
+          sops = hashlib.sha256((tested / "sops.exe").read_bytes()).hexdigest()
+          assert sops == "cb6fec76e23cb4ac56771ac38472b0fe1ba79a849bf2200aeda7c9467a045b7b", "sops.exe is not the pinned release"
+          assert (tested / "age-keygen.exe").read_bytes()[:2] == b"MZ", "age-keygen.exe is not a Windows executable"
+
+          # Root members, stored, fixed times and order: the same directory always gives the same bytes.
+          out.mkdir()
+          archive = out / "envs-placement.zip"
+          with zipfile.ZipFile(archive, "w", zipfile.ZIP_STORED) as z:
+              for name in names:
+                  info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+                  info.external_attr = 0o644 << 16
+                  z.writestr(info, (tested / name).read_bytes())
+          data = archive.read_bytes()
+          with zipfile.ZipFile(io.BytesIO(data)) as z:
+              assert z.testzip() is None, "a ZIP entry fails its CRC"
+              assert z.namelist() == names, "ZIP members differ from the distribution"
+              for name in names:
+                  assert z.read(name) == (tested / name).read_bytes(), f"ZIP {name} differs from the distribution"
+          digest = hashlib.sha256(data).hexdigest()
+          (out / "envs-placement.zip.sha256").write_text(f"{digest}  envs-placement.zip\n", encoding="ascii")
+          print(f"envs-placement.zip {len(data)} bytes sha256:{digest}: {len(names)} members equal to the tested directory")
+          EOF
+
+      - name: Publish the verified ZIP and its checksum
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="envs-placement-$ENVS_SOURCE_SHA"
+          zip="$RUNNER_TEMP/release/envs-placement.zip"
+          bot='github-actions[bot]'
+          expected="$(printf '%s\n' "envs-placement.zip=sha256:$(sha256sum "$zip" | cut -d ' ' -f 1)=$bot" \
+            "envs-placement.zip.sha256=sha256:$(sha256sum "$zip.sha256" | cut -d ' ' -f 1)=$bot" | LC_ALL=C sort)"
+          expected="$(printf '%s %s false %s\n%s' "$tag" "$ENVS_SOURCE_SHA" "$bot" "$expected")"
+          # Tag, target, draft, author and each asset's name, GitHub digest and uploader: the asset digest is the anchor.
+          readback() {
+            gh api "repos/$GH_REPO/releases/tags/$tag" \
+              --jq '"\(.tag_name) \(.target_commitish) \(.draft) \(.author.login)", ([.assets[] | "\(.name)=\(.digest)=\(.uploader.login)"] | sort | .[])'
+          }
+          if existing="$(readback 2>/dev/null)"; then
+            # A rerun or an earlier UNKNOWN creation: only the same bytes from this workflow are accepted; nothing is replaced.
+            test "$existing" = "$expected" || { echo "release $tag already exists with other content; nothing changed" >&2; exit 1; }
+            echo "release $tag already holds exactly these bytes"
+            exit 0
+          fi
+          gh release create "$tag" "$zip" "$zip.sha256" --target "$ENVS_SOURCE_SHA" --latest=false \
+            --title "envs placement $ENVS_SOURCE_SHA" \
+            --notes "The envs-placement-$ENVS_SOURCE_SHA distribution every check job of this push run tested, as one verified ZIP. Download it without credentials and accept it only when its SHA-256 equals this asset's GitHub digest and its SOURCE names $ENVS_SOURCE_SHA." \
+            || echo "release creation failed or its effect is unknown; reading it back once, no retry" >&2
+          test "$(readback)" = "$expected"
+          echo "published $tag: $(cut -d ' ' -f 1 "$zip.sha256")"
+
   toolchain:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
