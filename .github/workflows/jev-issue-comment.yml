@@ -17,6 +17,6 @@ jobs:
       github.event.issue.number == 52 &&
       github.event.comment.body == '/jev-evaluate' &&
       github.event.issue.pull_request == null
-    uses: roccho-org/ops/.github/workflows/jev-issue-comment.yml@dcb66f2906fb0a092bdcf36aaabb192dff144d5f
+    uses: roccho-org/ops/.github/workflows/jev-issue-comment.yml@9fc663006f1bd0a16dfaff061471a39451878195
     secrets:
       JEV_API_KEY: ${{ secrets.JEV_API_KEY }}
