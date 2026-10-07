@@ -190,7 +190,7 @@ PROBE_TOOL_CHECKS = (
 )
 CIPHERTEXTS = {
     "ciphertexts/dev-jev-api.sops.yaml", "ciphertexts/dev-rent-tunnel.sops.yaml", "ciphertexts/dev-jev-api.oci-dev.sops.yaml",
-    "ciphertexts/dev-rent-client.sops.yaml",
+    "ciphertexts/dev-rent-client.sops.yaml", "ciphertexts/dev-opencode-go.oci-dev.sops.yaml",
 }
 # The real SOPS roundtrip runs the locked sops with a check-only age that never enters the effect toolchain; the
 # closure tofu joins it so a real root output reaches the production sealing path.
@@ -436,12 +436,13 @@ def declared_inputs(row: dict[str, Any]) -> set[tuple[str, str]]:
 
 def author_target_inputs(adapter, contracts: dict[str, dict[str, dict[str, Any]]]) -> dict[str, set[tuple[str, str]]]:
     # Each author target's Environment inputs as the adapter reads them, in (namespace, name) form.
-    secrets = {item["name"] for item in contracts["environments"]["dev.authoring"]["required_secrets"]}
-    return {
-        target: {("secrets" if item["name"] in secrets else "vars", item["name"])
-                 for item in adapter.authoring_inputs(contracts, target)}
-        for target in adapter.AUTHOR_TARGETS
-    }
+    result = {}
+    for target in adapter.AUTHOR_TARGETS:
+        plane_id = adapter.GO_PLANE if target == adapter.GO_BINDING else "dev.authoring"
+        secrets = {item["name"] for item in contracts["environments"][plane_id]["required_secrets"]}
+        result[target] = {("secrets" if item["name"] in secrets else "vars", item["name"])
+                          for item in adapter.authoring_inputs(contracts, target)}
+    return result
 
 
 def run_commands(text: str) -> list[str]:
@@ -654,7 +655,8 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]],
         require("workflow_dispatch:" in text, f"{name}: manual dispatch missing")
         require("\n  push:" not in text and "\n  pull_request:" not in text, f"{name}: automatic effect trigger")
         require(f"environment: {row['github_environment']}" in text, f"{name}: static Environment differs")
-        require("github.repository == 'roccho-dev/envs'" in text, f"{name}: repository guard missing")
+        expected_repo = "roccho-org/envs" if name == "author-dev-jev-api.yml" else "roccho-dev/envs"
+        require(f"github.repository == '{expected_repo}'" in text, f"{name}: repository guard missing")
         require("github.ref_name == 'proposals'" in text, f"{name}: canonical ref guard missing")
         require("ref: ${{ github.sha }}" in text, f"{name}: exact checkout missing")
         require("main" not in text, f"{name}: main must not be an effect source")
@@ -785,7 +787,10 @@ def check_readme(root: Path, environments: dict[str, dict[str, Any]]) -> None:
         "checks/test_rent_state_proof.py",
         "a bucket name alone never authorizes deletion",
         "dev-authoring/OCI_DEV_AGE_RECIPIENT",
+        "dev-authoring/OPENCODE_API_KEY",
         "ciphertexts/dev-jev-api.oci-dev.sops.yaml",
+        "ciphertexts/dev-opencode-go.oci-dev.sops.yaml",
+        "`author --target opencode-go.oci-dev`",
         "`author --target jev-api.oci-dev`",
         RENT_RECEIVER,
         PLACEMENT_ENTRY,
