@@ -518,7 +518,7 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]],
                        "    if: >-\n      github.event.repository.owner.type == 'Organization' &&\n"
                        "      github.repository == 'roccho-org/envs' &&\n      github.event.issue.number == 52 &&\n"
                        "      github.event.comment.body == '/jev-evaluate' &&\n      github.event.issue.pull_request == null\n"
-                       "    uses: roccho-org/ops/.github/workflows/jev-issue-comment.yml@dcb66f2906fb0a092bdcf36aaabb192dff144d5f\n"
+                       "    uses: roccho-org/ops/.github/workflows/jev-issue-comment.yml@9fc663006f1bd0a16dfaff061471a39451878195\n"
                        "    secrets:\n      JEV_API_KEY: ${{ secrets.JEV_API_KEY }}\n"),
             "Issue caller must be the fixed Ops workflow and exact originating-Issue guard/slot only")
 
