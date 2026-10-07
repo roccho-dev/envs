@@ -145,6 +145,67 @@ def copy_root() -> Path:
     return target
 
 
+def go_fixture_clear(root: Path) -> None:
+    """Clear only the bounded Go source fixture; preserve and refuse any foreign entry.
+
+    The private root must be created by copy_root(). All existing source paths are a finite
+    manifest; only the one Go ciphertext path may be new. Inspect everything before unlinking.
+    This does not recursively delete a directory or borrow the legacy generic test cleanup.
+    """
+    parent = root.parent
+    if (root.name != "repo" or not parent.name.startswith("envs-jev-test-")
+            or parent.parent.resolve() != Path(tempfile.gettempdir()).resolve()
+            or parent.is_symlink() or root.is_symlink()
+            or not parent.is_dir() or not root.is_dir()
+            or parent.stat().st_uid != os.getuid() or root.stat().st_uid != os.getuid()
+            or (parent.stat().st_mode & 0o777) != 0o700):
+        raise AssertionError("Go fixture cleanup target is not a private owned copy")
+
+    def included(path: Path) -> bool:
+        return not any(part in {".git", "__pycache__"} for part in path.parts) and path.suffix != ".pyc"
+
+    baseline = [p for p in ROOT.rglob("*") if included(p.relative_to(ROOT))]
+    known_files = {p.relative_to(ROOT) for p in baseline if p.is_file()}
+    known_dirs = {p.relative_to(ROOT) for p in baseline if p.is_dir()}
+    known_files.add(jev.GO_CIPHERTEXT)
+    known_dirs.add(jev.GO_CIPHERTEXT.parent)
+    observed = list(root.rglob("*"))
+    for path in observed:
+        relative = path.relative_to(root)
+        if path.is_symlink() or (
+            (path.is_file() and relative not in known_files)
+            or (path.is_dir() and relative not in known_dirs)
+            or (not path.is_file() and not path.is_dir())
+        ):
+            raise AssertionError("Go fixture cleanup kept an unexpected file or directory")
+        if path.stat().st_uid != os.getuid():
+            raise AssertionError("Go fixture cleanup kept an unowned entry")
+
+    for path in observed:
+        if path.is_file():
+            path.unlink()
+    for path in sorted((p for p in observed if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
+        path.rmdir()
+    root.rmdir()
+    parent.rmdir()
+
+
+def test_go_fixture_cleanup_refuses_foreign() -> None:
+    root = copy_root()
+    foreign = root / "foreign-go-fixture"
+    foreign.write_text("unowned path must be retained\n")
+    try:
+        try:
+            go_fixture_clear(root)
+        except AssertionError:
+            assert foreign.read_text() == "unowned path must be retained\n"
+        else:
+            raise AssertionError("Go fixture cleanup accepted a foreign entry")
+    finally:
+        foreign.unlink()
+        go_fixture_clear(root)
+
+
 def append(path: Path, text: str) -> None:
     with path.open("a", encoding="utf-8") as stream:
         stream.write(text)
@@ -361,7 +422,7 @@ def test_author_go() -> None:
         for plane in ("dev.authoring", jev.GO_PLANE, "dev.projection"):
             assert contracts["environments"][plane]["migration_state"] == "NOT_CONFIGURED"
     finally:
-        shutil.rmtree(root.parent, ignore_errors=True)
+        go_fixture_clear(root)
 
 
 def expect_go_red(values: dict[str, str], *, mutate=None, output: bytes | None = None,
@@ -389,7 +450,7 @@ def expect_go_red(values: dict[str, str], *, mutate=None, output: bytes | None =
         assert output is not None or returncode != 0 or not calls, "SOPS ran before Go input gate"
         assert snapshot(root) == before, "RED Go authoring changed repository state"
     finally:
-        shutil.rmtree(root.parent, ignore_errors=True)
+        go_fixture_clear(root)
 
 
 def test_author_go_red() -> None:
@@ -429,7 +490,7 @@ def test_author_go_red() -> None:
             else:
                 raise AssertionError("invalid committed Go ciphertext accepted")
         finally:
-            shutil.rmtree(root.parent, ignore_errors=True)
+            go_fixture_clear(root)
 
 
 def test_author_oci_red() -> None:
@@ -1357,6 +1418,7 @@ def main() -> None:
         test_author_red_inputs()
         test_author_oci()
         test_author_go()
+        test_go_fixture_cleanup_refuses_foreign()
         test_targets_are_separate()
         test_author_oci_red()
         test_author_go_red()
