@@ -36,6 +36,14 @@ def run(bindings, consumers, selection):
 
 
 class ProjectionTests(unittest.TestCase):
+    def test_source_identity_names_the_transferred_repository(self):
+        source = run(*fixture())["source"]
+        self.assertEqual(source["repository"], "roccho-org/envs")
+        self.assertEqual(source["revision"], "a" * 40)
+        self.assertEqual(source["path"], "contracts")
+        self.assertRegex(source["digest"], r"\Asha256:[0-9a-f]{64}\Z")
+        self.assertNotIn("roccho-dev/envs", json.dumps(source))
+
     def test_actual_public_binding_is_projected_not_repaired(self):
         bindings = (ROOT / "contracts/bindings.jsonl").read_text()
         consumers = (ROOT / "contracts/provider-consumer.jsonl").read_text()

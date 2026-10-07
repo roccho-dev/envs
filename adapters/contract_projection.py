@@ -242,7 +242,7 @@ def project(bindings_text, consumers_text, selection, revision):
             "consumer": consumer["repository"], "stage": consumer["stage"],
             "capability": binding["capability"], "binding": binding["id"], "slot": slot,
             "target": {"provider": provider, "resource": resource, "account": account}}})
-    return {"source": {"repository": "roccho-dev/envs", "revision": revision, "path": "contracts",
+    return {"source": {"repository": "roccho-org/envs", "revision": revision, "path": "contracts",
                        "digest": digest({"bindings": bindings, "consumers": consumers})},
             "rows": sorted(output, key=lambda row: row["id"])}
 
