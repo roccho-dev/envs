@@ -84,6 +84,13 @@ def main() -> None:
     expect_red(lambda root: (root / "adapters/legacy.sh").write_text("exit 0\n"))
     expect_red(lambda root: (root / "adapters/legacy.go").write_text("package legacy\n"))
     expect_red(lambda root: (root / "contracts/provider-consumer.jsonl").unlink())
+    caller = ".github/workflows/jev-issue-comment.yml"
+    for old, new in (("github.event.issue.number == 52", "github.event.issue.number == 53"),
+                     ("roccho-org/ops/.github/workflows", "other/ops/.github/workflows"),
+                     ("@3ba9e1a9a7b6c7eb6ef8976e9f14e5e6e8b71953", "@proposals"),
+                     ("    secrets:\n      JEV_API_KEY: ${{ secrets.JEV_API_KEY }}", "    secrets: inherit"),
+                     ("      github.event.issue.pull_request == null", "      true")):
+        expect_red(replace_text(caller, old, new))
     expect_red(append_branch_effect)
 
     def add_database_path(root: Path) -> None:

@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 REQUIRED_FILES = {
     ".github/pull_request_template.md",
     ".github/workflows/check.yml",
+    ".github/workflows/jev-issue-comment.yml",
     ".github/workflows/author-dev-jev-api.yml",
     ".github/workflows/project-dev-jev-api.yml",
     ".github/workflows/project-dev-rent-tunnel.yml",
@@ -507,10 +508,19 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]],
     workflow_root = root / ".github/workflows"
     names = {path.name for path in workflow_root.iterdir() if path.is_file()}
     require(
-        names == {"check.yml", *EFFECT_WORKFLOWS},
+        names == {"check.yml", "jev-issue-comment.yml", *EFFECT_WORKFLOWS},
         f"workflow set differs: {sorted(names)}",
     )
     texts = {path.name: path.read_text(encoding="utf-8") for path in workflow_root.iterdir() if path.is_file()}
+    caller = texts["jev-issue-comment.yml"]
+    require(caller == ("name: Jev Issue comment evaluation\n\non:\n  issue_comment:\n    types: [created]\n\n"
+                       "permissions:\n  actions: read\n  contents: read\n  issues: write\n\njobs:\n  evaluate:\n"
+                       "    if: >-\n      github.event.repository.owner.type == 'Organization' &&\n"
+                       "      github.repository == 'roccho-org/envs' &&\n      github.event.issue.number == 52 &&\n"
+                       "      github.event.comment.body == '/jev-evaluate' &&\n      github.event.issue.pull_request == null\n"
+                       "    uses: roccho-org/ops/.github/workflows/jev-issue-comment.yml@3ba9e1a9a7b6c7eb6ef8976e9f14e5e6e8b71953\n"
+                       "    secrets:\n      JEV_API_KEY: ${{ secrets.JEV_API_KEY }}\n"),
+            "Issue caller must be the fixed Ops workflow and exact originating-Issue guard/slot only")
 
     for name, text in texts.items():
         require("pull_request_target:" not in text, f"{name}: pull_request_target is forbidden")

@@ -1067,7 +1067,9 @@ def test_org_setup_route() -> None:
             identity.write_text("fixture identity\n")
             identity.chmod(0o600)
             root = private / "repo"
-            shutil.copytree(ROOT, root, ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc"))
+            # Setup fixtures start before materialization; retain the real public receipt in ROOT.
+            shutil.copytree(ROOT, root, ignore=shutil.ignore_patterns(
+                ".git", "__pycache__", "*.pyc", Path(jev.ORG_HANDOFF).name))
             target, secret, world, _, delegated = org_world(copy.deepcopy(jev.ORG_TARGET))
             private_calls = []
 

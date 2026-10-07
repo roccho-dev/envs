@@ -1,0 +1,24 @@
+{
+  "binding": "jev-api.github-actions",
+  "controller": "roccho-dev",
+  "created_at": "2026-10-07T10:39:27Z",
+  "kind": "envs.orgSecretProjectionReceipt.v1",
+  "operation": "github_org_secret_put",
+  "provider_use": "NOT_RUN",
+  "readback": "SECRET_NAME_AND_SELECTED_REPOSITORY_IDS",
+  "source": "67af45e8067903950367d80533c3e9e7f267131e",
+  "target": {
+    "organization": "roccho-org",
+    "organization_id": "319185687",
+    "provider": "github-org-secret",
+    "repositories": [
+      "roccho-org/ops",
+      "roccho-org/envs"
+    ],
+    "repository_ids": [
+      "1275606595",
+      "1391871347"
+    ],
+    "secret_name": "JEV_API_KEY"
+  }
+}
