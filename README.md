@@ -91,6 +91,15 @@ There are no stg or prd authoring Environments. `dev-rent-access-probe` carries 
 
 ## Dev Jev flow
 
+The two Jev workflows publish a validated candidate branch and report the local
+commit plus the remote branch/head. They do not create a pull request or request
+`pull-requests: write`. The authenticated owner reconciles those identities and
+opens a PR to `proposals`; normal PR checks and review precede merge. A successful
+workflow means candidate publication only, not accepted ciphertext/handoff or
+consumer readiness. A failed publication stays failed; reconcile the retained
+branch and provider state rather than repeating authoring/projection to open a PR.
+The rent workflow keeps its separately accepted PR/approval path unchanged.
+
 ```text
 dev-authoring/SOPS_AGE_RECIPIENTS
 + dev-authoring/JEV_API_KEY

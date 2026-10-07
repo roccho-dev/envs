@@ -6,7 +6,6 @@ on:
 permissions:
   actions: read
   contents: write
-  pull-requests: write
 
 concurrency:
   group: project-dev-jev-api
@@ -78,9 +77,7 @@ jobs:
       - name: Verify candidate handoff
         run: '"$ENVS_EFFECT_BIN/python3" -I checks/repository.py'
 
-      - name: Open non-secret handoff PR
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Publish non-secret handoff candidate for owner PR
         run: |
           set -euo pipefail
           tool="$ENVS_EFFECT_BIN"
@@ -92,8 +89,5 @@ jobs:
           "$tool/git" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           "$tool/git" commit -m "chore: record dev Jev projection handoff"
           "$tool/git" push origin "HEAD:refs/heads/$branch"
-          "$tool/gh" pr create \
-            --base proposals \
-            --head "$branch" \
-            --title "chore: record dev Jev projection handoff" \
-            --body "Generated after provider effect and name-only readback. Contains no plaintext secret, private key, or secret-value hash."
+          "$tool/git" show --no-patch --format='HANDOFF_HEAD=%H'
+          "$tool/git" ls-remote --exit-code origin "refs/heads/$branch"

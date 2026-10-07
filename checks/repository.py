@@ -655,6 +655,20 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]],
     require(f"{EFFECT_ENTRY} author" in texts["author-dev-jev-api.yml"], "author workflow entry call missing")
     check_author_targets(texts["author-dev-jev-api.yml"], author_targets)
     require(f"{EFFECT_ENTRY} project" in texts["project-dev-jev-api.yml"], "project workflow entry call missing")
+    for name in ("author-dev-jev-api.yml", "project-dev-jev-api.yml"):
+        text = texts[name]
+        require("permissions:\n  actions: read\n  contents: write\n" in text
+                and "pull-requests:" not in text, f"{name}: candidate publication must not request PR authority")
+        require("pr create" not in text, f"{name}: owner must open the candidate PR")
+        require("continue-on-error:" not in text, f"{name}: failed publication must stay failed")
+        start = text.find("      - name: Publish ")
+        require(start != -1, f"{name}: owner candidate publication missing")
+        publish = text[start:]
+        require("GH_TOKEN:" not in publish, f"{name}: candidate publication must use checkout credentials only")
+        for marker in ('"$tool/git" push origin "HEAD:refs/heads/$branch"',
+                       '"$tool/git" show --no-patch --format=\'HANDOFF_HEAD=%H\'',
+                       '"$tool/git" ls-remote --exit-code origin "refs/heads/$branch"'):
+            require(marker in publish, f"{name}: candidate branch/head readback missing: {marker}")
     rent = texts["project-dev-rent-tunnel.yml"]
     require(f"run: '{EFFECT_ENTRY} rent-root'" in rent and rent.count(f"{EFFECT_ENTRY} rent-") == 1,
             "rent workflow must run only the persistent root entry")
