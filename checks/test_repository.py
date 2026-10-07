@@ -87,7 +87,7 @@ def main() -> None:
     caller = ".github/workflows/jev-issue-comment.yml"
     for old, new in (("github.event.issue.number == 52", "github.event.issue.number == 53"),
                      ("roccho-org/ops/.github/workflows", "other/ops/.github/workflows"),
-                     ("@3ba9e1a9a7b6c7eb6ef8976e9f14e5e6e8b71953", "@proposals"),
+                     ("@dcb66f2906fb0a092bdcf36aaabb192dff144d5f", "@proposals"),
                      ("    secrets:\n      JEV_API_KEY: ${{ secrets.JEV_API_KEY }}", "    secrets: inherit"),
                      ("      github.event.issue.pull_request == null", "      true")):
         expect_red(replace_text(caller, old, new))
