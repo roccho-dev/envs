@@ -36,6 +36,14 @@ def run(bindings, consumers, selection):
 
 
 class ProjectionTests(unittest.TestCase):
+    def test_source_identity_names_the_transferred_repository(self):
+        source = run(*fixture())["source"]
+        self.assertEqual(source["repository"], "roccho-org/envs")
+        self.assertEqual(source["revision"], "a" * 40)
+        self.assertEqual(source["path"], "contracts")
+        self.assertRegex(source["digest"], r"\Asha256:[0-9a-f]{64}\Z")
+        self.assertNotIn("roccho-dev/envs", json.dumps(source))
+
     def test_actual_public_binding_is_projected_not_repaired(self):
         bindings = (ROOT / "contracts/bindings.jsonl").read_text()
         consumers = (ROOT / "contracts/provider-consumer.jsonl").read_text()
@@ -59,6 +67,65 @@ class ProjectionTests(unittest.TestCase):
         b[0]["target"]["project"] = b[0]["target"].pop("worker_name")
         with self.assertRaises(ValueError):
             run(b, c, s)
+
+    def test_org_slot_has_exact_selected_repository_identity_not_effect_evidence(self):
+        b, c, s = fixture()
+        c[0]["repository"] = "fixture-org/ops"
+        b[0]["target"] = {"provider": "github-org-secret", "organization": "fixture-org",
+                          "organization_id": "123", "secret_name": "JEV_API_KEY",
+                          "repositories": ["fixture-org/ops", "fixture-org/envs"], "repository_ids": ["456", "789"]}
+        result = run(b, c, s)
+        self.assertEqual(result["rows"][0]["contract"]["target"],
+                         {"provider": "github-org-secret", "resource": "fixture-org", "account": "123"})
+        self.assertNotIn("receipt", result)
+        self.assertNotIn("verified", json.dumps(result))
+        self.assertEqual(result["rows"][0]["contract"]["slot"], "JEV_API_KEY")
+        original = copy.deepcopy([b, c, s])
+        self.assertEqual(result, run(b, c, s))
+        self.assertEqual(original, [b, c, s])
+        c[0]["repository"] = "fixture-org/envs"
+        self.assertEqual(run(b, c, s)["rows"][0]["contract"]["consumer"], "fixture-org/envs")
+        c[0]["repository"] = "other-org/ops"
+        with self.assertRaises(ValueError):
+            run(b, c, s)
+
+    def test_org_target_refusals_happen_before_digest_for_selected_and_unselected_rows(self):
+        base = {"provider": "github-org-secret", "organization": "fixture-org", "organization_id": "123",
+                "secret_name": "JEV_API_KEY", "repositories": ["fixture-org/ops"], "repository_ids": ["456"]}
+        mutations = [
+            lambda t: t.update(secret_value="PRIVATE-CANARY"),
+            lambda t: t.update(visibility="all"),
+            lambda t: t.update(environment="jev-issue-comment"),
+            lambda t: t.update(organization="fixture/org"),
+            lambda t: t.update(organization_id=123),
+            lambda t: t.update(organization_id="0"),
+            lambda t: t.update(secret_name="GITHUB_TOKEN"),
+            lambda t: t.update(repositories=[]),
+            lambda t: t.update(repositories=["other-org/ops"]),
+            lambda t: t.update(repositories=["fixture-org/ops", "fixture-org/ops"], repository_ids=["456", "789"]),
+            lambda t: t.update(repository_ids=["456", "789"]),
+            lambda t: t.update(repository_ids=[456]),
+            lambda t: t.update(repository_ids=["0"]),
+            lambda t: t.update(repository_ids=["ghp_" + "a" * 24]),
+            lambda t: t.update(repositories=["fixture-org/ops", "fixture-org/envs"], repository_ids=["456", "456"]),
+        ]
+        for index, mutate in enumerate(mutations):
+            for selected in (True, False):
+                with self.subTest(case=index, selected=selected):
+                    b, c, s = fixture()
+                    c[0]["repository"] = "fixture-org/ops"
+                    target = copy.deepcopy(base)
+                    mutate(target)
+                    extra = {**b[0], "id": "org-binding", "target": target}
+                    if selected:
+                        b[0]["target"] = target
+                    else:
+                        b.append(extra)
+                    with patch.object(module, "digest") as hash_call:
+                        with self.assertRaises(ValueError) as error:
+                            run(b, c, s)
+                        hash_call.assert_not_called()
+                    self.assertNotIn("PRIVATE-CANARY", str(error.exception))
 
     def test_missing_stable_binding_or_boundary_stays_missing(self):
         b, c, s = fixture()

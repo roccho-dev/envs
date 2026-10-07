@@ -42,6 +42,27 @@ def public_target(value):
     if not isinstance(value, dict):
         raise ValueError("target schema")
     provider = value.get("provider")
+    if provider == "github-org-secret":
+        closed(value, ("provider", "organization", "organization_id", "secret_name",
+                       "repositories", "repository_ids"))
+        for key in ("provider", "organization", "organization_id", "secret_name"):
+            token(value[key])
+        org = value["organization"]
+        if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?", org):
+            raise ValueError("organization identifier")
+        if not re.fullmatch(r"[1-9][0-9]*", value["organization_id"]):
+            raise ValueError("organization identity")
+        if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", value["secret_name"]) or value["secret_name"].startswith("GITHUB_"):
+            raise ValueError("secret slot identifier")
+        repos, ids = value["repositories"], value["repository_ids"]
+        tokens(repos); tokens(ids)
+        if not 1 <= len(repos) <= 100 or len(repos) != len(ids):
+            raise ValueError("selected repository identities")
+        if not all(re.fullmatch(re.escape(org) + r"/[A-Za-z0-9_.-]+", repo) for repo in repos):
+            raise ValueError("selected repository organization")
+        if not all(re.fullmatch(r"[1-9][0-9]*", repo_id) for repo_id in ids):
+            raise ValueError("selected repository identity")
+        return
     if provider in ("cloudflare-pages", "cloudflare-workers"):
         resource = "project" if provider == "cloudflare-pages" else "worker_name"
         closed(value, ("provider", resource, "secret_name"), ("account_id",))
@@ -200,12 +221,19 @@ def project(bindings_text, consumers_text, selection, revision):
         if consumer["capability"] != binding["capability"]:
             raise ValueError("selected capability relation inconsistent")
         target = binding["target"]
-        if target.get("provider") in ("cloudflare-pages", "cloudflare-workers"):
+        if target.get("provider") == "github-org-secret":
+            if consumer["repository"] not in target["repositories"]:
+                raise ValueError("selected consumer not covered by Org target")
+            provider, resource, slot = target["provider"], target["organization"], target["secret_name"]
+            account = target["organization_id"]
+        elif target.get("provider") in ("cloudflare-pages", "cloudflare-workers"):
             provider = target["provider"]
             resource_key = "project" if provider == "cloudflare-pages" else "worker_name"
             resource, slot = target[resource_key], target["secret_name"]
+            account = target.get("account_id")
         elif target.get("kind") == "process_env":
             provider, resource, slot = target["kind"], target["host"], target["secret_name"]
+            account = None
         else:
             raise ValueError("target projection unsupported")
         # Read only a closed set of public fields. source_key/ciphertext are not opened.
@@ -213,8 +241,8 @@ def project(bindings_text, consumers_text, selection, revision):
             "obligation_digest": requirement["obligation_digest"], "profile": requirement["profile"],
             "consumer": consumer["repository"], "stage": consumer["stage"],
             "capability": binding["capability"], "binding": binding["id"], "slot": slot,
-            "target": {"provider": provider, "resource": resource, "account": target.get("account_id")}}})
-    return {"source": {"repository": "roccho-dev/envs", "revision": revision, "path": "contracts",
+            "target": {"provider": provider, "resource": resource, "account": account}}})
+    return {"source": {"repository": "roccho-org/envs", "revision": revision, "path": "contracts",
                        "digest": digest({"bindings": bindings, "consumers": consumers})},
             "rows": sorted(output, key=lambda row: row["id"])}
 

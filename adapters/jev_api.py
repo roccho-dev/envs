@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
+import importlib.util
 import json
 import os
 import getpass
@@ -125,6 +127,16 @@ OCI_CIPHERTEXT = Path("ciphertexts/dev-jev-api.oci-dev.sops.yaml")
 OCI_RECIPIENT = "OCI_DEV_AGE_RECIPIENT"
 # Every binding `author --target` can select; a dispatch names exactly one of them.
 AUTHOR_TARGETS = ("jev-api", OCI_BINDING)
+ORG_BINDING = "jev-api.github-actions"
+ORG_HANDOFF = Path("handoffs/dev-jev-api.github-actions.json")
+ORG_RECEIPT_KIND = "envs.orgSecretProjectionReceipt.v1"
+ORG_PLAN_KIND = "envs.orgSecretProjectionPlan.v1"
+ORG_CONTROLLER = "roccho-dev"
+ORG_TARGET = {
+    "provider": "github-org-secret", "organization": "roccho-org", "organization_id": "319185687",
+    "secret_name": "JEV_API_KEY", "repositories": ["roccho-org/ops", "roccho-org/envs"],
+    "repository_ids": ["1275606595", "1391871347"],
+}
 
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -262,7 +274,34 @@ def expected_bindings(jev_target: dict[str, Any] | None = None) -> dict[str, dic
             "required_variables": [{"name": OCI_RECIPIENT, "type": "age_recipient", "lifecycle": "persistent"}],
             "target": {"repository": "roccho-dev/windows", "host": "oci-dev", "kind": "process_env", "secret_name": "JEV_API_KEY"},
         },
+        ORG_BINDING: {
+            "id": ORG_BINDING, "kind": "envs.authCapability.v1", "capability": "jev-api",
+            "ciphertext": OCI_CIPHERTEXT.as_posix(), "source_key": "JEV_API_KEY",
+            "target": json.loads(json.dumps(ORG_TARGET)),
+        },
     }
+
+
+def expected_org_boundaries() -> dict[str, dict[str, Any]]:
+    provider = {
+        "id": "dev.jev-api-github-actions.provider", "kind": "envs.providerConsumerBoundary.v1",
+        "role": "provider", "repository": "roccho-org/envs", "stage": "dev", "capability": "jev-api",
+        "binding": ORG_BINDING, "source_kind": "public_sops", "target_kind": "github_org_secret",
+        "owns": ["contract", "projection", "selected_repository_ids", "provider_readback", "projection_receipt"],
+        "does_not_own": ["application_runtime_acceptance", "consumer_independent_execution"],
+        "handoff_ref_kind": "exact_commit_sha",
+    }
+    result = {provider["id"]: provider}
+    for repository in ORG_TARGET["repositories"]:
+        name = repository.split("/")[1]
+        row = {
+            "id": f"{name}.jev-issue-comment.consumer", "kind": "envs.providerConsumerBoundary.v1",
+            "role": "consumer", "repository": repository, "stage": "dev", "capability": "jev-api",
+            "owns": ["trusted_caller_admission", "provider_effect", "same_issue_result_append", "result_readback"],
+            "requires": ["org_secret", "exact_binding_handoff", "finite_budget_stop"],
+        }
+        result[row["id"]] = row
+    return result
 
 
 def expected_rent_boundary() -> dict[str, Any]:
@@ -615,7 +654,9 @@ def validate_contracts(root: Path = ROOT) -> dict[str, dict[str, dict[str, Any]]
         "repository.branch-policy", "dev.jev-api.provider", "dev.rent-tunnel.provider", "dev.rent-access-probe.provider",
         "dev.rent-state-proof.provider", "dev.jev-api-oci-dev.provider", "apps.voice-ui.consumer", "ops.voice-ui.consumer",
         "normal.consumer.path", "dev.rent-client.provider", "dev.rent-root.provider", WINDOWS_CONSUMER,
-    }, "provider-consumer boundary set differs")
+    } | set(expected_org_boundaries()), "provider-consumer boundary set differs")
+    for identity, expected in expected_org_boundaries().items():
+        require(boundary[identity] == expected, "Org provider-consumer boundary differs")
     require(boundary["dev.rent-tunnel.provider"] == expected_rent_boundary(), "rent tunnel provider boundary differs")
     require(boundary["dev.rent-client.provider"] == expected_client_boundary(), "rent client provider boundary differs")
     require(boundary["dev.rent-root.provider"] == expected_root_boundary(), "rent root provider boundary differs")
@@ -2192,6 +2233,253 @@ def _workers_secret_put(*, account_id: str, worker_name: str, secret_name: str,
         raise EnvsError("Cloudflare Workers secret put transport failed") from None
 
 
+def project_github_org_secret(*, target: dict[str, Any], tools: Mapping[str, str],
+                              authorization: Mapping[str, str], secret_loader: Callable[[], bytes],
+                              runner: Runner | None = None, apply: bool = True) -> dict[str, Any]:
+    """Bound Org materialization primitive; not a grant, binding, CLI route or Jev-use receipt.
+
+    The owning projector supplies its admitted target/toolchain, authorized GH_TOKEN and
+    lazy SOPS loader. Native gh seals plaintext on stdin; the only write uses fixed repo IDs,
+    not gh's name-based lookup. No Repository/Environment endpoint or automatic retry exists.
+    """
+    try:
+        selected = json.loads(json.dumps(target, allow_nan=False))
+        spec = importlib.util.spec_from_file_location("envs_org_target", Path(__file__).with_name("contract_projection.py"))
+        require(spec is not None and spec.loader is not None, "Org target validator missing")
+        public = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(public)
+        public.public_target(selected)
+        require(selected["provider"] == "github-org-secret" and selected["secret_name"] == "JEV_API_KEY",
+                "Org Jev target differs")
+        gh = tools["gh"]
+        require(in_store(gh) and os.path.isfile(gh) and os.access(gh, os.X_OK), "fixed gh tool missing")
+        require(set(authorization) == {"GH_TOKEN"} and isinstance(authorization["GH_TOKEN"], str)
+                and bool(authorization["GH_TOKEN"]), "Org projection authorization missing")
+        require(type(apply) is bool, "Org apply mode invalid")
+    except (ValueError, TypeError, KeyError):
+        raise EnvsError("Org projection input invalid") from None
+    org, name = selected["organization"], selected["secret_name"]
+    expected = dict(zip(selected["repositories"], selected["repository_ids"], strict=True))
+
+    with tempfile.TemporaryDirectory(prefix="envs-org-gh-") as home:
+        child_env = clean_env(tools, {"GH_TOKEN": authorization["GH_TOKEN"], "GH_HOST": "github.com",
+                                      "HOME": home, "GH_CONFIG_DIR": home, "GH_PROMPT_DISABLED": "1"})
+
+        def command(args: list[str], stdin: bytes | None = None, limit: int = RESPONSE_LIMIT) -> bytes:
+            argv = [gh, *args]
+            try:
+                result = subprocess.run(argv, input=stdin, env=child_env, stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE, check=False, shell=False, timeout=30) \
+                    if runner is None else runner(argv, stdin, child_env)
+            except Exception:
+                raise EnvsError("Org gh operation unresolved") from None
+            require(result.returncode == 0 and len(result.stdout) <= limit, "Org gh operation failed")
+            return result.stdout
+
+        def api(route: str) -> Any:
+            try:
+                return json.loads(command(["api", "-X", "GET", route]).decode("utf-8"))
+            except (ValueError, UnicodeError):
+                raise EnvsError("Org metadata response invalid") from None
+
+        def identity() -> None:
+            observed = api(f"orgs/{org}")
+            require(isinstance(observed, dict) and observed.get("type") == "Organization"
+                    and observed.get("login") == org and str(observed.get("id")) == selected["organization_id"],
+                    "Org identity differs")
+            for repository, repository_id in expected.items():
+                observed = api(f"repos/{repository}")
+                owner = observed.get("owner", {}) if isinstance(observed, dict) else {}
+                require(isinstance(observed, dict) and isinstance(owner, dict)
+                        and observed.get("full_name") == repository and str(observed.get("id")) == repository_id
+                        and owner.get("type") == "Organization" and owner.get("login") == org
+                        and str(owner.get("id")) == selected["organization_id"], "Org repository identity differs")
+
+        def public_key() -> dict[str, str]:
+            key = api(f"orgs/{org}/actions/secrets/public-key")
+            require(isinstance(key, dict) and set(key) == {"key_id", "key"}
+                    and isinstance(key["key_id"], str) and bool(key["key_id"])
+                    and isinstance(key["key"], str), "Org public key invalid")
+            try:
+                require(len(base64.b64decode(key["key"], validate=True)) == 32, "Org public key invalid")
+            except ValueError:
+                raise EnvsError("Org public key invalid") from None
+            return key
+
+        # Read-only identity and Org API access preflight, before the owning loader reads plaintext.
+        identity()
+        key = public_key()
+        if not apply:
+            return {"operation": "github_org_secret_put", "target": selected,
+                    "readback": "NOT_RUN", "provider_use": "NOT_RUN"}
+        try:
+            secret = secret_loader()
+        except Exception:
+            raise EnvsError("Org source decryption failed") from None
+        require(isinstance(secret, bytes) and 0 < len(secret) <= 48 * 1024, "Org source secret size invalid")
+        encrypted = command(["secret", "set", name, "--app", "actions", "--org", org, "--no-store"],
+                            secret, 2 * RESPONSE_LIMIT).strip()
+        try:
+            require(bool(base64.b64decode(encrypted, validate=True)), "Org sealed value invalid")
+            encrypted_text = encrypted.decode("ascii")
+        except (ValueError, UnicodeError):
+            raise EnvsError("Org sealed value invalid") from None
+        require(public_key() == key, "Org public key changed before write")
+        identity()
+        # The native encrypted envelope goes through stdin. Repo IDs remain bound even if a name changes.
+        body = json.dumps({"encrypted_value": encrypted_text, "key_id": key["key_id"], "visibility": "selected",
+                           "selected_repository_ids": [int(i) for i in selected["repository_ids"]]},
+                          separators=(",", ":")).encode("utf-8")
+        try:
+            command(["api", "-X", "PUT", f"orgs/{org}/actions/secrets/{name}", "--input", "-"], body)
+            metadata = api(f"orgs/{org}/actions/secrets/{name}")
+            require(isinstance(metadata, dict) and metadata.get("name") == name
+                    and metadata.get("visibility") == "selected", "Org secret metadata differs")
+            access = api(f"orgs/{org}/actions/secrets/{name}/repositories?per_page=100")
+            rows = access.get("repositories") if isinstance(access, dict) else None
+            require(isinstance(rows, list) and access.get("total_count") == len(expected) == len(rows),
+                    "Org selected repository readback incomplete")
+            actual: dict[str, str] = {}
+            for row in rows:
+                require(isinstance(row, dict) and isinstance(row.get("full_name"), str)
+                        and row["full_name"] not in actual, "Org selected repository readback invalid")
+                actual[row["full_name"]] = str(row.get("id"))
+            require(actual == expected, "Org selected repository readback differs")
+            identity()
+        except Exception:
+            # A failed/unknown write or later readback is not a no-effect record. Never retry automatically.
+            raise EnvsError("Org projection write/readback unresolved; do not repeat") from None
+        return {"operation": "github_org_secret_put", "target": selected,
+                "readback": "SECRET_NAME_AND_SELECTED_REPOSITORY_IDS", "provider_use": "NOT_RUN"}
+
+
+def org_projection(*, envs_sha: str, auth_config: Path, identity: Path, apply: bool = False,
+                   root: Path = ROOT, runner: Runner | None = None) -> dict[str, Any]:
+    """The owner-only OCI setup route; consumers get no decryptor or controller credential."""
+    contracts = validate_contracts(root)
+    tools = toolchain(root)
+    manifest = json.loads(Path(os.environ["ENVS_EFFECT_TOOLCHAIN"]).read_text(encoding="utf-8"))
+    require(SHA40.fullmatch(envs_sha) is not None and envs_sha == manifest["source"], "Org source identity differs")
+    for relative in (BINDINGS, BOUNDARY, ENVIRONMENTS, OCI_CIPHERTEXT, FLAKE_LOCK):
+        path = root / relative
+        require(not path.is_symlink() and path.read_bytes() == (ROOT / relative).read_bytes(),
+                "Org data differs from the provided source")
+    require(not (root / ORG_HANDOFF).exists() and not (root / ORG_HANDOFF).is_symlink(),
+            "Org handoff already exists; reconcile before another operation")
+    require(not (root / ORG_HANDOFF).parent.is_symlink()
+            and (not (root / ORG_HANDOFF).parent.exists() or (root / ORG_HANDOFF).parent.is_dir()),
+            "Org handoff parent differs")
+    require(auth_config.is_absolute() and identity.is_absolute(), "Org private input paths must be absolute")
+    require(auth_config.resolve() == auth_config and identity.resolve() == identity,
+            "Org private input path contains a link")
+
+    def owned(path: Path, mode: int, directory: bool = False) -> None:
+        info = path.lstat()
+        require(not path.is_symlink() and info.st_uid == os.geteuid()
+                and info.st_mode & 0o777 == mode and (path.is_dir() if directory else path.is_file()),
+                "Org private input ownership differs")
+
+    owned(auth_config, 0o700, True)
+    owned(auth_config / "hosts.yml", 0o600)
+    owned(identity.parent, 0o700, True)
+    owned(identity, 0o600)
+
+    def command(argv: Sequence[str], env: Mapping[str, str], stdin: bytes | None = None) -> bytes:
+        try:
+            value = subprocess.run(list(argv), input=stdin, env=dict(env), stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, check=False, shell=False, timeout=30) \
+                if runner is None else runner(argv, stdin, env)
+        except Exception:
+            raise EnvsError("Org setup child unresolved") from None
+        require(value.returncode == 0 and len(value.stdout) <= RESPONSE_LIMIT, "Org setup child failed")
+        return value.stdout
+
+    # The explicit existing account slot only; no GH_TOKEN/HOME/account-switch fallback.
+    env = clean_env(tools, {"GH_CONFIG_DIR": str(auth_config), "GH_HOST": "github.com", "GH_PROMPT_DISABLED": "1"})
+    try:
+        token = command([tools["gh"], "auth", "token", "--hostname", "github.com", "--user", ORG_CONTROLLER], env).decode("ascii").strip()
+    except UnicodeError:
+        raise EnvsError("Org controller authorization invalid") from None
+    require(0 < len(token) <= 8192 and all(33 <= ord(char) <= 126 for char in token), "Org controller authorization invalid")
+    with tempfile.TemporaryDirectory(prefix="envs-org-controller-") as private_home:
+        private_env = clean_env(tools, {"GH_TOKEN": token, "GH_HOST": "github.com", "GH_PROMPT_DISABLED": "1",
+                                        "HOME": private_home, "GH_CONFIG_DIR": private_home})
+        try:
+            controller = json.loads(command([tools["gh"], "api", "-X", "GET", "user"], private_env))
+        except ValueError:
+            raise EnvsError("Org controller response invalid") from None
+        require(isinstance(controller, dict) and controller.get("login") == ORG_CONTROLLER
+                and controller.get("type") == "User", "Org controller identity differs")
+        try:
+            slots = json.loads(command([tools["gh"], "api", "-X", "GET",
+                                       f"orgs/{ORG_TARGET['organization']}/actions/secrets?per_page=100"], private_env))
+        except ValueError:
+            raise EnvsError("Org existing slot response invalid") from None
+        rows = slots.get("secrets") if isinstance(slots, dict) else None
+        require(isinstance(rows, list) and slots.get("total_count") == len(rows)
+                and all(isinstance(row, dict) and isinstance(row.get("name"), str) for row in rows),
+                "Org existing slot readback incomplete")
+        require(all(row["name"] != ORG_TARGET["secret_name"] for row in rows),
+                "Org slot already exists; reconcile before an authorized rotation")
+
+    binding = contracts["bindings"][ORG_BINDING]
+    cipher = ROOT / binding["ciphertext"]
+    validate_oci_ciphertext(cipher.read_bytes(), None, None)
+
+    def load_secret() -> bytes:
+        owned(identity, 0o600)
+        data = command([tools["sops"], "--decrypt", "--output-type", "json", str(cipher)],
+                       clean_env(tools, {"SOPS_AGE_KEY_FILE": str(identity)}))
+        try:
+            spec = importlib.util.spec_from_file_location("envs_org_payload", Path(__file__).with_name("contract_projection.py"))
+            require(spec is not None and spec.loader is not None, "Org payload validator missing")
+            public = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(public)
+            payload = public.read_json(data.decode("utf-8"))
+            require(isinstance(payload, dict) and set(payload) == {"JEV_API_KEY"}
+                    and isinstance(payload["JEV_API_KEY"], str) and bool(payload["JEV_API_KEY"]), "Org payload fields differ")
+            return payload["JEV_API_KEY"].encode("utf-8")
+        except (ValueError, UnicodeError, KeyError, TypeError):
+            raise EnvsError("Org source payload invalid") from None
+
+    result = project_github_org_secret(target=binding["target"], tools=tools, authorization={"GH_TOKEN": token},
+                                      secret_loader=load_secret, runner=runner, apply=apply)
+    if not apply:
+        return {"kind": ORG_PLAN_KIND, "source": envs_sha, "binding": ORG_BINDING,
+                "controller": ORG_CONTROLLER, "projection": "NOT_RUN", **result}
+    receipt = {"kind": ORG_RECEIPT_KIND, "source": envs_sha, "binding": ORG_BINDING,
+               "controller": ORG_CONTROLLER, "created_at": utc_now(), **result}
+    validate_org_receipt(receipt)
+    destination = root / ORG_HANDOFF
+    require(not destination.parent.is_symlink(), "Org handoff parent differs")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with destination.open("x", encoding="utf-8") as stream:
+            stream.write(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+    except OSError:
+        raise EnvsError("Org write succeeded but handoff unresolved; reconcile, do not repeat") from None
+    return receipt
+
+
+def validate_org_receipt(receipt: Any) -> None:
+    require(isinstance(receipt, dict) and set(receipt) == {
+        "kind", "source", "binding", "controller", "created_at", "operation", "target", "readback", "provider_use",
+    }, "Org receipt fields differ")
+    require(receipt["kind"] == ORG_RECEIPT_KIND and receipt["binding"] == ORG_BINDING
+            and receipt["controller"] == ORG_CONTROLLER and isinstance(receipt["source"], str)
+            and SHA40.fullmatch(receipt["source"]) is not None and receipt["target"] == ORG_TARGET
+            and receipt["operation"] == "github_org_secret_put"
+            and receipt["readback"] == "SECRET_NAME_AND_SELECTED_REPOSITORY_IDS"
+            and receipt["provider_use"] == "NOT_RUN", "Org receipt identity differs")
+    require(isinstance(receipt["created_at"], str) and receipt["created_at"].endswith("Z"),
+            "Org receipt time invalid")
+    try:
+        datetime.fromisoformat(receipt["created_at"][:-1] + "+00:00")
+    except ValueError:
+        raise EnvsError("Org receipt time invalid") from None
+    walk_receipt(receipt)
+
+
 def validate_receipt(receipt: dict[str, Any], expected_target: dict[str, Any] | None = None) -> None:
     require(set(receipt) == {
         "kind", "status", "envs_sha", "environment", "capability", "source",
@@ -2408,6 +2696,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     project_parser.add_argument("--run-attempt", type=int, required=True)
     project_parser.add_argument("--created-at")
     project_parser.add_argument("--output", type=Path, default=HANDOFF)
+    org_parser = sub.add_parser("project-org-secret")
+    org_parser.add_argument("--envs-sha", required=True)
+    org_parser.add_argument("--auth-config", type=Path, required=True)
+    org_parser.add_argument("--identity", type=Path, required=True)
+    org_parser.add_argument("--apply", action="store_true")
     args = parser.parse_args(argv)
     root = args.root.resolve()
     try:
@@ -2425,6 +2718,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "manifest": os.environ["ENVS_EFFECT_TOOLCHAIN"], "nixpkgs": locked_nixpkgs(root), "tools": tools,
                 "source": json.loads(Path(os.environ["ENVS_EFFECT_TOOLCHAIN"]).read_text(encoding="utf-8"))["source"],
             }, indent=2, sort_keys=True))
+        elif args.command == "project-org-secret":
+            result = org_projection(envs_sha=args.envs_sha, auth_config=args.auth_config,
+                                    identity=args.identity, apply=args.apply, root=root)
+            print(json.dumps(result, indent=2, sort_keys=True))
         elif args.command == "author":
             result = author(root) if args.target == "jev-api" else author_oci(root)
             print(json.dumps(result, indent=2, sort_keys=True))

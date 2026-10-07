@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import copy
 import importlib.util
 import json
@@ -13,6 +14,7 @@ import sys
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("jev_api", ROOT / "adapters/jev_api.py")
@@ -921,6 +923,233 @@ def test_workers_target_and_receipt_binding() -> None:
             raise AssertionError("mismatched Workers receipt was accepted")
 
 
+def org_world(target_override=None):
+    target = target_override or {"provider": "github-org-secret", "organization": "fixture-org", "organization_id": "123",
+              "secret_name": "JEV_API_KEY", "repositories": ["fixture-org/ops", "fixture-org/envs"],
+              "repository_ids": ["456", "789"]}
+    org, ops, envs = target["organization"], *target["repositories"]
+    org_id = int(target["organization_id"])
+    ops_id, envs_id = map(int, target["repository_ids"])
+    secret = ("fixture-org-key-" + secrets.token_urlsafe(24)).encode()
+    world = {"calls": [], "loads": 0, "writes": 0, "key_reads": 0, "fault": None}
+    key = {"key_id": "fixture-key-id", "key": base64.b64encode(b"x" * 32).decode()}
+
+    def loader():
+        world["loads"] += 1
+        return secret
+
+    def runner(argv, stdin, env):
+        world["calls"].append((list(argv), stdin))
+        assert argv[0] == TOOLS["gh"] and env["GH_HOST"] == "github.com"
+        assert env["GH_TOKEN"] == "fixture-controller-token"
+        assert "JEV_API_KEY" not in env and "SOPS_AGE_KEY" not in env
+        assert not any(secret.decode() in item for item in [*argv, *env.values()])
+        if world["fault"] == "permission" and "public-key" in argv[-1]:
+            return subprocess.CompletedProcess(argv, 1, stdout=b"", stderr=secret)
+        if argv[1:3] == ["secret", "set"]:
+            assert argv[3:] == ["JEV_API_KEY", "--app", "actions", "--org", org, "--no-store"]
+            assert stdin == secret and world["loads"] == 1 and world["writes"] == 0
+            stdout = b"not-base64!" if world["fault"] == "cipher" else base64.b64encode(b"synthetic-sealed-value") + b"\n"
+            return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr=b"")
+        assert argv[1:4] in (["api", "-X", "GET"], ["api", "-X", "PUT"])
+        route = argv[4]
+        if argv[3] == "PUT":
+            world["writes"] += 1
+            assert route == f"orgs/{org}/actions/secrets/JEV_API_KEY" and argv[5:] == ["--input", "-"]
+            payload = json.loads(stdin)
+            assert set(payload) == {"encrypted_value", "key_id", "visibility", "selected_repository_ids"}
+            assert payload["visibility"] == "selected" and payload["selected_repository_ids"] == [ops_id, envs_id]
+            assert payload["key_id"] == key["key_id"] and secret not in stdin
+            if world["fault"] == "write":
+                raise RuntimeError(secret.decode())
+            return subprocess.CompletedProcess(argv, 0, stdout=b"", stderr=b"")
+        assert stdin is None
+        owner = {"id": org_id, "login": org, "type": "Organization"}
+        if route == f"orgs/{org}":
+            value = owner
+        elif route == f"orgs/{org}/actions/secrets?per_page=100":
+            value = {"total_count": 0, "secrets": []}
+            if world["fault"] == "already-slot":
+                value = {"total_count": 1, "secrets": [{"name": "JEV_API_KEY"}]}
+        elif route in (f"repos/{ops}", f"repos/{envs}"):
+            value = {"id": ops_id if route.endswith("/ops") else envs_id, "full_name": route[6:], "owner": owner}
+            if world["fault"] == "owner":
+                value["owner"] = {**owner, "type": "User"}
+            if world["fault"] == "repo-id":
+                value["id"] = 999
+            if world["fault"] == "metadata-json":
+                return subprocess.CompletedProcess(argv, 0, stdout=b"not-json", stderr=secret)
+        elif route.endswith("public-key"):
+            world["key_reads"] += 1
+            value = key
+            if world["fault"] == "key-drift" and world["key_reads"] > 1:
+                value = {**key, "key_id": "different-key"}
+        elif route.endswith("/repositories?per_page=100"):
+            value = {"total_count": 2, "repositories": [{"id": envs_id, "full_name": envs},
+                                                        {"id": ops_id, "full_name": ops}]}
+            if world["fault"] == "readback":
+                value["repositories"][0]["id"] = 999
+            if world["fault"] == "incomplete":
+                value["repositories"].pop()
+        else:
+            assert route == f"orgs/{org}/actions/secrets/JEV_API_KEY"
+            value = {"name": "JEV_API_KEY", "visibility": "all" if world["fault"] == "visibility" else "selected"}
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(value).encode(), stderr=b"")
+
+    return target, secret, world, loader, runner
+
+
+def test_org_materialization_primitive() -> None:
+    target, secret, world, loader, runner = org_world()
+    plan = jev.project_github_org_secret(target=target, tools=TOOLS, authorization={"GH_TOKEN": "fixture-controller-token"},
+                                       secret_loader=loader, runner=runner, apply=False)
+    assert world["loads"] == 0 and world["writes"] == 0 and plan["readback"] == "NOT_RUN"
+    target, secret, world, loader, runner = org_world()
+    result = jev.project_github_org_secret(target=target, tools=TOOLS, authorization={"GH_TOKEN": "fixture-controller-token"},
+                                         secret_loader=loader, runner=runner)
+    assert world["loads"] == 1 and world["writes"] == 1
+    assert result == {"operation": "github_org_secret_put", "target": target,
+                      "readback": "SECRET_NAME_AND_SELECTED_REPOSITORY_IDS", "provider_use": "NOT_RUN"}
+    assert secret.decode() not in json.dumps(result) and "fixture-controller-token" not in json.dumps(result)
+    assert "secret_value" not in json.dumps(result) and "receipt" not in result and "status" not in result
+    for fault in ("permission", "owner", "repo-id", "metadata-json", "key-drift", "cipher", "write", "readback", "incomplete", "visibility"):
+        target, secret, world, loader, runner = org_world()
+        world["fault"] = fault
+        try:
+            jev.project_github_org_secret(target=target, tools=TOOLS, authorization={"GH_TOKEN": "fixture-controller-token"},
+                                         secret_loader=loader, runner=runner)
+        except jev.EnvsError as error:
+            assert secret.decode() not in str(error) and "fixture-controller-token" not in str(error)
+            if fault in ("write", "readback", "incomplete", "visibility"):
+                assert "unresolved; do not repeat" in str(error) and world["writes"] == 1
+            else:
+                assert world["writes"] == 0
+            if fault in ("permission", "owner", "repo-id", "metadata-json"):
+                assert world["loads"] == 0
+        else:
+            raise AssertionError("invalid Org state was accepted")
+    for auth in ({}, {"GH_TOKEN": ""}, {"GITHUB_TOKEN": "fixture"}, {"GH_TOKEN": "fixture", "fallback": "x"}):
+        target, secret, world, loader, runner = org_world()
+        try:
+            jev.project_github_org_secret(target=target, tools=TOOLS, authorization=auth, secret_loader=loader, runner=runner)
+        except jev.EnvsError:
+            assert world["calls"] == [] and world["loads"] == 0
+        else:
+            raise AssertionError("ambient or missing Org authority was accepted")
+    for malformed in (b"", b"x" * (48 * 1024 + 1), "not-bytes"):
+        target, secret, world, loader, runner = org_world()
+        try:
+            jev.project_github_org_secret(target=target, tools=TOOLS, authorization={"GH_TOKEN": "fixture-controller-token"},
+                                         secret_loader=lambda: malformed, runner=runner)
+        except jev.EnvsError:
+            assert world["writes"] == 0 and not any(call[0][1:3] == ["secret", "set"] for call in world["calls"])
+        else:
+            raise AssertionError("invalid plaintext input was accepted")
+
+
+def test_org_setup_route() -> None:
+    def refuse(call) -> None:
+        try:
+            call()
+        except jev.EnvsError:
+            return
+        raise AssertionError("invalid Org setup or receipt was accepted")
+
+    for fault in (None, "controller", "permission", "decrypt", "duplicate-payload", "payload-field",
+                  "key-mode", "auth-mode", "source", "handoff", "already-slot", "write", "readback"):
+        with tempfile.TemporaryDirectory(prefix="envs-org-setup-test-") as tmp:
+            private = Path(tmp)
+            auth = private / "gh"
+            auth.mkdir(mode=0o700)
+            (auth / "hosts.yml").write_text("fixture only\n")
+            (auth / "hosts.yml").chmod(0o600)
+            identity = private / "oci-dev.key"
+            identity.write_text("fixture identity\n")
+            identity.chmod(0o600)
+            root = private / "repo"
+            # Setup fixtures start before materialization; retain the real public receipt in ROOT.
+            shutil.copytree(ROOT, root, ignore=shutil.ignore_patterns(
+                ".git", "__pycache__", "*.pyc", Path(jev.ORG_HANDOFF).name))
+            target, secret, world, _, delegated = org_world(copy.deepcopy(jev.ORG_TARGET))
+            private_calls = []
+
+            def runner(argv, stdin, env):
+                private_calls.append((list(argv), stdin, dict(env)))
+                if argv[0] == TOOLS["sops"]:
+                    world["loads"] += 1
+                    assert env["SOPS_AGE_KEY_FILE"] == str(identity) and "SOPS_AGE_KEY" not in env
+                    assert stdin is None
+                    if fault == "decrypt":
+                        return subprocess.CompletedProcess(argv, 1, stdout=b"", stderr=secret)
+                    body = json.dumps({"JEV_API_KEY": secret.decode()}).encode()
+                    if fault == "duplicate-payload":
+                        body = b'{"JEV_API_KEY":"x","JEV_API_KEY":"y"}'
+                    if fault == "payload-field":
+                        body = json.dumps({"JEV_API_KEY": secret.decode(), "extra": "x"}).encode()
+                    return subprocess.CompletedProcess(argv, 0, stdout=body, stderr=b"")
+                if list(argv[1:3]) == ["auth", "token"]:
+                    assert env["GH_CONFIG_DIR"] == str(auth) and "GH_TOKEN" not in env and "GITHUB_TOKEN" not in env
+                    return subprocess.CompletedProcess(argv, 0, stdout=b"fixture-controller-token\n", stderr=b"")
+                if list(argv[1:]) == ["api", "-X", "GET", "user"]:
+                    login = "other" if fault == "controller" else jev.ORG_CONTROLLER
+                    return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"login": login, "type": "User"}).encode(), stderr=b"")
+                return delegated(argv, stdin, env)
+
+            if fault in ("permission", "already-slot", "write", "readback"):
+                world["fault"] = fault
+            if fault == "key-mode":
+                identity.chmod(0o644)
+            if fault == "auth-mode":
+                (auth / "hosts.yml").chmod(0o644)
+            if fault == "handoff":
+                (root / jev.ORG_HANDOFF).parent.mkdir(exist_ok=True)
+                (root / jev.ORG_HANDOFF).write_text("{}")
+            source = "b" * 40 if fault == "source" else "a" * 40
+            with environment({"ENVS_EFFECT_TOOLCHAIN": MANIFEST, "GH_TOKEN": "ambient-token-must-not-be-used"}):
+                if fault is None:
+                    plan = jev.org_projection(envs_sha=source, auth_config=auth, identity=identity, root=root, runner=runner)
+                    assert plan["kind"] == jev.ORG_PLAN_KIND and plan["projection"] == "NOT_RUN"
+                    assert world["loads"] == 0 and world["writes"] == 0 and not (root / jev.ORG_HANDOFF).exists()
+                    result = jev.org_projection(envs_sha=source, auth_config=auth, identity=identity, apply=True, root=root, runner=runner)
+                    jev.validate_org_receipt(result)
+                    assert world["loads"] == 1 and world["writes"] == 1 and result["provider_use"] == "NOT_RUN"
+                    assert json.loads((root / jev.ORG_HANDOFF).read_text()) == result
+                    assert secret.decode() not in json.dumps(result) and "fixture-controller-token" not in json.dumps(result)
+                    refuse(lambda: jev.org_projection(envs_sha=source, auth_config=auth, identity=identity,
+                                                         apply=True, root=root, runner=runner))
+                    assert world["writes"] == 1
+                    mutations = [dict(result, provider_use="PASS"), dict(result, secret_value="PRIVATE-CANARY"),
+                                 dict(result, source="proposals"), dict(result, created_at="not-a-time"),
+                                 dict(result, kind=jev.ORG_PLAN_KIND), dict(result, target={**result["target"], "visibility": "all"})]
+                    for altered in mutations:
+                        refuse(lambda: jev.validate_org_receipt(altered))
+                else:
+                    try:
+                        jev.org_projection(envs_sha=source, auth_config=auth, identity=identity, apply=True, root=root, runner=runner)
+                    except jev.EnvsError as error:
+                        assert secret.decode() not in str(error) and "fixture-controller-token" not in str(error)
+                        assert world["writes"] == int(fault in ("write", "readback"))
+                        if fault in ("controller", "permission", "key-mode", "auth-mode", "source", "handoff", "already-slot"):
+                            assert world["loads"] == 0
+                    else:
+                        raise AssertionError("invalid Org setup state was accepted")
+
+
+def test_org_setup_cli_mode() -> None:
+    args = ["project-org-secret", "--envs-sha", "a" * 40,
+            "--auth-config", "/work/repos/.auth/roccho-dev/gh",
+            "--identity", "/work/repos/.auth/roccho-dev/age/oci-dev.key"]
+    for apply in (False, True):
+        calls = []
+        def fake(**kwargs):
+            calls.append(kwargs)
+            return {"kind": jev.ORG_PLAN_KIND, "projection": "NOT_RUN"}
+        with patch.object(jev, "org_projection", fake), patch("builtins.print"):
+            assert jev.main(args + (["--apply"] if apply else [])) == 0
+        assert len(calls) == 1 and calls[0]["apply"] is apply
+        assert calls[0]["auth_config"] == Path(args[4]) and calls[0]["identity"] == Path(args[6])
+
+
 def test_receipt_mutations() -> None:
     base = jev.build_receipt(
         envs_sha="a" * 40,
@@ -998,6 +1227,9 @@ def main() -> None:
         test_toolchain_red()
         test_decrypt_failure_has_no_provider_effect()
         test_receipt_mutations()
+        test_org_materialization_primitive()
+        test_org_setup_route()
+        test_org_setup_cli_mode()
         if args.sops is None:
             print("real OCI SOPS roundtrip: NOT RUN (the check workflow runs it with --sops and --age-keygen)")
         else:

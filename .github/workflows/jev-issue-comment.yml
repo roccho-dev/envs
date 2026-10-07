@@ -1,0 +1,22 @@
+name: Jev Issue comment evaluation
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  actions: read
+  contents: read
+  issues: write
+
+jobs:
+  evaluate:
+    if: >-
+      github.event.repository.owner.type == 'Organization' &&
+      github.repository == 'roccho-org/envs' &&
+      github.event.issue.number == 52 &&
+      github.event.comment.body == '/jev-evaluate' &&
+      github.event.issue.pull_request == null
+    uses: roccho-org/ops/.github/workflows/jev-issue-comment.yml@3ba9e1a9a7b6c7eb6ef8976e9f14e5e6e8b71953
+    secrets:
+      JEV_API_KEY: ${{ secrets.JEV_API_KEY }}
