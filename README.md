@@ -1,5 +1,46 @@
 # envs
 
+## GitHub Issue Actions: one Org Secret slot
+
+`jev-api.github-actions` binds the existing encrypted SOPS source to the single
+`roccho-org/JEV_API_KEY` Actions Org Secret, selected by the stable IDs of
+`roccho-org/ops` and `roccho-org/envs`. No Ops Repository or Environment Secret
+copy is produced. The existing Cloudflare/local bindings and authoring inputs
+are unchanged.
+
+The provided `envs-effect` entry has an owner-only setup command:
+
+```sh
+envs-effect --root <exact-source-checkout> project-org-secret \
+  --envs-sha <provided-source-sha> \
+  --auth-config /work/repos/.auth/roccho-dev/gh \
+  --identity /work/repos/.auth/roccho-dev/age/oci-dev.key
+```
+
+Without `--apply`, this performs authentication/Org identity/public-key reads
+only: no SOPS decryption, encryption, secret write or handoff. The output is a
+plan, never a projection receipt. Actual `--apply` needs an explicit effect
+grant. The controller must be the existing `roccho-dev` principal; private
+inputs must be owned regular files with mode0600 under mode0700 directories.
+The controller credential remains in the owner's native process, never CI.
+
+An applied operation uses SOPS plaintext only in the bounded process and gh
+encryption stdin, writes only the Org slot using selected repository IDs, and
+requires exact name/visibility/repository readback. Only then is
+`handoffs/dev-jev-api.github-actions.json` created. It binds the provided source,
+target and controller but explicitly records `provider_use: NOT_RUN`. A plan,
+CI PASS or that receipt is not evidence of a real Jev evaluation. Existing Org
+slot, handoff or unknown write/readback is reconciled, not replayed or overwritten.
+Setup needs an exclusive authorized writer; a metadata GET is not an atomic
+lock against another administrator.
+Rotation/revoke remains separately authorized: replacement real use must precede
+provider revocation; this command does not issue or revoke a Jev key.
+
+Normal evaluation runs on GitHub-hosted Actions and does not call, clone or wait
+for envs CI. OCI is used only for development and authorized setup, not as an
+application ingress or runtime dependency. Consumer admission, finite budget,
+same-Issue append/readback and first/next real evaluation are separate app gates.
+
 `envs` holds public environment contracts, performs bounded provider projection, and returns a non-secret exact-SHA handoff.
 
 - canonical branch: `proposals`

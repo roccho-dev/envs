@@ -316,7 +316,8 @@ def check_shape(root: Path) -> None:
     handoff_dir = root / "handoffs"
     if handoff_dir.exists():
         handoffs = sorted(path.relative_to(root).as_posix() for path in handoff_dir.rglob("*") if path.is_file())
-        require(handoffs == ["handoffs/dev-jev-api.json"], f"unexpected handoffs: {handoffs}")
+        require(bool(handoffs) and set(handoffs) <= {"handoffs/dev-jev-api.json", "handoffs/dev-jev-api.github-actions.json"},
+                f"unexpected handoffs: {handoffs}")
 
 
 def check_probe_config(text: str) -> None:
@@ -815,6 +816,8 @@ def inspect(root: Path = ROOT, *, verify_main_compatibility_refresh: bool = Fals
     environments = contracts["environments"]
     if (root / adapter.HANDOFF).is_file():
         adapter.load_receipt(root / adapter.HANDOFF)
+    if (root / adapter.ORG_HANDOFF).is_file():
+        adapter.validate_org_receipt(json.loads((root / adapter.ORG_HANDOFF).read_text(encoding="utf-8")))
     check_workflows(root, environments, author_target_inputs(adapter, contracts), adapter)
     check_toolchain(root, adapter)
     check_placement(root)
