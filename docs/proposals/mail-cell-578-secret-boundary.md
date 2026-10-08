@@ -1,116 +1,101 @@
-# 🔐 Mail Cell — envs / Org Secret / runtime binding（設計案）
+# 🔐 Mail Cell — envs既存投影の再利用（設定追加は差分だけ）
 
-Ref: [ADRS #578](https://github.com/roccho-dev/adrs/issues/578) / [apps PR #80](https://github.com/roccho-dev/apps/pull/80) / [ADRS #443](https://github.com/roccho-dev/adrs/issues/443) / [ADRS #547](https://github.com/roccho-dev/adrs/issues/547)
+Ref: [ADRS #578](https://github.com/roccho-dev/adrs/issues/578) / [ADRS #443](https://github.com/roccho-dev/adrs/issues/443) / [ADRS #386](https://github.com/roccho-dev/adrs/issues/386) / [ADRS #547](https://github.com/roccho-dev/adrs/issues/547) / [apps PR #80](https://github.com/roccho-dev/apps/pull/80) / [ops PR #509](https://github.com/roccho-org/ops/pull/509)
 
-状態: **PROPOSAL / non-binding documentation only**。secret値、SOPS ciphertext、GitHub Org Secret、Cloudflare runtime secret、OAuthアプリ、DNSは**作成/変更しない**。実際の値・target・権限は別途承認し、元となる`contracts/environments.jsonl` / `contracts/bindings.jsonl`へ採用・投影する。
+**状態: PROPOSAL / docs-only**。秘密値、Org Secret、Cloudflare runtime、Google OAuth、契約本体、IaC、製品実装・送信は変更しない。
 
-## 🎯 契約上の位置づけ
+## 🎯 結論：製品ごとのSecret設定を復活させない
 
-- `roccho-org/envs`：credential意味・ライフサイクル・選択先・暗号化正本・handoffを管理。
-- `roccho-org` **GitHub Actions Org Secret**：信頼済みorg所有workflowへ、必要な時だけ物理投影する**target slot**。ここ自体を二重の秘密正本としない。
-- Cloudflare Worker/Pages secret：**実行時target slot**。Org Secretを自動的に読めるわけではない。明示的なenvs投影が必要。
-- `roccho-dev/apps`：個人所有repoなので**roccho-orgのOrg Secretを直接読めない**。アプリのproduct source / public artifactにはcredentialsを含めない。
-- R2：Worker R2 bindingを使うならruntimeのS3 Access Keyは要らない。別のR2 API tokenを新造しない。
-- Gmailの下書き：OAuthの`gmail.compose`等は送信可能な強い権限を含む。**draft-only OAuth scopeの存在を仮定しない**。credentialはAgentから隔離し、選択したAPI操作だけをWorkerが実行できるようにする。
+既存の `envs` は認証・Bindingの**唯一の管理元**であり、`ops/apps` が同じ秘密・target・required inputを毎回書き直す必要はない。consumerの通常実行はenvs checkout / workflow / SOPS / age を要求しない。目的は「**新しい認証情報の初回取得までゼロ**」ではなく「**既にある設定の二重宣言・配布・毎回の手動介入をゼロ**」にすること。
 
-## 🔑 必要入力・候補の最小表
+| 既存実体 | 状態と保証の範囲 |
+|---|---|
+| [ADRS #443](https://github.com/roccho-dev/adrs/issues/443) | consumer → 内部capability、envs → target native slot → provider boundary。provider credentialをconsumerへ配らない |
+| [envs PR #48](https://github.com/roccho-org/envs/pull/48) | **MERGED**：既存`contracts/bindings.jsonl`・`provider-consumer.jsonl`からpublic provision factsを自動投影。**新しいprovider secretを自動で実配置する機能ではない** |
+| [ops PR #494](https://github.com/roccho-org/ops/pull/494) | **MERGED**：requirementとprovision/evidenceの差分検出。実provider READYの保証ではない |
+| [envs PR #54](https://github.com/roccho-org/envs/pull/54) | **MERGED**：JEV_API_KEYのSOPS→roccho-org Org Secretへの**1件の実投影・native readback**。Ops repo/Environmentへの複製ゼロ。Jev consumer real useは別証拠で`NOT_RUN` |
+| [envs PR #57](https://github.com/roccho-org/envs/pull/57) | **OPEN**：Go source authoring向け差分。CI成功だが未merge/未実secret effect |
 
-| 入力名（提案） | 種別 | 置き場所と利用者 | 時点 / 条件 |
-|---|---|---|---|
-| `MAIL_GMAIL_OAUTH_CLIENT_ID` | 非秘密variable | envs binding → 対象Google OAuth client | Gmail API利用時 |
-| `MAIL_GMAIL_OAUTH_CLIENT_SECRET` | secret | envs source → 必要なauthor/projection → Cloudflare runtime secret | confidential OAuth clientを採用した時 |
-| `MAIL_GMAIL_OAUTH_REFRESH_TOKEN` | secret | envs source → Cloudflare runtime secret（Gmail adapterのみ） | 初回OAuth同意後、draft/読み書き利用時 |
-| `MAIL_SEND_PROVIDER_API_KEY` | secret / **条件付き** | envs source → 選択した送信Provider runtime | 別のSMTP/API providerにkeyが必要な時だけ |
-| `CLOUDFLARE_API_TOKEN` | 既存のsecret名 | 既存envs author/projection plane | Cloudflare設定/API作用が必要な時。利用scopeを検証し安易に複製しない |
-| `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_ZONE_ID` | 非秘密variable | envs binding → provisioning | 対象アカウント/zoneを選択 |
-| `MAIL_DOMAIN` / `MAIL_R2_BUCKET` | 非秘密variable | envs binding → Worker config | domain/bucketの選択 |
-| `MAIL_FORWARD_TO` | 宛先config（要アクセス制御） | envs binding → Email Routing | Gmail宛を認証済み転送先として登録した後 |
-| `MAIL_APPROVER_ID` / `MAIL_ACCESS_AUD` | 非秘密ID | envs binding → 承認ゲート | Access等の認証済みsubjectとaudienceを検証 |
+以上の既存機能を呼ぶ。mail専用の第2のenvs provider、共通configフレームワーク、新しいSecret台帳を作らない。
 
-**不要な物理secret**：`R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`（Worker-native R2 bindingの場合）、`MAIL_MANUAL_SEND_PASSWORD`（既存認証/認可を利用する場合）。Google Workspace契約も必須ではない。
-
-## 🏢 Org Secret と Worker の区別
-
-| Target | 可否 | 期待状態 |
-|---|---|---|
-| `roccho-org/envs`のActions | Org Secret利用可能（selected repositoriesが必要） | author/projection時だけ |
-| `roccho-org/ops`のActions | Org Secret利用可能（selected repositoriesが必要） | 本当にworkflowで必要な時だけ |
-| `roccho-dev/apps`のActions | **roccho-org Org Secretは利用不可** | secret-free build／artifact |
-| Cloudflare Worker runtime | Org Secretを直接利用不可 | envsから必要なruntime secretへ投影 |
-| Agent / browser client | refresh token / provider keyを配布しない | capability経由のみ |
-
-`Org Secret` は常時必須ではない。信頼済みActionsが本当に秘密を使う場合のみ作成し、**単にappsへ実行時credentialを置くために全repoへ配布しない**。既存 [envs#52](https://github.com/roccho-org/envs/issues/52) のJeV固有経路をmail一般化の口実にしない。
-
-## 🌳 envs側の予定tree（今は追加しない）
+## 🌳 変更対象の正しいtree
 
 ```text
 roccho-org/envs/
 ├─ contracts/
-│  ├─ bindings.jsonl       # mail capability・selected target・providerを追加する候補
-│  ├─ environments.jsonl   # stage別required input name/type/lifecycle候補
-│  ├─ provider-consumer.jsonl  # apps/sourceとenvs/effectの禁止依存
-│  └─ targets.jsonl        # Workerのbinding / selected runtime target
-├─ ciphertexts/            # 初回承認後に作るSOPS暗号文だけ
-├─ adapters/               # 既存author/projection/readbackを再利用（別実装は原則不要）
-├─ handoffs/               # providerへ本当に投影・読戻し成功した場合だけ
-└─ checks/                 # 入力/target検査・秘密値を含まない負のテスト
+│  ├─ bindings.jsonl           # 新capability/targetが本当に不足した場合の差分行
+│  ├─ environments.jsonl       # 初回入力が本当に必要な場合の差分行
+│  └─ provider-consumer.jsonl  # 所有/禁止依存が実際に不足する場合の差分行
+├─ adapters/                  # 既存 author / projection / readback を優先再利用
+├─ ciphertexts/               # 未保有credentialを許可後に暗号化した場合のみ
+└─ handoffs/                  # 実体へのeffect＋readbackを経た非秘密証拠のみ
 ```
 
-## 🔄 Secret投影のデータフロー
+**追加するdocs・schema・汎用runnerは0候補から開始**。このPRのdocsは討議を置くための例外であり、新しい設定SSOTではない。既存sourceで表現できるなら追加も不要。mail用の秘密名を10個固定する、`MAIL_*`行を先に全件作る、といった設計は採用しない。
+
+## 📬 Mail Cellで必要になり得る「新規分」だけ
+
+| 対象 | 既存の再利用先 | 初回追加が必要となる条件 |
+|---|---|---|
+| 🔥 Worker → R2 | Cloudflare Workerの**R2 binding**、opsの既存配置/設定 | bucket・bindingがまだ存在しない時。**R2 Access Keyは通常不要** |
+| 📨 Email Routing / 独自ドメイン | ops側の既存Cloudflare設定/IaC・envsの既存認証 | MX/route/転送先が未作成・未認証の時。転送先Gmail認証は初回の人間確認 |
+| ❄️ Gmail Draft/Cold | provider boundaryのGmail API＋envs secret authority | Gmailを直接Workerから操作する場合、Google OAuthアプリ・権限・本人同意・継続tokenの新規取得が必要。**ChatGPT接続Gmailの認証をWorkerへ流用できる前提にしない** |
+| 🚀 独自ドメイン送信 | opsの交換可能な送信provider boundary | 対象providerが新しいcredentialを要求する時だけenvsで1つの新capability/source/targetを登録。Cloudflare Email Sendingの通常メールへの適合は先に確認 |
+| ✅ 送信承認 | appsの本人認証＋承認ゲート | 既存Identityを使う。権限・信頼できるactorの不足が確認されるまで独自の承認パスワードを作らない |
+
+Google OAuthの`gmail.compose`等は送信可能な権限を含みうる。Agentとbrowserに渡すのは内部capabilityのみ。Secret投影の新しいtarget adapterが必要かは、現在の実sourceで検査して不足した対象**だけ**対応する。envs PR #48のpublic projectionや #54の**Jev専用** Org Secret bootstrapが、新しいGmail Worker OAuthの物理投影まで実装済みであるとは**主張しない**。
+
+## 🏗️ 二つのフロー（データエッジ付き）
 
 ```mermaid
 flowchart TB
-  subgraph Owner["👤 Owner / Secret Authority"]
-    Consent["🔑 Google OAuth<br/>初回承認・同意"]
-    SecretSource["🔐 envs<br/>暗号化正本・名前/target"]
+  subgraph Authority["🔐 envs：既存SSOT・投影"]
+    Contract["既存契約<br/>bindings / consumer / target"]
+    Source["既存暗号化正本<br/>＋必要時のみ新認証"]
+    Projection["既存projection/readback<br/>未対応targetのみ差分実装"]
+    Contract -->|"必要capability / target"| Projection
+    Source -->|"認可済みcredential"| Projection
   end
-  subgraph Control["🏢 信頼済みauthor / projection"]
-    OrgSlot["GitHub Org Secret<br/>selected org reposのみ"]
-    Projector["envs: 権限検査・最小投影・readback"]
+  subgraph Runtime["⚙️ ops：provider境界"]
+    Native["☁️ Worker native secret slot / R2 binding"]
+    Provider["📮 Gmail / 送信Provider adapter"]
+    Receipt["🧾 実投影 / effectの非秘密readback"]
+    Native -->|"実行時credential / binding"| Provider
+    Provider -->|"作用結果 / source identity"| Receipt
   end
-  subgraph Runtime["☁️ Cloudflare runtime"]
-    GmailWorker["📮 Gmail adapter<br/>OAuth token"]
-    SenderWorker["✉️ Sender adapter<br/>Provider credential"]
-    R2Native["🔥 R2 binding<br/>追加API keyなし"]
+  subgraph Consumer["🖥️ apps：通常利用"]
+    UI["確認・承認UI"]
+    Intent["内部capability / approved intent"]
+    UI -->|"固定版の人間承認"| Intent
   end
-  subgraph Client["🚫 非秘密consumer"]
-    App["🖥️ apps artifact"]
-    Agent["🤖 Agent"]
-  end
-  Consent -->|"refresh tokenを安全に受領"| SecretSource
-  SecretSource -->|"選択されたターゲット情報"| Projector
-  SecretSource -.->|"Actionsで必要な時のみ"| OrgSlot
-  OrgSlot -.->|"selected trusted workflowのみ"| Projector
-  Projector -->|"runtime secret projection"| GmailWorker
-  Projector -->|"provider別必要時"| SenderWorker
-  Projector -->|"binding名と対象"| R2Native
-  App -->|"認証済みAPI要求"| GmailWorker
-  Agent -->|"draft intentのみ"| App
+  Projection -->|"必要時のみ初回投影"| Native
+  Projection -->|"対象 / source SHA / target観測"| Receipt
+  Intent -->|"secret-free API request"| Provider
 ```
 
-## 🚫 絶対に通してはいけない10件
+**禁止エッジ**：apps/Agent/browser → provider credential、consumer通常実行 → envs CI/SOPS、org secret → 異なるorgのrepo、`secret-name`存在のみ → provider PASS。
 
-1. `roccho-dev/apps`に`roccho-org` Org Secretを配ったつもりになる。
-2. OAuth refresh tokenをpublic repo、PR、CIログ、`envs`平文へ書く。
-3. `MAIL_GMAIL_OAUTH_CLIENT_SECRET`が不要なOAuth clientなのに強制する。
-4. AgentがOAuth credentialやSend provider tokenを直接取得する。
-5. `gmail.compose`を下書きだけ送信可能と誤解する。
-6. Cloudflare Worker runtimeがGitHub Org Secretを直接読めると誤解する。
-7. providerのスコープ・target未確認で同一Org Secretを全repoへ公開する。
-8. 必要なR2 bindingがあるのにS3型R2 keyを重複投入する。
-9. 前回投影のreadbackなしにsuccess・secret readyを名乗る。
-10. Secretの名前が一致しただけで実Gmail/Cloudflare利用をPASS扱いする。
-11. Gmail転送先の未認証時に稼働完了と主張する。
-12. 認証済み本人以外の承認APIアクセスを許す。
-13. secretのローテーションで以前の権限を広げる。
-14. Cloudflare Email Sendingの適用条件未確認で送信Providerを固定する。
+## ⚠️ 破綻ケース・採用ゲート
 
-## ✅ 実装・採択の順序
+1. 既存のCloudflare認証を使えるのにmail専用tokenを追加する → 却下。
+2. Providerに新しいcredentialが必要なのに「設定0」と扱う → 却下。
+3. `roccho-org` Org Secretを`roccho-dev/apps`が直接読む想定 → 却下。
+4. Org SecretをCloudflare runtime secretと同一視 → 却下。
+5. OAuthの初回本人同意をCIが自動代行できるとみなす → 却下。
+6. GmailのChatGPT接続認証をWorkerへ流用する → 却下。
+7. AgentへGmail送信可能tokenを渡す → 却下。
+8. R2 Worker bindingがあるのにS3 access keyを追加 → 却下。
+9. Cloudflare Sending一般返信用途の適合を未検証で固定 → 却下。
+10. source-only CI合格やSecret slot presenceをProvider利用成功へ昇格 → 却下。
+11. secretをopsのRepo/Environmentへ複製してOrg側と二重正本化 → 却下。
+12. consumerを1つ追加するたびsecret source/targetを複製 → 却下。
 
-1. ADRS #578 と apps PR #80 の意味境界（特に人間承認と送信）をレビュー。
-2. 公開の`contracts/`に **名前 / 種類 / lifecycle / selected target** を追加（別途承認）。
-3. Google OAuth clientと転送先認証、Providerの用途・認可をOwnerが準備（別途承認）。
-4. 必要な時だけSOPS暗号化正本→target native secretへ投影、name-only readback。
-5. アプリのdraft→固定版→承認→送信→receiptを実環境で検証。
+## ✅ 次の正しい実装手順
 
-このPRでは **手順1の設計記録のみ**。配布・秘密値設定・外部送信・merge/production cutover・Google OAuth client作成のGOなし。
+1. Mailが利用する**既存 capability / environment / binding / provider adapter**をreadbackし、再利用できるものを差し引く。
+2. 未保有の**credentialの初回発行・Google同意**と、未作成の**実行先**だけを列挙。存在しない新規分以外は変更しない。
+3. 現在のenvs source shapeで不足する対象だけ、既存契約へ最小行を追加し、既存projection/readback入口で実行可能か検証する。
+4. 要求（ops）↔提供（envs）↔receiptを既存差分機構で照合。新しい比較器を作らない。
+5. 真のprovider effect・独立consumer実行・承認した送信内容をreadbackして初めてREADY。
+
+**このPRは経路の訂正のみ。** Secret作成・credential配布・実送信・merge・本番構成の変更は行わない。
