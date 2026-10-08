@@ -125,8 +125,14 @@ STATE_TRANSIENT = re.compile(rb"(?<![-\w])timeout|timed out|connection (?:refuse
 OCI_BINDING = "jev-api.oci-dev"
 OCI_CIPHERTEXT = Path("ciphertexts/dev-jev-api.oci-dev.sops.yaml")
 OCI_RECIPIENT = "OCI_DEV_AGE_RECIPIENT"
+# Go uses a distinct source plane on the existing dev-authoring Environment. Only the named recipient is shared;
+# Jev and Go secrets never cross selected author steps, tool environments, ciphertexts, or target kinds.
+GO_PLANE = "dev.opencode-go-authoring"
+GO_BINDING = "opencode-go.oci-dev"
+GO_CIPHERTEXT = Path("ciphertexts/dev-opencode-go.oci-dev.sops.yaml")
+GO_KEY = "OPENCODE_API_KEY"
 # Every binding `author --target` can select; a dispatch names exactly one of them.
-AUTHOR_TARGETS = ("jev-api", OCI_BINDING)
+AUTHOR_TARGETS = ("jev-api", OCI_BINDING, GO_BINDING)
 ORG_BINDING = "jev-api.github-actions"
 ORG_HANDOFF = Path("handoffs/dev-jev-api.github-actions.json")
 ORG_RECEIPT_KIND = "envs.orgSecretProjectionReceipt.v1"
@@ -273,6 +279,16 @@ def expected_bindings(jev_target: dict[str, Any] | None = None) -> dict[str, dic
             "github_environment": "dev-authoring",
             "required_variables": [{"name": OCI_RECIPIENT, "type": "age_recipient", "lifecycle": "persistent"}],
             "target": {"repository": "roccho-dev/windows", "host": "oci-dev", "kind": "process_env", "secret_name": "JEV_API_KEY"},
+        },
+        GO_BINDING: {
+            "id": GO_BINDING,
+            "kind": "envs.authCapability.v1",
+            "capability": "opencode-go",
+            "ciphertext": GO_CIPHERTEXT.as_posix(),
+            "source_key": GO_KEY,
+            "github_environment": "dev-authoring",
+            "required_variables": [{"name": OCI_RECIPIENT, "type": "age_recipient", "lifecycle": "persistent"}],
+            "target": {"repository": "roccho-dev/windows", "host": "oci-dev", "kind": "pi_auth_command"},
         },
         ORG_BINDING: {
             "id": ORG_BINDING, "kind": "envs.authCapability.v1", "capability": "jev-api",
@@ -428,6 +444,23 @@ def expected_oci_boundary() -> dict[str, Any]:
     }
 
 
+def expected_go_boundary() -> dict[str, Any]:
+    return {
+        "id": "dev.opencode-go-oci-dev.provider",
+        "kind": "envs.providerConsumerBoundary.v1",
+        "role": "provider",
+        "repository": "roccho-org/envs",
+        "stage": "dev",
+        "capability": "opencode-go",
+        "binding": GO_BINDING,
+        "source_kind": "ephemeral_ingress",
+        "target_kind": "public_sops",
+        "owns": ["contract", "target_selected_authoring", "single_recipient_encryption", "ciphertext_handoff_pr"],
+        "does_not_own": ["target_apply", "target_age_identity", "application_runtime_acceptance", "deployment"],
+        "handoff_ref_kind": "exact_commit_sha",
+    }
+
+
 def expected_inputs() -> dict[str, dict[str, list[dict[str, str]]]]:
     def entries(*values: tuple[str, str, str]) -> list[dict[str, str]]:
         return [{"name": name, "type": kind, "lifecycle": lifecycle} for name, kind, lifecycle in values]
@@ -445,6 +478,10 @@ def expected_inputs() -> dict[str, dict[str, list[dict[str, str]]]]:
         "dev.authoring": {
             "required_secrets": entries(("JEV_API_KEY", "opaque", "one_shot_ingress")),
             "required_variables": entries(("SOPS_AGE_RECIPIENTS", "age_recipient_list", "persistent")),
+        },
+        GO_PLANE: {
+            "required_secrets": entries((GO_KEY, "opaque", "one_shot_ingress")),
+            "required_variables": entries((OCI_RECIPIENT, "age_recipient", "persistent")),
         },
         "dev.projection": {
             "required_secrets": entries(
@@ -537,13 +574,18 @@ def validate_contracts(root: Path = ROOT) -> dict[str, dict[str, dict[str, Any]]
     boundary = index(root / BOUNDARY)
 
     require(set(envs) == {
-        "dev.authoring", "dev.projection", "dev.runtime", RENT_PLANE, CLIENT_PLANE, ROOT_PLANE, PROBE_PLANE, STATE_PLANE,
+        "dev.authoring", GO_PLANE, "dev.projection", "dev.runtime", RENT_PLANE, CLIENT_PLANE, ROOT_PLANE, PROBE_PLANE, STATE_PLANE,
         LINODE_READ_PLANE,
         "stg.projection", "stg.runtime", "prd.projection", "prd.runtime",
         "voice-ui.dev", "voice-ui.stg", "voice-ui.prd",
     }, "environment set differs")
 
     require(envs["dev.authoring"]["github_environment"] == "dev-authoring", "dev authoring Environment differs")
+    go_plane = envs[GO_PLANE]
+    require(go_plane["github_environment"] == "dev-authoring" and go_plane["owner"] == "envs"
+            and go_plane["source_kind"] == "ephemeral_ingress" and go_plane["target_kind"] == "public_sops"
+            and go_plane["active_github_environment"] is None and go_plane["migration_state"] == "NOT_CONFIGURED",
+            "Go source-only authoring plane differs")
     rent = envs[RENT_PLANE]
     require(rent["github_environment"] == "dev-rent-tunnel" and rent["owner"] == "envs"
             and rent["source_kind"] == "provider_issued" and rent["target_kind"] == "public_sops",
@@ -647,6 +689,9 @@ def validate_contracts(root: Path = ROOT) -> dict[str, dict[str, dict[str, Any]]
     oci_cipher = root / OCI_CIPHERTEXT
     if oci_cipher.is_file():
         validate_oci_ciphertext(oci_cipher.read_bytes(), None, None)
+    go_cipher = root / GO_CIPHERTEXT
+    if go_cipher.is_file():
+        validate_oci_ciphertext(go_cipher.read_bytes(), None, None, key=GO_KEY)
 
     jev_target = validate_jev_target(bindings.get("jev-api", {}).get("target"))
     require(bindings == expected_bindings(jev_target), "binding set differs")
@@ -654,6 +699,7 @@ def validate_contracts(root: Path = ROOT) -> dict[str, dict[str, dict[str, Any]]
         "repository.branch-policy", "dev.jev-api.provider", "dev.rent-tunnel.provider", "dev.rent-access-probe.provider",
         "dev.rent-state-proof.provider", "dev.jev-api-oci-dev.provider", "apps.voice-ui.consumer", "ops.voice-ui.consumer",
         "normal.consumer.path", "dev.rent-client.provider", "dev.rent-root.provider", WINDOWS_CONSUMER,
+        "dev.opencode-go-oci-dev.provider",
     } | set(expected_org_boundaries()), "provider-consumer boundary set differs")
     for identity, expected in expected_org_boundaries().items():
         require(boundary[identity] == expected, "Org provider-consumer boundary differs")
@@ -666,6 +712,8 @@ def validate_contracts(root: Path = ROOT) -> dict[str, dict[str, dict[str, Any]]
     require(boundary["dev.rent-access-probe.provider"] == expected_probe_boundary(), "access probe provider boundary differs")
     require(boundary["dev.rent-state-proof.provider"] == expected_state_boundary(), "state proof provider boundary differs")
     require(boundary["dev.jev-api-oci-dev.provider"] == expected_oci_boundary(), "OCI dev provider boundary differs")
+    require(boundary["dev.opencode-go-oci-dev.provider"] == expected_go_boundary(),
+            "OpenCode Go provider boundary differs")
     require(boundary["repository.branch-policy"] == {
         "id": "repository.branch-policy", "kind": "envs.branchPolicy.v1",
         "canonical_branch": "proposals", "default_branch": "proposals",
@@ -728,11 +776,13 @@ def validate_client_ciphertext(data: bytes, values: Sequence[bytes] | None, reci
     require(set(re.findall(r"(?m)^([^\s#][^:]*):", text)) == {*CLIENT_KEYS, "sops"}, "rent client ciphertext fields differ")
 
 
-def validate_oci_ciphertext(data: bytes, secret: bytes | None, recipient: str | None) -> None:
-    validate_ciphertext(data, secret, None if recipient is None else [recipient])
+def validate_oci_ciphertext(data: bytes, secret: bytes | None, recipient: str | None,
+                            key: str = "JEV_API_KEY") -> None:
+    require(key in {"JEV_API_KEY", GO_KEY}, "OCI dev ciphertext key unsupported")
+    validate_ciphertext(data, secret, None if recipient is None else [recipient], key=key)
     text = data.decode("utf-8", errors="strict")
     require(len(RECIPIENT_METADATA.findall(text)) == 1, "OCI dev ciphertext must have exactly one recipient")
-    require(set(re.findall(r"(?m)^([^\s#][^:]*):", text)) == {"JEV_API_KEY", "sops"}, "OCI dev ciphertext fields differ")
+    require(set(re.findall(r"(?m)^([^\s#][^:]*):", text)) == {key, "sops"}, "OCI dev ciphertext fields differ")
 
 
 def repository_files(root: Path) -> list[Path]:
@@ -751,7 +801,8 @@ def reject_live_values(root: Path, name: str, values: list[str],
     for path in repository_files(root):
         relative = path.relative_to(root).as_posix()
         data = path.read_bytes()
-        if relative in {CIPHERTEXT.as_posix(), RENT_CIPHERTEXT.as_posix(), CLIENT_CIPHERTEXT.as_posix(), OCI_CIPHERTEXT.as_posix()}:
+        if relative in {CIPHERTEXT.as_posix(), RENT_CIPHERTEXT.as_posix(), CLIENT_CIPHERTEXT.as_posix(),
+                        OCI_CIPHERTEXT.as_posix(), GO_CIPHERTEXT.as_posix()}:
             data = without_recipient_metadata(data.decode("utf-8", errors="replace")).encode()
         for value in values:
             if value.encode() in data:
@@ -879,10 +930,10 @@ def author(root: Path = ROOT, runner: Runner = default_runner) -> dict[str, Any]
 
 
 def authoring_inputs(contracts: dict[str, dict[str, dict[str, Any]]], target: str) -> list[dict[str, str]]:
-    # The Environment inputs one author target reads. The Cloudflare target reads its plane's own; the OCI target
-    # reads the plane's source secret plus the recipient its binding declares. Neither reads the other's recipient.
+    # A selected author target reads only its own source plane and recipient. The GitHub Environment
+    # can be shared without leaking one source key into another target's process environment.
     require(target in AUTHOR_TARGETS, f"unknown author target: {target}")
-    plane = contracts["environments"]["dev.authoring"]
+    plane = contracts["environments"]["dev.authoring" if target != GO_BINDING else GO_PLANE]
     if target == "jev-api":
         return plane["required_secrets"] + plane["required_variables"]
     binding = contracts["bindings"][target]
@@ -892,11 +943,13 @@ def authoring_inputs(contracts: dict[str, dict[str, dict[str, Any]]], target: st
     return source + binding["required_variables"]
 
 
-def encrypt_oci_key(source: str, recipient: str, tools: Mapping[str, str], runner: Runner = default_runner) -> bytes:
-    # The key reaches SOPS on stdin only; the ciphertext must name exactly this one recipient.
+def encrypt_oci_key(source: str, recipient: str, tools: Mapping[str, str], runner: Runner = default_runner,
+                    key: str = "JEV_API_KEY") -> bytes:
+    # The selected key reaches SOPS on stdin only; the ciphertext must name exactly one recipient and source field.
+    require(key in {"JEV_API_KEY", GO_KEY}, "OCI dev source field unsupported")
     require(AGE_RECIPIENT.fullmatch(recipient) is not None, "OCI dev target needs exactly one age recipient")
     require(source != "", "OCI dev source key is empty")
-    payload = json.dumps({"JEV_API_KEY": source}, separators=(",", ":")).encode() + b"\n"
+    payload = json.dumps({key: source}, separators=(",", ":")).encode() + b"\n"
     result = run_checked(
         [tools["sops"], "--encrypt", "--input-type", "json", "--output-type", "yaml", "/dev/stdin"],
         input_data=payload,
@@ -904,32 +957,37 @@ def encrypt_oci_key(source: str, recipient: str, tools: Mapping[str, str], runne
         runner=runner,
         label="SOPS encryption",
     )
-    validate_oci_ciphertext(result.stdout, source.encode(), recipient)
+    validate_oci_ciphertext(result.stdout, source.encode(), recipient, key=key)
     return result.stdout
 
 
-def author_oci(root: Path = ROOT, runner: Runner = default_runner) -> dict[str, Any]:
-    # Writes only the OCI ciphertext: no plane state, no handoff, no other target's file.
+def author_oci(root: Path = ROOT, runner: Runner = default_runner, target: str = OCI_BINDING) -> dict[str, Any]:
+    # Writes only the selected OCI ciphertext: no plane state, handoff or other target's file.
+    require(target in (OCI_BINDING, GO_BINDING), "OCI author target not declared")
     contracts = validate_contracts(root)
     tools = toolchain(root)
+    binding = contracts["bindings"][target]
+    source_key = binding["source_key"]
     values: dict[str, str] = {}
-    for entry in authoring_inputs(contracts, OCI_BINDING):
+    for entry in authoring_inputs(contracts, target):
         name, kind = entry["name"], entry["type"]
         value = os.environ.get(name, "")
-        require(value != "", f"{OCI_BINDING}: {name} is missing")
-        require(INPUT_TYPES[kind](value), f"{OCI_BINDING}: {name} is not a valid {kind}")
+        require(value != "", f"{target}: {name} is missing")
+        require(INPUT_TYPES[kind](value), f"{target}: {name} is not a valid {kind}")
         values[name] = value
     # Secret and Variable alike: a value already in Git is RED before SOPS runs.
     reject_live_values(root, OCI_RECIPIENT, [values[OCI_RECIPIENT]])
-    reject_live_values(root, "JEV_API_KEY", [values["JEV_API_KEY"]])
-    data = encrypt_oci_key(values["JEV_API_KEY"], values[OCI_RECIPIENT], tools, runner)
-    target = root / OCI_CIPHERTEXT
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(data)
+    reject_live_values(root, source_key, [values[source_key]])
+    data = encrypt_oci_key(values[source_key], values[OCI_RECIPIENT], tools, runner, key=source_key)
+    ciphertext_path = OCI_CIPHERTEXT if target == OCI_BINDING else GO_CIPHERTEXT
+    require(binding["ciphertext"] == ciphertext_path.as_posix(), "selected ciphertext differs")
+    output = root / ciphertext_path
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_bytes(data)
     validate_contracts(root)
     return {
-        "kind": "envs.targetAuthoringResult.v1", "status": "PASS", "binding": OCI_BINDING,
-        "ciphertext": OCI_CIPHERTEXT.as_posix(), "recipient_count": 1,
+        "kind": "envs.targetAuthoringResult.v1", "status": "PASS", "binding": target,
+        "ciphertext": ciphertext_path.as_posix(), "recipient_count": 1,
         "target_apply": "NOT_RUN", "application_runtime": "NOT_RUN",
     }
 
@@ -2723,7 +2781,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                                     identity=args.identity, apply=args.apply, root=root)
             print(json.dumps(result, indent=2, sort_keys=True))
         elif args.command == "author":
-            result = author(root) if args.target == "jev-api" else author_oci(root)
+            result = author(root) if args.target == "jev-api" else author_oci(root, target=args.target)
             print(json.dumps(result, indent=2, sort_keys=True))
         elif args.command == "rent-tunnel":
             print(json.dumps(rent_author(root), indent=2, sort_keys=True))

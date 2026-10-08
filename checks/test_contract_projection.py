@@ -53,6 +53,54 @@ class ProjectionTests(unittest.TestCase):
         self.assertNotIn("receipt", result)
         self.assertNotIn("verified", result)
 
+    def test_pi_auth_command_is_a_closed_public_shape_not_a_selected_projection(self):
+        b, c, selection = fixture()
+        original = run(b, c, selection)
+        go = next(row for row in (json.loads(line) for line in
+                  (ROOT / "contracts/bindings.jsonl").read_text().splitlines() if line)
+                  if row["id"] == "opencode-go.oci-dev")
+        expected_target = {"repository": "roccho-dev/windows", "host": "oci-dev", "kind": "pi_auth_command"}
+        self.assertEqual(go["target"], expected_target)
+        b.append(go)
+        unselected = run(b, c, selection)
+        self.assertEqual(unselected["rows"], original["rows"], "Go must not masquerade as a Jev output")
+        self.assertNotEqual(unselected["source"]["digest"], original["source"]["digest"],
+                            "unselected Go row must participate in the public source digest")
+        self.assertEqual(unselected, run(list(reversed(b)), c, selection))
+        changed = copy.deepcopy(b)
+        changed[1]["capability"] = "different-public-capability"
+        self.assertNotEqual(run(changed, c, selection)["source"]["digest"], unselected["source"]["digest"])
+
+        # Knowing a public target kind does not authorize executing or projecting its secret.
+        selected = copy.deepcopy(selection)
+        selected["obligations"][0]["binding"] = "opencode-go.oci-dev"
+        consumer = copy.deepcopy(c)
+        consumer[0]["capability"] = "opencode-go"
+        with self.assertRaisesRegex(ValueError, "target projection unsupported"):
+            run(b, consumer, selected)
+
+        # The whole digest domain must reject wrong kind, extra keys, malformed and foreign target identities
+        # before digest(), even when the Go row is not selected.
+        mutations = (
+            lambda t: t.update(kind="process_env"),
+            lambda t: t.update(kind="pi_auth_command_other"),
+            lambda t: t.update(secret_name="OPENCODE_API_KEY"),
+            lambda t: t.update(api_key="PRIVATE-CANARY"),
+            lambda t: t.update(repository="other/windows"),
+            lambda t: t.update(host="other-host"),
+            lambda t: t.update(repository=42),
+        )
+        for index, mutate in enumerate(mutations):
+            with self.subTest(case=index):
+                bad = copy.deepcopy(b)
+                mutate(bad[1]["target"])
+                with patch.object(module, "digest") as hash_call:
+                    with self.assertRaises(ValueError) as failure:
+                        run(bad, c, selection)
+                    hash_call.assert_not_called()
+                self.assertNotIn("PRIVATE-CANARY", str(failure.exception))
+
+
     def test_pages_is_not_workers_and_no_plaintext_read(self):
         result = run(*fixture())
         self.assertEqual(result["rows"][0]["contract"]["target"],

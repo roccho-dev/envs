@@ -10,6 +10,7 @@ on:
         options:
           - jev-api
           - jev-api.oci-dev
+          - opencode-go.oci-dev
 
 permissions:
   actions: read
@@ -22,7 +23,7 @@ concurrency:
 
 jobs:
   author:
-    if: github.repository == 'roccho-dev/envs' && github.ref_name == 'proposals'
+    if: github.repository == 'roccho-org/envs' && github.ref_name == 'proposals'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     environment: dev-authoring
@@ -86,6 +87,13 @@ jobs:
           JEV_API_KEY: ${{ secrets.JEV_API_KEY }}
           OCI_DEV_AGE_RECIPIENT: ${{ vars.OCI_DEV_AGE_RECIPIENT }}
         run: '"$ENVS_EFFECT_BIN/envs-effect" --root "$GITHUB_WORKSPACE" author --target jev-api.oci-dev'
+
+      - name: Author OpenCode Go OCI dev ciphertext
+        if: inputs.target == 'opencode-go.oci-dev'
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          OCI_DEV_AGE_RECIPIENT: ${{ vars.OCI_DEV_AGE_RECIPIENT }}
+        run: '"$ENVS_EFFECT_BIN/envs-effect" --root "$GITHUB_WORKSPACE" author --target opencode-go.oci-dev'
 
       - name: Verify candidate tree
         run: '"$ENVS_EFFECT_BIN/python3" -I checks/repository.py'

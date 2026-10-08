@@ -75,6 +75,13 @@ OCI_RECIPIENT = "age1" + "".join(secrets.choice(BECH32) for _ in range(58))
 OCI_OTHER = "age1" + "".join(secrets.choice(BECH32) for _ in range(58))
 # Generated per run: the OCI source value never appears in tracked source.
 OCI_KEY = "jev-" + secrets.token_urlsafe(24)
+GO_KEY = "go-" + secrets.token_urlsafe(24)
+
+
+def go_env(**overrides: str) -> dict[str, str]:
+    values = {jev.GO_KEY: GO_KEY, jev.OCI_RECIPIENT: OCI_RECIPIENT, "ENVS_EFFECT_TOOLCHAIN": MANIFEST}
+    values.update(overrides)
+    return values
 
 
 def oci_env(**overrides: str) -> dict[str, str]:
@@ -134,7 +141,69 @@ def copy_root() -> Path:
     target = Path(tempfile.mkdtemp(prefix="envs-jev-test-")) / "repo"
     shutil.copytree(ROOT, target, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".git"))
     (target / jev.OCI_CIPHERTEXT).unlink(missing_ok=True)
+    (target / jev.GO_CIPHERTEXT).unlink(missing_ok=True)
     return target
+
+
+def go_fixture_clear(root: Path) -> None:
+    """Clear only the bounded Go source fixture; preserve and refuse any foreign entry.
+
+    The private root must be created by copy_root(). All existing source paths are a finite
+    manifest; only the one Go ciphertext path may be new. Inspect everything before unlinking.
+    This does not recursively delete a directory or borrow the legacy generic test cleanup.
+    """
+    parent = root.parent
+    if (root.name != "repo" or not parent.name.startswith("envs-jev-test-")
+            or parent.parent.resolve() != Path(tempfile.gettempdir()).resolve()
+            or parent.is_symlink() or root.is_symlink()
+            or not parent.is_dir() or not root.is_dir()
+            or parent.stat().st_uid != os.getuid() or root.stat().st_uid != os.getuid()
+            or (parent.stat().st_mode & 0o777) != 0o700):
+        raise AssertionError("Go fixture cleanup target is not a private owned copy")
+
+    def included(path: Path) -> bool:
+        return not any(part in {".git", "__pycache__"} for part in path.parts) and path.suffix != ".pyc"
+
+    baseline = [p for p in ROOT.rglob("*") if included(p.relative_to(ROOT))]
+    known_files = {p.relative_to(ROOT) for p in baseline if p.is_file()}
+    known_dirs = {p.relative_to(ROOT) for p in baseline if p.is_dir()}
+    known_files.add(jev.GO_CIPHERTEXT)
+    known_dirs.add(jev.GO_CIPHERTEXT.parent)
+    observed = list(root.rglob("*"))
+    for path in observed:
+        relative = path.relative_to(root)
+        if path.is_symlink() or (
+            (path.is_file() and relative not in known_files)
+            or (path.is_dir() and relative not in known_dirs)
+            or (not path.is_file() and not path.is_dir())
+        ):
+            raise AssertionError("Go fixture cleanup kept an unexpected file or directory")
+        if path.stat().st_uid != os.getuid():
+            raise AssertionError("Go fixture cleanup kept an unowned entry")
+
+    for path in observed:
+        if path.is_file():
+            path.unlink()
+    for path in sorted((p for p in observed if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
+        path.rmdir()
+    root.rmdir()
+    parent.rmdir()
+
+
+def test_go_fixture_cleanup_refuses_foreign() -> None:
+    root = copy_root()
+    foreign = root / "foreign-go-fixture"
+    foreign.write_text("unowned path must be retained\n")
+    try:
+        try:
+            go_fixture_clear(root)
+        except AssertionError:
+            assert foreign.read_text() == "unowned path must be retained\n"
+        else:
+            raise AssertionError("Go fixture cleanup accepted a foreign entry")
+    finally:
+        foreign.unlink()
+        go_fixture_clear(root)
 
 
 def append(path: Path, text: str) -> None:
@@ -264,7 +333,11 @@ def test_author_oci() -> None:
 def test_targets_are_separate() -> None:
     contracts = jev.validate_contracts(ROOT)
     names = {target: [entry["name"] for entry in jev.authoring_inputs(contracts, target)] for target in jev.AUTHOR_TARGETS}
-    assert names == {"jev-api": ["JEV_API_KEY", "SOPS_AGE_RECIPIENTS"], jev.OCI_BINDING: ["JEV_API_KEY", jev.OCI_RECIPIENT]}
+    assert names == {
+        "jev-api": ["JEV_API_KEY", "SOPS_AGE_RECIPIENTS"],
+        jev.OCI_BINDING: ["JEV_API_KEY", jev.OCI_RECIPIENT],
+        jev.GO_BINDING: [jev.GO_KEY, jev.OCI_RECIPIENT],
+    }
     try:
         jev.authoring_inputs(contracts, "rent-tunnel")
     except jev.EnvsError:
@@ -312,6 +385,112 @@ def expect_oci_red(values: dict[str, str], *, mutate=None, output: bytes | None 
         assert snapshot(root) == before, "a RED OCI authoring changed the repository"
     finally:
         shutil.rmtree(root.parent, ignore_errors=True)
+
+
+def test_author_go() -> None:
+    # Sharing the GitHub Environment does not permit either Jev secret or list-recipient to enter this Go invocation.
+    root = copy_root()
+    calls: list[tuple[list[str], bytes | None, dict[str, str]]] = []
+    try:
+        before = snapshot(root)
+
+        def runner(argv, input_data, env):
+            calls.append((list(argv), input_data, dict(env)))
+            return subprocess.CompletedProcess(argv, 0, stdout=oci_ciphertext(key=jev.GO_KEY), stderr=b"")
+
+        with environment(go_env(JEV_API_KEY="not-go-input", SOPS_AGE_RECIPIENTS="wrong-list")):
+            result = jev.author_oci(root, runner, target=jev.GO_BINDING)
+        assert result == {
+            "kind": "envs.targetAuthoringResult.v1", "status": "PASS", "binding": jev.GO_BINDING,
+            "ciphertext": jev.GO_CIPHERTEXT.as_posix(), "recipient_count": 1,
+            "target_apply": "NOT_RUN", "application_runtime": "NOT_RUN",
+        }
+        assert len(calls) == 1
+        argv, stdin, env = calls[0]
+        assert argv == [TOOLS["sops"], "--encrypt", "--input-type", "json", "--output-type", "yaml", "/dev/stdin"]
+        assert json.loads(stdin) == {jev.GO_KEY: GO_KEY}
+        assert env["SOPS_AGE_RECIPIENTS"] == OCI_RECIPIENT
+        for secret in (jev.GO_KEY, "JEV_API_KEY", jev.OCI_RECIPIENT):
+            assert secret not in env, "a source secret or target recipient leaked into the tool environment"
+        assert GO_KEY not in json.dumps(result)
+        assert not any(GO_KEY in item for item in [*argv, *env.values()])
+        after = snapshot(root)
+        assert set(after) - set(before) == {jev.GO_CIPHERTEXT.as_posix()}
+        assert all(after[name] == data for name, data in before.items())
+        assert not (root / jev.OCI_CIPHERTEXT).exists() and not (root / jev.CIPHERTEXT).exists()
+        contracts = jev.validate_contracts(root)
+        for plane in ("dev.authoring", jev.GO_PLANE, "dev.projection"):
+            assert contracts["environments"][plane]["migration_state"] == "NOT_CONFIGURED"
+    finally:
+        go_fixture_clear(root)
+
+
+def expect_go_red(values: dict[str, str], *, mutate=None, output: bytes | None = None,
+                  returncode: int = 0) -> None:
+    root = copy_root()
+    calls: list[list[str]] = []
+    try:
+        if mutate is not None:
+            mutate(root)
+        before = snapshot(root)
+
+        def runner(argv, input_data, env):
+            calls.append(list(argv))
+            return subprocess.CompletedProcess(
+                argv, returncode, stdout=output if output is not None else oci_ciphertext(key=jev.GO_KEY), stderr=b"")
+
+        with environment(values):
+            try:
+                jev.author_oci(root, runner, target=jev.GO_BINDING)
+            except jev.EnvsError as error:
+                message = str(error)
+            else:
+                raise AssertionError("invalid Go authoring input accepted")
+        assert GO_KEY not in message, "Go secret leaked into failure"
+        assert output is not None or returncode != 0 or not calls, "SOPS ran before Go input gate"
+        assert snapshot(root) == before, "RED Go authoring changed repository state"
+    finally:
+        go_fixture_clear(root)
+
+
+def test_author_go_red() -> None:
+    for name in (jev.GO_KEY, jev.OCI_RECIPIENT):
+        expect_go_red(go_env(**{name: ""}))
+    for value in (f"{OCI_RECIPIENT},{OCI_OTHER}", f"{OCI_RECIPIENT},{OCI_RECIPIENT}",
+                  OCI_RECIPIENT.upper(), f" {OCI_RECIPIENT}", "not-an-age-recipient"):
+        expect_go_red(go_env(**{jev.OCI_RECIPIENT: value}))
+    # A source secret never falls back to Jev's distinct secret or recipient list.
+    expect_go_red(go_env(**{jev.GO_KEY: "", "JEV_API_KEY": "shadow-jev"}))
+    expect_go_red(go_env(**{jev.OCI_RECIPIENT: "", "SOPS_AGE_RECIPIENTS": OCI_RECIPIENT}))
+    expect_go_red(go_env(), mutate=lambda root: append(root / "README.md", f"\n{OCI_RECIPIENT}\n"))
+    expect_go_red(go_env(), mutate=lambda root: append(root / "README.md", f"\n{GO_KEY}\n"))
+    for output, code in (
+        (oci_ciphertext(), 0),
+        (oci_ciphertext(key=jev.RENT_KEY), 0),
+        (oci_ciphertext(key=jev.GO_KEY, recipients=(OCI_OTHER,)), 0),
+        (oci_ciphertext(key=jev.GO_KEY, recipients=(OCI_RECIPIENT, OCI_OTHER)), 0),
+        (oci_ciphertext(key=jev.GO_KEY, recipients=()), 0),
+        (oci_ciphertext(key=jev.GO_KEY, extra="note: plain\n"), 0),
+        (oci_ciphertext(key=jev.GO_KEY, extra=f"note: {GO_KEY}\n"), 0),
+        (oci_ciphertext(key=jev.GO_KEY), 1),
+    ):
+        expect_go_red(go_env(), output=output, returncode=code)
+    # Malformed committed Go SOPS is RED even when this Go target is unselected.
+    for data in (b"OPENCODE_API_KEY: plain\n", oci_ciphertext(),
+                 oci_ciphertext(key=jev.GO_KEY, recipients=(OCI_RECIPIENT, OCI_OTHER)),
+                 oci_ciphertext(key=jev.GO_KEY, extra="note: unexpected\n")):
+        root = copy_root()
+        try:
+            (root / jev.GO_CIPHERTEXT).parent.mkdir(exist_ok=True)
+            (root / jev.GO_CIPHERTEXT).write_bytes(data)
+            try:
+                jev.validate_contracts(root)
+            except jev.EnvsError:
+                pass
+            else:
+                raise AssertionError("invalid committed Go ciphertext accepted")
+        finally:
+            go_fixture_clear(root)
 
 
 def test_author_oci_red() -> None:
@@ -459,6 +638,31 @@ def real_oci_roundtrip(sops_bin: str, keygen_bin: str) -> None:
         else:
             raise AssertionError("two recipients were accepted")
         assert len(calls) == before, "sops ran for a recipient list"
+        # The independent Go source uses the same *recipient*, never Jev's plaintext field or ciphertext.
+        go_data = jev.encrypt_oci_key(GO_KEY, recipient, tools, runner, key=jev.GO_KEY)
+        assert GO_KEY.encode() not in go_data and OCI_KEY.encode() not in go_data
+        jev.validate_oci_ciphertext(go_data, GO_KEY.encode(), recipient, key=jev.GO_KEY)
+        go_cipher = work / "dev-opencode-go.oci-dev.sops.yaml"
+        go_cipher.write_bytes(go_data)
+        go_open = decrypt(go_cipher, key)
+        assert go_open.returncode == 0 and json.loads(go_open.stdout) == {jev.GO_KEY: GO_KEY}
+        go_wrong = decrypt(go_cipher, other_key)
+        assert go_wrong.returncode != 0 and GO_KEY.encode() not in go_wrong.stdout + go_wrong.stderr
+        go_text = go_data.decode()
+        go_start = go_text.index("ENC[AES256_GCM,data:") + len("ENC[AES256_GCM,data:")
+        go_tampered = work / "tampered-go.sops.yaml"
+        go_tampered.write_text(
+            go_text[:go_start] + ("A" if go_text[go_start] != "A" else "B") + go_text[go_start + 1:],
+            encoding="utf-8")
+        rejected = decrypt(go_tampered, key)
+        assert rejected.returncode != 0 and GO_KEY.encode() not in rejected.stdout + rejected.stderr
+        for candidate, expected in ((go_data, other), (go_text.replace(recipient, other).encode(), recipient)):
+            try:
+                jev.validate_oci_ciphertext(candidate, None, expected, key=jev.GO_KEY)
+            except jev.EnvsError:
+                continue
+            raise AssertionError("Go ciphertext was accepted for a different recipient")
+        print("real Go dummy SOPS roundtrip: PASS (single target recipient; wrong identity/tamper RED)")
         print(f"real OCI SOPS roundtrip: PASS (sops={sops_path}, age-keygen={keygen})")
     finally:
         shutil.rmtree(work, ignore_errors=True)
@@ -1213,8 +1417,11 @@ def main() -> None:
         test_author()
         test_author_red_inputs()
         test_author_oci()
+        test_author_go()
+        test_go_fixture_cleanup_refuses_foreign()
         test_targets_are_separate()
         test_author_oci_red()
+        test_author_go_red()
         test_committed_oci_state()
         test_author_target_cli()
         test_project()

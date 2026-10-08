@@ -66,6 +66,11 @@ def public_target(value):
     if provider in ("cloudflare-pages", "cloudflare-workers"):
         resource = "project" if provider == "cloudflare-pages" else "worker_name"
         closed(value, ("provider", resource, "secret_name"), ("account_id",))
+    elif value.get("kind") == "pi_auth_command":
+        # Source metadata only. This is not parent-process secret injection or an executable projection port.
+        closed(value, ("repository", "host", "kind"))
+        if value != {"repository": "roccho-dev/windows", "host": "oci-dev", "kind": "pi_auth_command"}:
+            raise ValueError("Pi target identity differs")
     elif value.get("kind") == "process_env":
         closed(value, ("repository", "host", "kind", "secret_name"))
     elif value.get("kind") == "cloudflared_token_file":

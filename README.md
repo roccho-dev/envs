@@ -93,6 +93,7 @@ THIRD_PARTY_NOTICES.md
 | Environment input | Kind | Type | Lifecycle |
 |---|---|---|---|
 | `dev-authoring/JEV_API_KEY` | secret | opaque | one_shot_ingress |
+| `dev-authoring/OPENCODE_API_KEY` | secret | opaque | one_shot_ingress |
 | `dev-authoring/SOPS_AGE_RECIPIENTS` | variable | age_recipient_list | persistent |
 | `dev-authoring/OCI_DEV_AGE_RECIPIENT` | variable | age_recipient | persistent |
 | `dev-projection/SOPS_AGE_KEY` | secret | age_identity | persistent |
@@ -169,6 +170,35 @@ dev-authoring/JEV_API_KEY + dev-authoring/OCI_DEV_AGE_RECIPIENT
 - `checks/test_jev_api.py` proves the gates with fake sops, and in `check` it runs the real locked sops with check-only `age-keygen` identities: the target identity decrypts, and another identity or a tampered ciphertext is RED.
 
 Not proven here, and not owned by envs: the target's identity, applying the ciphertext on the target, the launcher, application runtime acceptance, and any deployment. Source and CI PASS is not a real authoring PASS.
+
+## Dev OpenCode Go OCI authoring (ADRS #530)
+
+`opencode-go.oci-dev` is a separate source capability for the already accepted Windows Pi v1.0.4
+`pi_auth_command` resolver. Its authoring selects only its own secret and the one OCI-dev age
+recipient, under the existing `dev-authoring` GitHub Environment:
+
+```text
+dev-authoring/OPENCODE_API_KEY + dev-authoring/OCI_DEV_AGE_RECIPIENT
+→ author-dev-jev-api, `author --target opencode-go.oci-dev` (manual dispatch on proposals only)
+→ ciphertexts/dev-opencode-go.oci-dev.sops.yaml (exactly OPENCODE_API_KEY + SOPS metadata; one recipient)
+→ ciphertext-only source PR → accepted canonical proposals revision
+```
+
+- `dev.opencode-go-authoring` declares the Go source separately from `dev.authoring` (Jev).
+  The existing workflow's three literal target steps never pass `OPENCODE_API_KEY` to a
+  Jev step or `JEV_API_KEY` to the Go step. Cloudflare's `SOPS_AGE_RECIPIENTS` list
+  is not an OCI-dev author input. Sharing the target age recipient does not share the source key.
+- The Windows target is exactly `{"repository":"roccho-dev/windows","host":"oci-dev","kind":"pi_auth_command"}`;
+  public contract projection validates this *source shape* even when unselected, but it cannot
+  execute or project the selected Go secret as a `process_env` value.
+- The selected Go source is encrypted to precisely one age recipient by the locked SOPS tool
+  using stdin, not argv or process environment. Input leaks into tracked Git, wrong recipients,
+  added fields, non-SOPS plaintext or missing inputs are RED before an accepted handoff.
+- The existing `checks/test_jev_api.py` fixture tests Go/Jev input isolation, encrypted dummy
+  source roundtrip with check-only target/wrong age identities, tampering and rejection cases.
+  No real `OPENCODE_API_KEY` value, production ciphertext, provider call, target key or runtime
+  adoption is part of this source stage. The committed Go plane is `NOT_CONFIGURED`; only
+  later real canonical ciphertext/provisioning can move the live acceptance gate.
 
 ## Dev rent tunnel flow (windows #14)
 

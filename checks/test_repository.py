@@ -304,6 +304,38 @@ def main() -> None:
     expect_red(replace_text("README.md", "dev-authoring/OCI_DEV_AGE_RECIPIENT", "dev-authoring/REMOVED"))
     expect_red(replace_text(check, "checks/test_jev_api.py --sops", "checks/test_jev_api.py --no-sops"))
 
+    # Go authoring reuses the Environment but may select only OPENCODE_API_KEY and the exact target recipient.
+    go_mapping = "          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}\n"
+    go_target = "          - opencode-go.oci-dev\n"
+    expect_red(replace_text(author, go_target, ""))
+    expect_red(replace_text(author, "        if: inputs.target == 'opencode-go.oci-dev'\n", ""))
+    expect_red(replace_text(author, "author --target opencode-go.oci-dev'", "author --target jev-api.oci-dev'"))
+    expect_red(replace_text(author, go_mapping, "          JEV_API_KEY: ${{ secrets.JEV_API_KEY }}\n"))
+    expect_red(replace_text(author, go_mapping, ""))
+    expect_red(replace_text(author, "          - opencode-go.oci-dev\n", "          - jev-api.oci-dev\n"))
+    expect_red(replace_text(author, "github.repository == 'roccho-org/envs'",
+                            "github.repository == 'roccho-dev/envs'"))
+    expect_red(mutate_plane("dev.opencode-go-authoring", lambda row: row["required_secrets"][0].update(
+        {"name": "JEV_API_KEY"})))
+    expect_red(mutate_plane("dev.opencode-go-authoring", lambda row: row["required_variables"][0].update(
+        {"type": "age_recipient_list"})))
+    expect_red(mutate_plane("dev.opencode-go-authoring", lambda row: row.update(
+        {"github_environment": "different-authoring"})))
+    expect_red(mutate_plane("dev.opencode-go-authoring", lambda row: row.update(
+        {"migration_state": "ACTIVE"})))
+    expect_red(replace_text("contracts/bindings.jsonl", '"host":"oci-dev","kind":"pi_auth_command"',
+                            '"host":"oci-dev","kind":"process_env"'))
+    expect_red(replace_text("contracts/provider-consumer.jsonl", '"binding":"opencode-go.oci-dev"',
+                            '"binding":"jev-api.oci-dev"'))
+    expect_red(replace_text("README.md", "dev-authoring/OPENCODE_API_KEY", "dev-authoring/REMOVED-GO"))
+    expect_red(replace_text("README.md", "`author --target opencode-go.oci-dev`", "`author --target anything`"))
+
+    def invalid_go_ciphertext(root: Path) -> None:
+        (root / "ciphertexts").mkdir(exist_ok=True)
+        (root / "ciphertexts/dev-opencode-go.oci-dev.sops.yaml").write_text("OPENCODE_API_KEY: plain\n")
+
+    expect_red(invalid_go_ciphertext)
+
     def invalid_oci_ciphertext(root: Path) -> None:
         (root / "ciphertexts").mkdir(exist_ok=True)
         (root / "ciphertexts/dev-jev-api.oci-dev.sops.yaml").write_text("JEV_API_KEY: plain\n")
