@@ -3,8 +3,8 @@ name: probe-dev-mail-routing
 on:
   workflow_dispatch:
     inputs:
-      domain_sha256:
-        description: Non-secret lowercase SHA-256 of the exact Owner-selected domain; do not submit its plaintext
+      domain:
+        description: Non-secret exact M0 zone domain; this input is visible in GitHub run metadata, never include mailbox/contacts
         type: string
         required: true
       expected_source_sha:
@@ -74,16 +74,15 @@ jobs:
       - name: Record effect toolchain identity
         run: '"$ENVS_EFFECT_BIN/envs-effect" --root "$GITHUB_WORKSPACE" toolchain'
 
-      # The exact caller-selected domain stays outside this workflow event:
-      # workflow_dispatch metadata carries only a non-secret SHA-256 selector.
-      # Plaintext may be dictionary-guessed for known DNS names; it is not an
-      # encrypted channel. P must assess disclosure before authorizing dispatch.
-      # Existing dev-projection account Variable is fetched IN MEMORY via the
-      # GitHub REST API with the already available masked GITHUB_TOKEN.
-      # No value is expanded into job/step env, run script, argv or logs.
-      # If GitHub denies Variables read, fail UNKNOWN and do not fall back.
+      # P's v2 boundary allows the EXISTING non-secret account locator
+      # (dev-projection Variable) in the native step environment. GitHub may
+      # display this locator and the selected domain in run metadata; neither
+      # is a credential, and the selected domain is an ordinary non-secret
+      # workflow_dispatch input. NEVER put mailbox/contact data in domain.
+      # The existing masked token is the ONLY secret. A failed Cloudflare GET
+      # cannot fall back to a different account, token or Environment.
       - name: Read selected Cloudflare zone under existing account
         env:
-          GH_TOKEN: ${{ github.token }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
         run: '"$ENVS_EFFECT_BIN/mail-routing-read"'

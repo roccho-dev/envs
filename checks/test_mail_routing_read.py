@@ -2,7 +2,6 @@
 """Offline security regressions for the M0 Mail GET-only client."""
 from __future__ import annotations
 
-import hashlib
 import importlib.util
 import io
 import json
@@ -22,13 +21,11 @@ mail = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(mail)
 
 DOMAIN = "hidden.example.invalid"
-SELECTOR = hashlib.sha256(DOMAIN.encode()).hexdigest()
 ACCOUNT = "a" * 32
 ZONE = "b" * 32
 TOKEN = "private_cf_fixture_token"
-GITHUB_TOKEN = "private_github_fixture_token"
 RECIPIENT = "very.private@example.invalid"
-ENV = {"CLOUDFLARE_API_TOKEN": TOKEN, "GH_TOKEN": GITHUB_TOKEN}
+ENV = {"CLOUDFLARE_API_TOKEN": TOKEN, "CLOUDFLARE_ACCOUNT_ID": ACCOUNT}
 
 
 def wrap(value: object) -> bytes:
@@ -72,14 +69,9 @@ class Fake:
         assert kwargs == {"timeout": 12}
         url = urllib.parse.urlsplit(req.full_url)
         assert url.scheme == "https"
-        if url.netloc == "api.github.com":
-            assert req.full_url == mail.GITHUB_ACCOUNT_URL
-            assert req.get_header("Authorization") == "Bearer " + GITHUB_TOKEN
-            path = "github-account"
-        else:
-            assert url.netloc == "api.cloudflare.com"
-            assert req.get_header("Authorization") == "Bearer " + TOKEN
-            path = url.path.removeprefix("/client/v4")
+        assert url.netloc == "api.cloudflare.com"
+        assert req.get_header("Authorization") == "Bearer " + TOKEN
+        path = url.path.removeprefix("/client/v4")
         self.calls.append(path)
         if path == self.deny:
             raise urllib.error.HTTPError(req.full_url, 403, TOKEN, {}, None)
@@ -87,17 +79,16 @@ class Fake:
             return Response(b'{"result":{"contains":"SECRET_RESPONSE"}}')
         if path in self.overrides:
             return Response(wrap(self.overrides[path]))
-        if path == "github-account":
-            return Response(json.dumps({
-                "name": "CLOUDFLARE_ACCOUNT_ID",
-                "value": "f" * 32 if self.wrong_account else ACCOUNT,
-            }).encode())
         if path == "/user/tokens/verify":
             return Response(wrap({"status": "active"}))
         if path == "/zones":
             query = urllib.parse.parse_qs(url.query)
-            assert query == {"account.id": [ACCOUNT], "match": ["all"], "page": ["1"], "per_page": ["50"]}
-            wanted = {"name": DOMAIN, "id": ZONE, "account": {"id": ACCOUNT}}
+            assert query == {
+                "name": [DOMAIN], "account.id": [ACCOUNT], "match": ["all"],
+                "page": ["1"], "per_page": ["50"],
+            }
+            wanted = {"name": DOMAIN, "id": ZONE,
+                      "account": {"id": "f" * 32 if self.wrong_account else ACCOUNT}}
             return Response(wrap([wanted, wanted] if self.duplicate else [wanted]))
         if path == f"/zones/{ZONE}/dns_records":
             return Response(wrap([
@@ -109,7 +100,11 @@ class Fake:
         if path == f"/zones/{ZONE}/email/routing/dns":
             return Response(wrap([{"type": "MX", "name": DOMAIN}]))
         if path == f"/zones/{ZONE}/email/routing/rules":
-            return Response(wrap([{"source": "wrangler", "enabled": True, "actions": [{"value": [RECIPIENT]}]}]))
+            return Response(wrap([{
+                "source": "wrangler", "enabled": True,
+                "actions": [{"value": [RECIPIENT]}],
+                "matchers": [{"type": "literal", "field": "to", "value": "m0@" + DOMAIN}],
+            }]))
         if path == f"/zones/{ZONE}/email/routing/rules/catch_all":
             return Response(wrap({"enabled": False}))
         if path == f"/accounts/{ACCOUNT}/email/routing/addresses":
@@ -117,14 +112,14 @@ class Fake:
         raise AssertionError("unexpected provider path / fallback")
 
 
-def event(path: Path, value: object = SELECTOR) -> str:
-    path.write_text(json.dumps({"inputs": {"domain_sha256": value}}), encoding="utf-8")
+def event(path: Path, value: object = DOMAIN) -> str:
+    path.write_text(json.dumps({"inputs": {"domain": value}}), encoding="utf-8")
     return str(path)
 
 
 def safe(result: dict) -> None:
     text = json.dumps(result)
-    for private in (DOMAIN, ACCOUNT, ZONE, TOKEN, GITHUB_TOKEN, RECIPIENT, SELECTOR,
+    for private in (DOMAIN, ACCOUNT, ZONE, TOKEN, RECIPIENT,
                     "private-mx.invalid", "SECRET_RESPONSE"):
         assert private not in text, "private value leaked"
     assert "traceback" not in text.lower()
@@ -188,15 +183,18 @@ def main() -> None:
         assert answer["counts"]["verified_destinations"] == 1
         safe(answer)
 
-        # Raw domain/zone/account never supplied by workflow metadata or step env.
-        for wrong in (DOMAIN, "", "xyz", "Z" * 64, 3, None, {"name": DOMAIN}):
+        # Domain is an explicit non-secret native workflow selector; it
+        # remains excluded from adapter stdout, provider identities and logs.
+        for wrong in ("", "xyz", "Z" * 64, 3, None, {"name": DOMAIN},
+                      "https://" + DOMAIN, "*.example.invalid", DOMAIN + " "):
             fixture = Fake()
             result = mail.observe(event(path, wrong), ENV, fixture)
             assert result["status"] == "INCOMPLETE" and fixture.calls == []
             safe(result)
         selected = event(path)
         for missing in ({}, {"CLOUDFLARE_API_TOKEN": TOKEN},
-                        {"GH_TOKEN": GITHUB_TOKEN}):
+                        {"CLOUDFLARE_ACCOUNT_ID": ACCOUNT},
+                        {"CLOUDFLARE_API_TOKEN": TOKEN, "CLOUDFLARE_ACCOUNT_ID": "f" * 31}):
             fixture = Fake()
             result = mail.observe(selected, missing, fixture)
             assert result["status"] == "INCOMPLETE" and fixture.calls == []
@@ -209,23 +207,31 @@ def main() -> None:
             safe(result)
 
         # HTTP refusal is per-operation, not proof of missing Write access.
-        for endpoint in ("github-account", "/user/tokens/verify", "/zones",
+        for endpoint in ("/user/tokens/verify", "/zones",
                          f"/zones/{ZONE}/email/routing/rules",
                          f"/accounts/{ACCOUNT}/email/routing/addresses"):
             fixture = Fake(deny=endpoint)
             result = mail.observe(selected, ENV, fixture)
             assert result["status"] == "INCOMPLETE"
-            if endpoint == "github-account":
-                assert result["read"]["account"] == "UNKNOWN"
-                assert fixture.calls == ["github-account"]
-            else:
-                assert "DENIED" in result["read"].values()
+            assert "DENIED" in result["read"].values()
             assert len(fixture.calls) == len(set(fixture.calls))
             safe(result)
 
         bad_objects = (
             ("/user/tokens/verify", {}, "token"),
             ("/zones", [], "zone"),
+            (f"/zones/{ZONE}/dns_records", [{}], "dns"),
+            (f"/zones/{ZONE}/dns_records", [{"type": None}], "dns"),
+            (f"/zones/{ZONE}/email/routing/dns", [{}], "routing_dns"),
+            (f"/zones/{ZONE}/email/routing/rules", [{
+                "source": "api", "enabled": True, "actions": [],
+            }], "rules"),
+            (f"/zones/{ZONE}/email/routing/rules", [{
+                "source": "api", "enabled": True, "actions": [], "matchers": "literal",
+            }], "rules"),
+            (f"/zones/{ZONE}/email/routing/rules", [{
+                "source": "api", "enabled": True, "actions": [], "matchers": [{}],
+            }], "rules"),
             (f"/zones/{ZONE}/email/routing", {}, "routing"),
             (f"/zones/{ZONE}/email/routing", {"enabled": "false", "status": "ready"}, "routing"),
             (f"/zones/{ZONE}/email/routing", {"enabled": False}, "routing"),
@@ -250,13 +256,13 @@ def main() -> None:
         assert result["status"] == "INCOMPLETE" and result["read"]["dns"] == "UNKNOWN"
         safe(result)
 
-        # Main entry only with INVALID input; never execute a real network call
-        # from the synthetic CI test (no provider, no GitHub API).
+        # Main entry only with INVALID input; never execute a live network
+        # call from this synthetic CI test.
         preserved = dict(os.environ)
         try:
             os.environ.clear()
             os.environ.update({**ENV, "GITHUB_EVENT_PATH": selected})
-            os.environ["GH_TOKEN"] = ""
+            os.environ["CLOUDFLARE_ACCOUNT_ID"] = "invalid"
             stream = io.StringIO()
             with redirect_stdout(stream):
                 assert mail.main() == 2
@@ -266,13 +272,14 @@ def main() -> None:
             os.environ.update(preserved)
 
     workflow = (ROOT / ".github/workflows/probe-dev-mail-routing.yml").read_text(encoding="utf-8")
-    assert "domain_sha256:" in workflow and "domain:\n" not in workflow
-    assert "CLOUDFLARE_ACCOUNT_ID: " not in workflow
-    assert "${{ vars.CLOUDFLARE_ACCOUNT_ID }}" not in workflow
-    assert "GH_TOKEN: ${{ github.token }}" in workflow
+    assert "      domain:\n" in workflow and "domain_sha256:" not in workflow
+    assert "CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}" in workflow
+    assert "CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}" in workflow
+    assert "GH_TOKEN: ${{ github.token }}\n          CLOUDFLARE_API_TOKEN" not in workflow
     assert "github.actor_id == '40359643'" in workflow
     assert "github.triggering_actor == 'roccho-dev'" in workflow
-    assert "GITHUB_EVENT_PATH" not in workflow or "domain_sha256" in workflow
+    assert "inputs.domain" not in workflow
+    assert "environment: dev-projection" in workflow
     test_transport_no_redirect_no_proxy()
     print("mail routing read selftest: PASS; GET-only, safe transport/schema/metadata")
 

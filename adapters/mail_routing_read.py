@@ -8,7 +8,6 @@ zone identifier, email, request URL, exception message or traceback escapes.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -21,17 +20,9 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 API = "https://api.cloudflare.com/client/v4"
-# Existing dev-projection Environment Variable, read directly in memory with
-# the already provided Actions token; never expand its raw value into step env,
-# argv, GitHub log/script or run metadata.
-GITHUB_ACCOUNT_URL = (
-    "https://api.github.com/repos/roccho-org/envs/environments/"
-    "dev-projection/variables/CLOUDFLARE_ACCOUNT_ID"
-)
 ACCOUNT = re.compile(r"^[0-9a-f]{32}$")
-SELECTOR = re.compile(r"^[0-9a-f]{64}$")
 LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
-STEPS = ("account", "token", "zone", "dns", "routing", "routing_dns", "rules", "catch_all", "addresses")
+STEPS = ("token", "zone", "dns", "routing", "routing_dns", "rules", "catch_all", "addresses")
 MAX_RESPONSE = 1_000_000
 MAX_PAGES = 100
 PAGE_SIZE = 50
@@ -58,53 +49,34 @@ def safe_opener(https_handler: urllib.request.BaseHandler | None = None) -> Open
     return urllib.request.build_opener(urllib.request.ProxyHandler({}), DenyRedirect(), handler).open
 
 
-def selector_from_event(path: str) -> str:
+def domain_from_event(path: str) -> str:
+    # This is an explicitly non-secret selected-domain locator in native
+    # workflow_dispatch metadata. It is NEVER used as a credential, emitted
+    # in stdout/stderr, or expanded by an Actions run-step environment.
     try:
         event = json.loads(Path(path).read_text(encoding="utf-8"))
-        value = event["inputs"]["domain_sha256"]
-        if not isinstance(value, str) or not SELECTOR.fullmatch(value):
+        value = event["inputs"]["domain"]
+        if not isinstance(value, str):
             raise ValueError()
-        return value
+        domain = value.lower()
+        if (len(domain) > 253 or len(domain) < 4 or domain != value.strip().lower()
+                or "." not in domain or any(not LABEL.fullmatch(part) for part in domain.split("."))):
+            raise ValueError()
+        return domain
     except (OSError, ValueError, KeyError, TypeError, UnicodeError):
         raise ReadFailure() from None
 
 
 def private_inputs(event_path: str, environ: Mapping[str, str]) -> tuple[str, str, str]:
-    # The dispatch metadata contains only a non-secret fingerprint, not the
-    # raw target. This is an opaque SELECTOR, not encryption or a secrecy proof
-    # against dictionary attacks on publicly known DNS names.
-    selector = selector_from_event(event_path)
+    # Both Cloudflare inputs use EXISTING dev-projection native GitHub slots.
+    # GitHub Variables are not Secret-masked; account is allowed here only as
+    # a NON-SECRET operational locator under the bounded P v2 exception.
+    domain = domain_from_event(event_path)
+    account = environ.get("CLOUDFLARE_ACCOUNT_ID", "")
     token = environ.get("CLOUDFLARE_API_TOKEN", "")
-    github = environ.get("GH_TOKEN", "")
-    if (not token or len(token) > 4096 or token != token.strip()
-            or not github or len(github) > 4096 or github != github.strip()):
+    if not ACCOUNT.fullmatch(account) or not token or len(token) > 4096 or token != token.strip():
         raise ReadFailure()
-    return selector, token, github
-
-
-def configured_account(opener: Opener, github_token: str) -> str:
-    request = urllib.request.Request(
-        GITHUB_ACCOUNT_URL,
-        headers={"Authorization": "Bearer " + github_token, "Accept": "application/vnd.github+json"},
-        method="GET",
-    )
-    try:
-        with opener(request, timeout=12) as response:
-            if getattr(response, "status", None) != 200:
-                raise ReadFailure()
-            raw = response.read(MAX_RESPONSE + 1)
-        if len(raw) > MAX_RESPONSE:
-            raise ReadFailure()
-        data = json.loads(raw)
-        if (not isinstance(data, dict) or data.get("name") != "CLOUDFLARE_ACCOUNT_ID"
-                or not isinstance(data.get("value"), str) or not ACCOUNT.fullmatch(data["value"])):
-            raise ReadFailure()
-        return data["value"]
-    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError,
-            ValueError, TypeError, UnicodeError):
-        # GitHub 403 means lack of access to this Variable, NOT a Cloudflare
-        # permission result. Do not fall back to a different Environment.
-        raise ReadFailure() from None
+    return domain, account, token
 
 
 def _request(opener: Opener, token: str, path: str, params: Mapping[str, object] | None = None) -> Any:
@@ -186,10 +158,9 @@ def _empty() -> dict[str, Any]:
 def observe(event_path: str, environ: Mapping[str, str], opener: Opener | None = None) -> dict[str, Any]:
     output = _empty()
     try:
-        selector, token, github_token = private_inputs(event_path, environ)
+        domain, account, token = private_inputs(event_path, environ)
     except ReadFailure:
         return output
-
     if opener is None:
         opener = safe_opener()
 
@@ -206,10 +177,6 @@ def observe(event_path: str, environ: Mapping[str, str], opener: Opener | None =
         output["read"][step] = "OBSERVED"
         return result
 
-    account = check("account", lambda: configured_account(opener, github_token))
-    if account is None:
-        return output
-
     def read_token() -> dict[str, Any]:
         data = _single(opener, token, "/user/tokens/verify")
         if data.get("status") not in ("active", "disabled", "expired", "inactive"):
@@ -223,26 +190,20 @@ def observe(event_path: str, environ: Mapping[str, str], opener: Opener | None =
     if not output["facts"]["token_active"]:
         return output
 
-    # Do not put the domain into workflow_dispatch metadata or a step env.
-    # Enumerate only the configured account; one matching SHA-256 selector
-    # must resolve, otherwise STOP with no fallback to another account/zone.
+    # Native Cloudflare account and selected domain filters are sent together.
+    # Do not enumerate other zones just to hide an ordinary non-secret selector.
     zones = check("zone", lambda: _list(opener, token, "/zones", {
-        "account.id": account, "match": "all",
+        "name": domain, "account.id": account, "match": "all",
     }))
     if zones is None:
-        # Preserve an exact HTTP DENIED rather than rewriting it UNKNOWN.
+        # Preserve HTTP DENIED, do not silently demote it to UNKNOWN.
         return output
-    matching = []
-    for candidate in zones:
-        name = candidate.get("name")
-        if isinstance(name, str) and hashlib.sha256(name.lower().encode()).hexdigest() == selector:
-            matching.append(candidate)
-    if len(matching) != 1:
+    if len(zones) != 1:
         output["read"]["zone"] = "UNKNOWN"
         return output
-    zone = matching[0]
+    zone = zones[0]
     owner = zone.get("account")
-    if (not isinstance(zone.get("name"), str) or not isinstance(owner, dict)
+    if (zone.get("name") != domain or not isinstance(owner, dict)
             or owner.get("id") != account or not ACCOUNT.fullmatch(str(zone.get("id", "")))):
         output["read"]["zone"] = "UNKNOWN"
         return output
@@ -250,7 +211,13 @@ def observe(event_path: str, environ: Mapping[str, str], opener: Opener | None =
     zone_id = zone["id"]
     # Each capability is independently observed. Failure/403 is not absence or
     # evidence of missing Write permission; never switch account/zone/token.
-    dns = check("dns", lambda: _list(opener, token, f"/zones/{zone_id}/dns_records"))
+    def read_dns() -> list[dict[str, Any]]:
+        rows = _list(opener, token, f"/zones/{zone_id}/dns_records")
+        if any(not isinstance(row.get("type"), str) or not row["type"].strip() for row in rows):
+            raise ReadFailure()
+        return rows
+
+    dns = check("dns", read_dns)
     if dns is not None:
         output["counts"]["dns"] = len(dns)
         output["facts"]["mx_present"] = any(x.get("type") == "MX" for x in dns)
@@ -275,7 +242,9 @@ def observe(event_path: str, environ: Mapping[str, str], opener: Opener | None =
         payload = _request(opener, token, f"/zones/{zone_id}/email/routing/dns")
         records = payload["result"]
         info = payload.get("result_info")
-        if (not isinstance(records, list) or any(not isinstance(item, dict) for item in records)
+        if (not isinstance(records, list)
+                or any(not isinstance(item, dict) or not isinstance(item.get("type"), str)
+                       or not item["type"].strip() for item in records)
                 or (isinstance(info, dict) and info.get("total_count", len(records)) != len(records))):
             raise ReadFailure()
         return records
@@ -286,9 +255,16 @@ def observe(event_path: str, environ: Mapping[str, str], opener: Opener | None =
 
     def read_rules() -> list[dict[str, Any]]:
         rows = _list(opener, token, f"/zones/{zone_id}/email/routing/rules")
-        if any(type(row.get("enabled")) is not bool or not isinstance(row.get("source"), str)
-               or not isinstance(row.get("actions"), list) for row in rows):
-            raise ReadFailure()
+        for row in rows:
+            matchers = row.get("matchers")
+            if (type(row.get("enabled")) is not bool
+                    or not isinstance(row.get("source"), str)
+                    or not isinstance(row.get("actions"), list)
+                    or not isinstance(matchers, list) or not matchers
+                    or any(not isinstance(m, dict) or not all(
+                        isinstance(m.get(key), str) and m[key] for key in ("type", "field", "value")
+                    ) for m in matchers)):
+                raise ReadFailure()
         return rows
 
     rules = check("rules", read_rules)
