@@ -59,7 +59,9 @@ class Fake:
                  duplicate: bool = False, overrides: dict[str, object] | None = None,
                  zone_reply: bytes | None = None, zone_http: int | None = None,
                  zone_transport: bool = False, zone_id: str = ZONE,
-                 wrong_name: bool = False, zone_unexpected: bool = False) -> None:
+                 wrong_name: bool = False, zone_unexpected: bool = False,
+                 list_http: tuple[str, int] | None = None, list_transport: str = "",
+                 list_unexpected: str = "", list_reply: dict[str, bytes] | None = None) -> None:
         self.calls: list[str] = []
         self.deny = deny
         self.bad = bad
@@ -72,6 +74,10 @@ class Fake:
         self.zone_id = zone_id
         self.wrong_name = wrong_name
         self.zone_unexpected = zone_unexpected
+        self.list_http = list_http
+        self.list_transport = list_transport
+        self.list_unexpected = list_unexpected
+        self.list_reply = list_reply or {}
 
     def __call__(self, req: urllib.request.Request, **kwargs: object):
         assert req.get_method() == "GET"
@@ -82,6 +88,14 @@ class Fake:
         assert req.get_header("Authorization") == "Bearer " + TOKEN
         path = url.path.removeprefix("/client/v4")
         self.calls.append(path)
+        if self.list_http is not None and path == self.list_http[0]:
+            raise urllib.error.HTTPError(req.full_url, self.list_http[1], TOKEN, {}, None)
+        if path == self.list_transport:
+            raise urllib.error.URLError("private transport " + TOKEN)
+        if path == self.list_unexpected:
+            raise RuntimeError("private internal " + TOKEN)
+        if path in self.list_reply:
+            return Response(self.list_reply[path])
         if path == self.deny:
             raise urllib.error.HTTPError(req.full_url, 403, TOKEN, {}, None)
         if path == self.bad:
@@ -196,6 +210,7 @@ def main() -> None:
         assert all(s == "OBSERVED" for s in answer["read"].values())
         assert len(success.calls) == len(mail.STEPS)
         assert "zone_unknown_reason" not in answer
+        assert "rules_unknown_reason" not in answer and "addresses_unknown_reason" not in answer
         assert answer["write_authority"] == answer["mail_arrival"] == "NOT_PROVEN"
         assert answer["facts"]["token_active"] is True
         assert answer["facts"]["routing_ready"] is True and answer["facts"]["catch_all_enabled"] is False
@@ -332,6 +347,97 @@ def main() -> None:
             assert passed["counts"][count_key] == 0
             assert "zone_unknown_reason" not in passed
             safe(passed)
+
+        # Diagnose only the two remaining read4 UNKNOWN lists. Do not change
+        # the strict item/pagination validation or send any real provider GET.
+        for step, endpoint, count_key, shape in (
+            ("rules", f"/zones/{ZONE}/email/routing/rules", "rules", "rule_item_shape"),
+            ("addresses", f"/accounts/{ACCOUNT}/email/routing/addresses",
+             "account_destinations", "address_item_shape"),
+        ):
+            diagnostic_key = f"{step}_unknown_reason"
+
+            def list_case(fixture: Fake, expected: str) -> None:
+                got = mail.observe(selected, ENV, fixture)
+                assert got["status"] == "INCOMPLETE"
+                assert got["read"]["token"] == got["read"]["zone"] == "OBSERVED"
+                assert got["read"][step] == "UNKNOWN"
+                assert got[diagnostic_key] == expected, (got, expected)
+                assert count_key not in got["counts"]
+                assert "zone_unknown_reason" not in got
+                other = "addresses" if step == "rules" else "rules"
+                assert got["read"][other] == "OBSERVED"
+                assert f"{other}_unknown_reason" not in got
+                assert fixture.calls.count(endpoint) == 1
+                assert len(fixture.calls) == len(set(fixture.calls))
+                assert got["write_authority"] == got["mail_arrival"] == "NOT_PROVEN"
+                safe(got)
+
+            list_case(Fake(list_transport=endpoint), "transport")
+            for status in (302, 429, 500):
+                list_case(Fake(list_http=(endpoint, status)), "http_other")
+            list_case(Fake(bad=endpoint), "invalid_payload_or_pagination")
+            list_case(Fake(list_reply={endpoint: b'{private-invalid-json:'}),
+                      "invalid_payload_or_pagination")
+            missing_info = json.loads(wrap([]))
+            missing_info.pop("result_info")
+            list_case(Fake(list_reply={endpoint: json.dumps(missing_info).encode()}),
+                      "invalid_payload_or_pagination")
+            inconsistent = json.loads(wrap([]))
+            inconsistent["result_info"]["total_count"] = 1
+            list_case(Fake(list_reply={endpoint: json.dumps(inconsistent).encode()}),
+                      "invalid_payload_or_pagination")
+            list_case(Fake(overrides={endpoint: [{}]}), shape)
+            list_case(Fake(list_unexpected=endpoint), "unclassified")
+
+            # An explicit refusal remains DENIED and has NO diagnostic reason.
+            for refused in (401, 403):
+                denied = mail.observe(selected, ENV, Fake(list_http=(endpoint, refused)))
+                assert denied["read"][step] == "DENIED"
+                assert diagnostic_key not in denied
+                assert "zone_unknown_reason" not in denied
+                safe(denied)
+
+            # Legitimate empty list is OBSERVED(0), including Cloudflare's
+            # zero-page form; never speculate that it is a missing permission.
+            for payload in (wrap([]),):
+                completed = mail.observe(selected, ENV, Fake(list_reply={endpoint: payload}))
+                assert completed["status"] == "READ_OBSERVED"
+                assert completed["counts"][count_key] == 0
+                assert diagnostic_key not in completed
+                safe(completed)
+            empty_zero_page = json.loads(wrap([]))
+            empty_zero_page["result_info"]["total_pages"] = 0
+            completed = mail.observe(selected, ENV, Fake(
+                list_reply={endpoint: json.dumps(empty_zero_page).encode()}))
+            assert completed["status"] == "READ_OBSERVED"
+            assert completed["counts"][count_key] == 0
+            assert diagnostic_key not in completed
+            safe(completed)
+
+        # Exercise the actual closed stdout path for BOTH step diagnostics,
+        # with the real production observe/main and synthetic injected opener.
+        for step, endpoint in (
+            ("rules", f"/zones/{ZONE}/email/routing/rules"),
+            ("addresses", f"/accounts/{ACCOUNT}/email/routing/addresses"),
+        ):
+            saved_opener = mail.safe_opener
+            saved_env = dict(os.environ)
+            try:
+                mail.safe_opener = lambda endpoint=endpoint: Fake(list_transport=endpoint)
+                os.environ.clear()
+                os.environ.update({**ENV, "GITHUB_EVENT_PATH": selected})
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    assert mail.main() == 2
+                closed = json.loads(output.getvalue())
+                assert closed[f"{step}_unknown_reason"] == "transport"
+                assert "zone_unknown_reason" not in closed
+                safe(closed)
+            finally:
+                mail.safe_opener = saved_opener
+                os.environ.clear()
+                os.environ.update(saved_env)
 
         # Exercise main() with synthetic *valid* account and mocked opener
         # to establish that its actual public JSON retains only the enum.

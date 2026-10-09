@@ -41,6 +41,10 @@ class ReadFailure(Exception):
         self.reason = reason if state == "UNKNOWN" and reason in ZONE_UNKNOWN_REASONS else None
 
 
+class ItemShapeFailure(ReadFailure):
+    """Only the current local rule/address item validator rejected an item."""
+
+
 class DenyRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *_args: Any, **_kwargs: Any) -> None:
         # Refuse both same-origin and cross-origin 30x; no Bearer forwarding.
@@ -187,14 +191,23 @@ def observe(event_path: str, environ: Mapping[str, str], opener: Opener | None =
             result = fetch()
         except ReadFailure as failure:
             output["read"][step] = failure.state
-            if step == "zone" and failure.state == "UNKNOWN":
-                output["zone_unknown_reason"] = failure.reason or "unclassified"
+            if failure.state == "UNKNOWN":
+                if step == "zone":
+                    output["zone_unknown_reason"] = failure.reason or "unclassified"
+                elif step in ("rules", "addresses"):
+                    # Shape means "rejected by this LOCAL item validator",
+                    # never "the provider returned a bad resource".
+                    shape = "rule_item_shape" if step == "rules" else "address_item_shape"
+                    reason = shape if isinstance(failure, ItemShapeFailure) else failure.reason
+                    if reason not in ("transport", "http_other", "invalid_payload_or_pagination", shape):
+                        reason = "unclassified"
+                    output[f"{step}_unknown_reason"] = reason
             return None
         except Exception:
             # Fail closed even for malformed provider/opener implementations.
             output["read"][step] = "UNKNOWN"
-            if step == "zone":
-                output["zone_unknown_reason"] = "unclassified"
+            if step in ("zone", "rules", "addresses"):
+                output[f"{step}_unknown_reason"] = "unclassified"
             return None
         output["read"][step] = "OBSERVED"
         return result
@@ -288,7 +301,7 @@ def observe(event_path: str, environ: Mapping[str, str], opener: Opener | None =
                     or any(not isinstance(m, dict) or not all(
                         isinstance(m.get(key), str) and m[key] for key in ("type", "field", "value")
                     ) for m in matchers)):
-                raise ReadFailure()
+                raise ItemShapeFailure()
         return rows
 
     rules = check("rules", read_rules)
@@ -316,7 +329,7 @@ def observe(event_path: str, environ: Mapping[str, str], opener: Opener | None =
                         not isinstance(value, str)
                         or re.fullmatch(r"\d{4}-\d{2}-\d{2}T[^\s]+", value) is None
                     ))):
-                raise ReadFailure()
+                raise ItemShapeFailure()
         return rows
 
     addresses = check("addresses", read_addresses)
