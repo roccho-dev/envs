@@ -372,3 +372,21 @@ nix build .#check-age --no-update-lock-file                             # check-
 ```
 
 The repository oracle calculates accepted structure and state. Its tests deliberately create invalid states and require RED rather than repeating only happy-path execution.
+
+### GitHub-ref transition: S2 SOURCE only (not activated)
+
+The existing `dev.rent-root` effect workflow is **source-hard-inactive at its job
+admission guard** (`false && roccho-org/envs && proposals`), before any
+Environment secret, artifact/child, old S3/Cloudflare inspect, native apply,
+ciphertext write or Git/PR handoff. All other five effect workflows and the
+independent R2 state proof retain their prior source and ownership.
+
+The `envs-effect rent-root-inspect` entry has a bounded, read-only
+implementation for the **future** approved I/B/K/G process: old R2 S3
+state/lock HEAD observations, native encrypted state pull and Cloudflare
+GET-only finite page inventory, returning public counts but **NOT_PROVEN**
+world/state equivalence. It currently refuses at `source_guard` before
+looking at any secret or spawning any child. CI simulates the read path with
+fixture tools; it never performs real inspection. No key/ref/backend migration,
+activation, provider apply, transport or credential change is authorized by
+this source.

@@ -52,6 +52,20 @@ ROOT_CONFIG = Path("providers/dev-rent-cloudflare/main.tf")
 ROOT_SECRETS = ("CLOUDFLARE_API_TOKEN", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "RENT_STATE_PASSPHRASE")
 # One key provider and method name for the state's life (a rotation would add a new name with this one as fallback).
 ROOT_KEY_NAME = "k0"
+# S2 registers a real read-only inspect implementation, but makes live admission
+# impossible from this SOURCE commit. A separately reviewed readiness source
+# grant is required before any caller may read Environment secrets or spawn.
+ROOT_INSPECT_SOURCE_ACTIVE = False
+ROOT_INSPECT_RESOURCE_TYPES = frozenset({
+    "cloudflare_zero_trust_tunnel_cloudflared",
+    "cloudflare_zero_trust_tunnel_cloudflared_config",
+    "cloudflare_dns_record",
+    "cloudflare_zero_trust_access_service_token",
+    "cloudflare_zero_trust_access_policy",
+    "cloudflare_zero_trust_access_application",
+})
+ROOT_INSPECT_STATE_LIMIT = 1048576
+
 # The format secrets.token_hex(32) produces, placed inside an HCL string: a format check, not a strength proof.
 ROOT_PASSPHRASE = re.compile(r"^[0-9a-f]{64}$")
 # The windows slot rule (Get-RentAccessProblem) for each line: 1-1024 printable ASCII characters.
@@ -1807,6 +1821,129 @@ def s3_object(tools: Mapping[str, str], runner: Runner, endpoint: str, credentia
             "code": "none" if parsed is None else parsed if parsed in known else "other"}
 
 
+
+def rent_inspect_head(tools: Mapping[str, str], inputs: Mapping[str, str], runner: Runner, object_key: str) -> str:
+    # The existing persistent root's exact R2 object or native .tflock.
+    # curl's SigV4 config enters through stdin only: no secret argv, file,
+    # shell, proxy, redirect, request body or retry. Never emit response bytes.
+    account = inputs["CLOUDFLARE_ACCOUNT_ID"]
+    bucket = inputs["RENT_STATE_BUCKET"]
+    require(re.fullmatch(r"[a-z0-9][a-z0-9.-]{2,62}", bucket) is not None and ".." not in bucket,
+            "rent inspect bucket is not a closed R2 object name")
+    require(object_key.startswith("state/") and ".." not in object_key and "//" not in object_key
+            and re.fullmatch(r"[a-zA-Z0-9_./-]{1,180}", object_key) is not None,
+            "rent inspect object key is not bounded")
+    endpoint = r2_endpoint(account)
+    lines = [
+        f"url = {curl_value(f'{endpoint}/{bucket}/{object_key}')}",
+        'request = "HEAD"', 'aws-sigv4 = "aws:amz:auto:s3"',
+        f"user = {curl_value(inputs['AWS_ACCESS_KEY_ID'] + ':' + inputs['AWS_SECRET_ACCESS_KEY'])}",
+        'proto = "=https"', 'noproxy = "*"', "silent",
+        'connect-timeout = "10"', 'max-time = "30"',
+        'write-out = "%{stderr}%{http_code}"',
+    ]
+    if os.environ.get("SSL_CERT_FILE"):
+        require(in_store(os.environ["SSL_CERT_FILE"]), "rent inspect CA bundle is not Nix-owned")
+        lines.append(f"cacert = {curl_value(os.environ['SSL_CERT_FILE'])}")
+    result = runner([tools["curl"], "-q", "-I", "--config", "-"],
+                    ("\n".join(lines) + "\n").encode(), clean_env(tools, {}))
+    code = result.stderr.strip()
+    require(result.returncode == 0 and code in (b"200", b"404")
+            and len(result.stdout) <= 4096, "rent inspect S3 HEAD is UNKNOWN")
+    return "PRESENT" if code == b"200" else "ABSENT"
+
+
+def rent_root_inspect(root: Path = ROOT, *, runner: Runner = default_runner,
+                      api: Api = default_api, progress: dict[str, str] | None = None) -> dict[str, Any]:
+    # First gate is compile-time/source-owned and cannot be flipped by env,
+    # a workflow input or CLI argument. Tests patch it only with fake children.
+    progress = {} if progress is None else progress
+    progress["stage"] = "source_guard"
+    require(ROOT_INSPECT_SOURCE_ACTIVE, "rent-root inspect is source-hard-inactive")
+    progress["stage"] = "contracts"
+    contracts = validate_contracts(root)
+    tools = toolchain(root)
+    inputs = gate(root, contracts, ROOT_PLANE)
+    require(ROOT_PASSPHRASE.fullmatch(inputs["RENT_STATE_PASSPHRASE"]) is not None,
+            "rent-root inspect encryption input invalid")
+    for name in ROOT_SECRETS:
+        reject_live_values(root, name, [inputs[name]])
+    key = inputs["RENT_STATE_KEY"]
+    require(key.startswith("state/") and key.endswith(".tfstate") and ".." not in key,
+            "rent-root inspect requires the declared old-S3 state key")
+
+    progress["stage"] = "s3_head"
+    require(rent_inspect_head(tools, inputs, runner, key) == "PRESENT",
+            "rent-root old-S3 state missing or UNKNOWN")
+    require(rent_inspect_head(tools, inputs, runner, key + ".tflock") == "ABSENT",
+            "rent-root old-S3 lock present or UNKNOWN")
+
+    # Existing RootRunner/standard OpenTofu, in an owner-only scratch: init
+    # configures ONLY old S3 and state pull reads it; no plan/apply/import/write.
+    # State plaintext remains in process memory, never a file, log or receipt.
+    progress["stage"] = "state_read"
+    scratch = Path(tempfile.mkdtemp(prefix="envs-rent-inspect-"))
+    home, work = scratch / "home", scratch / "root"
+    home.mkdir(mode=0o700)
+    work.mkdir(mode=0o700)
+    (work / "main.tf").write_bytes((root / ROOT_CONFIG).read_bytes())
+    env = clean_env(tools, {
+        "HOME": str(home), "AWS_ACCESS_KEY_ID": inputs["AWS_ACCESS_KEY_ID"],
+        "AWS_SECRET_ACCESS_KEY": inputs["AWS_SECRET_ACCESS_KEY"],
+        "AWS_ENDPOINT_URL_S3": r2_endpoint(inputs["CLOUDFLARE_ACCOUNT_ID"]),
+        "AWS_EC2_METADATA_DISABLED": "true",
+        "TF_ENCRYPTION": encryption_config(ROOT_KEY_NAME, inputs["RENT_STATE_PASSPHRASE"]),
+        "TF_IN_AUTOMATION": "1", "TF_INPUT": "0",
+    })
+    tofu(tools, work, env, runner, "init", "-input=false", "-no-color",
+         f"-backend-config=bucket={inputs['RENT_STATE_BUCKET']}", f"-backend-config=key={key}")
+    payload = tofu(tools, work, env, runner, "state", "pull")
+    require(0 < len(payload) <= ROOT_INSPECT_STATE_LIMIT, "rent-root state size UNKNOWN")
+    try:
+        state = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise EnvsError("rent-root state is not valid JSON") from None
+    require(isinstance(state, dict) and isinstance(state.get("lineage"), str) and state["lineage"]
+            and type(state.get("serial")) is int and state["serial"] > 0,
+            "rent-root state identity UNKNOWN")
+    resources = state.get("resources")
+    require(isinstance(resources, list), "rent-root managed resource set UNKNOWN")
+    managed = [item for item in resources if isinstance(item, dict) and item.get("mode") == "managed"]
+    require(len(managed) == len(ROOT_INSPECT_RESOURCE_TYPES)
+            and {item.get("type") for item in managed} == ROOT_INSPECT_RESOURCE_TYPES
+            and all(item.get("name") == "rent" for item in managed),
+            "rent-root state owned-resource identity UNKNOWN")
+
+    # Cloudflare GET-only bounded pages. Counts intentionally do not claim
+    # object identity, equality to state, complete Q or an accepted delta.
+    progress["stage"] = "cloudflare_read"
+    account, zone, token = (inputs[name] for name in
+                            ("CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_ZONE_ID", "CLOUDFLARE_API_TOKEN"))
+    routes = (
+        ("tunnels", f"/accounts/{account}/cfd_tunnel?per_page=50"),
+        ("applications", f"/accounts/{account}/access/apps?per_page=50"),
+        ("service_tokens", f"/accounts/{account}/access/service_tokens?per_page=50"),
+        ("dns", f"/zones/{zone}/dns_records?per_page=50"),
+    )
+    counts: dict[str, int] = {}
+    for label, path in routes:
+        status, reply = api("GET", path, token, None)
+        require(status == 200 and isinstance(reply, dict) and reply.get("success") is True,
+                "rent-root Cloudflare read is UNKNOWN")
+        values, page = reply.get("result"), reply.get("result_info")
+        require(isinstance(values, list) and len(values) <= 50
+                and isinstance(page, dict) and type(page.get("total_pages")) is int
+                and page["total_pages"] == 1, "rent-root Cloudflare inventory page is UNKNOWN")
+        counts[label] = len(values)
+    progress["stage"] = "complete"
+    return {
+        "kind": "envs.rentRootInspect.v1", "status": "BOUNDED_READ_ONLY",
+        "old_state": "PRESENT_ENCRYPTED_READ", "old_lock": "ABSENT",
+        "managed_root_resources": len(managed), "cloudflare_counts": counts,
+        "world_state_equivalence": "NOT_PROVEN", "provider_delta_F": "NOT_PROVEN",
+        "native_migration": "NOT_RUN", "effect": "NONE",
+    }
+
 def s3_facts(operation: Mapping[str, Any]) -> dict[str, Any]:
     if operation["ok"]:
         return dict(NO_FAILURE_FACTS)
@@ -2744,6 +2881,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     sub.add_parser("rent-client")
     # Applies the persistent root and seals both envelopes; its inputs come only from the declared environment.
     sub.add_parser("rent-root")
+    # S2 source composes the closed future read-only entry, never activates it.
+    sub.add_parser("rent-root-inspect")
     sub.add_parser("rent-access-probe")
     sub.add_parser("rent-access-locate")
     sub.add_parser("rent-state-proof")
@@ -2800,6 +2939,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                     print(f"RENT_ROOT_INIT_HINT_UNVERIFIED={progress['init_hint']}", file=sys.stderr)
                 return 1
             print(json.dumps(result, indent=2, sort_keys=True))
+        elif args.command == "rent-root-inspect":
+            # Closed source/phase gate runs before any contract, env, tool,
+            # secret read or child. Never disclose traceback or secret input.
+            progress: dict[str, str] = {}
+            try:
+                result = rent_root_inspect(root, progress=progress)
+            except Exception as exc:
+                kind = failure_class(exc) if isinstance(exc, STATE_FAILURES) else "other"
+                print(f"RENT_ROOT_INSPECT=RED: {kind} at {progress.get('stage', 'source_guard')}", file=sys.stderr)
+                return 1
+            print(json.dumps(result, sort_keys=True))
         elif args.command in {"rent-access-probe", "rent-access-locate"}:
             result = access_probe(root, locate_only=args.command == "rent-access-locate")
             print(json.dumps(result, indent=2, sort_keys=True))
