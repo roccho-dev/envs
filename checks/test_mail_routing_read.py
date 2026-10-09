@@ -140,9 +140,14 @@ def test_transport_no_redirect_no_proxy() -> None:
 
         def https_open(self, req: urllib.request.Request):
             self.calls.append(req.full_url)
-            return urllib.response.addinfourl(
-                io.BytesIO(b""), {"Location": self.location}, req.full_url, code=self.code,
-            )
+            response = Response(b"")
+            response.code = self.code
+            response.status = self.code
+            response.msg = "synthetic redirect"
+            response.info = lambda: {"Location": self.location}
+            response.geturl = lambda: req.full_url
+            response.close = lambda: None
+            return response
 
     prior = {key: os.environ.get(key) for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")}
     try:
