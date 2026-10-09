@@ -1,0 +1,88 @@
+name: probe-dev-mail-routing
+
+on:
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: Non-secret exact M0 zone domain; this input is visible in GitHub run metadata, never include mailbox/contacts
+        type: string
+        required: true
+      expected_source_sha:
+        description: Exact canonical source SHA approved for the one read-only dispatch
+        type: string
+        required: true
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: probe-dev-mail-routing
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    # GitHub principal admission, NOT an assertion that the P/R/W chat roles
+    # can be distinguished when they use the same GitHub login.
+    if: github.repository == 'roccho-org/envs' && github.ref_name == 'proposals' && github.sha == inputs.expected_source_sha && github.run_attempt == 1 && github.actor == 'roccho-dev' && github.actor_id == '40359643' && github.triggering_actor == 'roccho-dev'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: dev-projection
+    steps:
+      - name: Checkout exact canonical revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      # Consumes the artifact that check provided for this exact SHA; nothing is built or installed here.
+      - name: Obtain provided effect artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ENVS_SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          echo "platform: $ImageOS $ImageVersion"
+          api="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions"
+          auth="Authorization: Bearer $GH_TOKEN"
+          art="$(mktemp -d)"
+          curl -fsSL -H "$auth" -o "$art/list.json" "$api/artifacts?name=envs-effect-$ENVS_SOURCE_SHA&per_page=100"
+          jq -e '[.artifacts[] | select(.expired | not)] | length == 1 and (.[0].digest | test("^sha256:[0-9a-f]{64}$"))' "$art/list.json" >/dev/null
+          jq '[.artifacts[] | select(.expired | not)][0]' "$art/list.json" >"$art/artifact.json"
+          id="$(jq -r '.id' "$art/artifact.json")"
+          digest="$(jq -r '.digest' "$art/artifact.json")"
+          run_id="$(jq -r '.workflow_run.id' "$art/artifact.json")"
+          curl -fsSL -H "$auth" -o "$art/run.json" "$api/runs/$run_id"
+          jq -e --arg sha "$ENVS_SOURCE_SHA" --arg branch "${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}" --arg repo "$GITHUB_REPOSITORY" --arg current "$GITHUB_RUN_ID" \
+            '.path == ".github/workflows/check.yml" and .head_sha == $sha and .head_branch == $branch and .repository.full_name == $repo and .head_repository.full_name == $repo and ((.id | tostring) == $current or (.event == "push" and .conclusion == "success"))' \
+            "$art/run.json" >/dev/null
+          curl -fsSL -H "$auth" -o "$art/envs-effect.zip" "$api/artifacts/$id/zip"
+          echo "${digest#sha256:}  $art/envs-effect.zip" | sha256sum -c -
+          unzip -q "$art/envs-effect.zip" -d "$art/content"
+          test "$(ls -A "$art/content")" = envs-effect.tar
+          test "$(tar -xOf "$art/content/envs-effect.tar" SOURCE)" = "$ENVS_SOURCE_SHA"
+          entry="$(tar -xOf "$art/content/envs-effect.tar" ENTRY)"
+          [[ "$entry" =~ ^/nix/store/[0-9a-z]{32}-envs-effect-toolchain/bin/envs-effect$ ]]
+          sudo mkdir -p /nix/store
+          sudo tar -x -C / -f "$art/content/envs-effect.tar" nix/store
+          test -x "$entry"
+          echo "artifact: run=$run_id id=$id digest=$digest entry=$entry"
+          echo "ENVS_EFFECT_BIN=${entry%/envs-effect}" >>"$GITHUB_ENV"
+          echo "ENVS_EFFECT_DIGEST=$digest" >>"$GITHUB_ENV"
+          echo "ENVS_EFFECT_ZIP=$art/envs-effect.zip" >>"$GITHUB_ENV"
+
+      - name: Record effect toolchain identity
+        run: '"$ENVS_EFFECT_BIN/envs-effect" --root "$GITHUB_WORKSPACE" toolchain'
+
+      # P's v2 boundary allows the EXISTING non-secret account locator
+      # (dev-projection Variable) in the native step environment. GitHub may
+      # display this locator and the selected domain in run metadata; neither
+      # is a credential, and the selected domain is an ordinary non-secret
+      # workflow_dispatch input. NEVER put mailbox/contact data in domain.
+      # The existing masked token is the ONLY secret. A failed Cloudflare GET
+      # cannot fall back to a different account, token or Environment.
+      - name: Read selected Cloudflare zone under existing account
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: '"$ENVS_EFFECT_BIN/mail-routing-read"'

@@ -22,12 +22,14 @@ REQUIRED_FILES = {
     ".github/workflows/probe-dev-rent-access-ssh.yml",
     ".github/workflows/probe-dev-rent-state.yml",
     ".github/workflows/probe-dev-linode-read.yml",
+    ".github/workflows/probe-dev-mail-routing.yml",
     ".gitignore",
     "LICENSE_POLICY.md",
     "LICENSES/README.md",
     "README.md",
     "THIRD_PARTY_NOTICES.md",
     "adapters/jev_api.py",
+    "adapters/mail_routing_read.py",
     "adapters/place.ps1",
     "adapters/rent-receive.sh",
     "checks/repository.py",
@@ -35,6 +37,7 @@ REQUIRED_FILES = {
     "checks/test_rent_access_probe.py",
     "checks/test_rent_state_proof.py",
     "checks/test_linode_read_probe.py",
+    "checks/test_mail_routing_read.py",
     "checks/test_rent_tunnel.py",
     "checks/test_repository.py",
     "contracts/bindings.jsonl",
@@ -155,6 +158,7 @@ EFFECT_WORKFLOWS = {
     "probe-dev-rent-access-ssh.yml": "dev.rent-access-probe",
     "probe-dev-rent-state.yml": "dev.rent-state-proof",
     "probe-dev-linode-read.yml": "dev.linode-read-probe",
+    "probe-dev-mail-routing.yml": "dev.projection",
 }
 PROBE_CONFIG = "providers/dev-rent-access-probe/main.tf"
 RENT_CONFIG = "providers/dev-rent-cloudflare/main.tf"
@@ -541,10 +545,13 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]],
     require("run: python3 checks/test_rent_access_probe.py\n" in check, "check workflow must test the access probe adapter")
     require("run: python3 checks/test_rent_state_proof.py\n" in check, "check workflow must test the state proof adapter")
     require("run: python3 checks/test_linode_read_probe.py\n" in check, "check workflow must test the Linode read probe")
+    require("run: python3 checks/test_mail_routing_read.py\n" in check, "check must run Mail GET-only/redaction selftest")
     require(TOOLCHAIN_BUILD in check, "check workflow must reconstruct the effect toolchain")
     require(f'{TOOLCHAIN_BIN}envs-effect" toolchain' in check, "check workflow must execute the effect entry")
     require(f'{TOOLCHAIN_BIN}python3" -I checks/test_jev_api.py' in check,
             "check workflow must test the adapter on the toolchain interpreter")
+    require(f'{TOOLCHAIN_BIN}python3" -I checks/test_mail_routing_read.py' in check,
+            "check must test Mail adapter on the pinned toolchain interpreter")
     require('nix flake lock "$relock"' in check and 'cmp flake.lock "$relock/flake.lock"' in check,
             "check workflow must prove Nix regenerates the committed lock")
     for tool in ("python3", "sops", "git", "gh", "wrangler"):
@@ -639,6 +646,12 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]],
         require(re.search(r"(?m)^ {0,4}env:", text) is None, f"{name}: workflow or job env is forbidden")
         # The author Environment also carries each binding's declared inputs; its steps prove which one reads which.
         declared = set().union(*author_targets.values()) if name == "author-dev-jev-api.yml" else declared_inputs(row)
+        if name == "probe-dev-mail-routing.yml":
+            # P v2 explicitly permits this ONE existing non-secret account
+            # locator at the native vars-to-runtime boundary. It is not a
+            # credential or a claim of Cloudflare API Write permission.
+            declared = {("secrets", "CLOUDFLARE_API_TOKEN"), ("vars", "CLOUDFLARE_ACCOUNT_ID")}
+            require(declared <= declared_inputs(row), "Mail must reuse the existing dev-projection slots")
         keys = set(EFFECT_ENV.findall(rest))
         allowed = EFFECT_STEP_KEYS | {input_name for _, input_name in declared}
         require(keys <= allowed, f"{name}: step env or input not allowed: {sorted(keys - allowed)}")
@@ -655,11 +668,16 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]],
         require("workflow_dispatch:" in text, f"{name}: manual dispatch missing")
         require("\n  push:" not in text and "\n  pull_request:" not in text, f"{name}: automatic effect trigger")
         require(f"environment: {row['github_environment']}" in text, f"{name}: static Environment differs")
-        expected_repo = "roccho-org/envs" if name == "author-dev-jev-api.yml" else "roccho-dev/envs"
+        expected_repo = "roccho-org/envs" if name in {"author-dev-jev-api.yml", "probe-dev-mail-routing.yml"} else "roccho-dev/envs"
         require(f"github.repository == '{expected_repo}'" in text, f"{name}: repository guard missing")
         require("github.ref_name == 'proposals'" in text, f"{name}: canonical ref guard missing")
         require("ref: ${{ github.sha }}" in text, f"{name}: exact checkout missing")
-        require("main" not in text, f"{name}: main must not be an effect source")
+        if name == "probe-dev-mail-routing.yml":
+            # 'domain' contains the spelling 'main'; verify the actual branch.
+            require("refs/heads/main" not in text and "github.ref_name == 'main'" not in text,
+                    "Mail read must not run on main")
+        else:
+            require("main" not in text, f"{name}: main must not be an effect source")
         require(set(INPUT_REFERENCE.findall(text)) == declared, f"{name}: Environment inputs differ from contract")
         for namespace, input_name in sorted(declared):
             mapping = "^\\s+" + re.escape(f"{input_name}: ${{{{ {namespace}.{input_name} }}}}") + "$"
@@ -699,6 +717,33 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]],
             "Linode read workflow entry call missing")
     require("permissions:\n  actions: read\n  contents: read\n" in linode and "write" not in linode,
             "Linode read workflow must be read-only on the repository")
+    mail = texts["probe-dev-mail-routing.yml"]
+    require("permissions:\n  actions: read\n  contents: read\n" in mail and "write" not in mail,
+            "Mail read workflow must have only repository read permissions")
+    require("github.sha == inputs.expected_source_sha && github.run_attempt == 1" in mail,
+            "Mail read is limited to approved exact source and first attempt")
+    require("      domain:\n" in mail and "        required: true\n" in mail
+            and "domain_sha256" not in mail,
+            "Mail must use one exact non-secret native domain selector")
+    require('        run: \'"$ENVS_EFFECT_BIN/mail-routing-read"\'\n' in mail,
+            "Mail read must use the provided toolchain entry")
+    require("SOPS_AGE_KEY" not in mail and "AWS_" not in mail and "CLOUDFLARE_ZONE_ID" not in mail,
+            "Mail read must not borrow age/rent/state secrets or zone identifiers")
+    require("GITHUB_EVENT_PATH" not in mail or "      domain:\n" in mail,
+            "Mail selected domain must be read from the native event file")
+    require("inputs.domain" not in mail,
+            "Domain must never be interpolated into a shell/env/argv expression")
+    require("CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}" in mail,
+            "Mail must use the existing native non-secret account Variable, without a REST auth dependency")
+    # The existing artifact-consumer step must retain its own GH_TOKEN.
+    # Only the final Cloudflare read step must not request another GitHub
+    # token/REST permission to fetch an existing Environment Variable.
+    read_step = mail.split("      - name: Read selected Cloudflare zone under existing account\n", 1)
+    require(len(read_step) == 2 and "GH_TOKEN: ${{ github.token }}" not in read_step[1],
+            "Mail read step must not add a second GitHub token/REST dependency")
+    require("github.actor == 'roccho-dev'" in mail and "github.actor_id == '40359643'" in mail
+            and "github.triggering_actor == 'roccho-dev'" in mail,
+            "Mail dispatch must admit only the fixed GitHub controller, without claiming chat role identity")
 
 
 def check_toolchain(root: Path, adapter) -> None:
@@ -717,6 +762,10 @@ def check_toolchain(root: Path, adapter) -> None:
     require("export SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt" in flake,
             "the entry must carry its own CA bundle for provider retrieval")
     require('exec ${tools.python3} -I ${self}/adapters/jev_api.py "$@"' in flake, "flake entry must run only the adapter")
+    require('exec ${tools.python3} -I ${self}/adapters/mail_routing_read.py' in flake,
+            "Mail read must use the exact pinned interpreter/source")
+    require('paths = [ entry contract-projection mail-routing-read ] ++ packages;' in flake,
+            "Mail read must be included in the same artifact closure")
     require("closureInfo { rootPaths = [ effect-toolchain ]; }" in flake and "echo ${effect-toolchain}/bin/envs-effect > ENTRY" in flake,
             "flake artifact must carry the whole entry closure and its ENTRY")
     require('rev = self.rev or (throw "' in flake and "echo ${rev} > SOURCE" in flake and "ENTRY SOURCE $(cat" in flake
