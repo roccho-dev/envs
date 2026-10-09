@@ -735,7 +735,11 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]],
             "Domain must never be interpolated into a shell/env/argv expression")
     require("CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}" in mail,
             "Mail must use the existing native non-secret account Variable, without a REST auth dependency")
-    require("GH_TOKEN: ${{ github.token }}" not in mail,
+    # The existing artifact-consumer step must retain its own GH_TOKEN.
+    # Only the final Cloudflare read step must not request another GitHub
+    # token/REST permission to fetch an existing Environment Variable.
+    read_step = mail.split("      - name: Read selected Cloudflare zone under existing account\n", 1)
+    require(len(read_step) == 2 and "GH_TOKEN: ${{ github.token }}" not in read_step[1],
             "Mail read step must not add a second GitHub token/REST dependency")
     require("github.actor == 'roccho-dev'" in mail and "github.actor_id == '40359643'" in mail
             and "github.triggering_actor == 'roccho-dev'" in mail,
