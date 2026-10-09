@@ -51,6 +51,9 @@ jobs:
       - name: Test Linode read probe adapter
         run: python3 checks/test_linode_read_probe.py
 
+      - name: Test credential-safe Mail Routing read probe
+        run: python3 checks/test_mail_routing_read.py
+
       - name: Verify explicit main compatibility refresh
         if: github.ref_name == 'main'
         run: python3 checks/repository.py --verify-main-compatibility-refresh
@@ -811,6 +814,9 @@ jobs:
 
       - name: Test Linode read probe on the toolchain interpreter
         run: '"$RUNNER_TEMP/envs-effect/bin/python3" -I checks/test_linode_read_probe.py'
+
+      - name: Test Mail read probe with the provided Python
+        run: '"$RUNNER_TEMP/envs-effect/bin/python3" -I checks/test_mail_routing_read.py'
 
       # The locked closure sops encrypts and decrypts for real; check-only age makes throwaway identities in a temp dir.
       # The closure tofu applies an encrypted schema-only fixture root whose real output reaches the production sealer.
