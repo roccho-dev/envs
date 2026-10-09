@@ -882,6 +882,88 @@ def real_root_roundtrip(sops_bin: str, keygen_bin: str, tofu_bin: str) -> None:
     print(f"real root output to both envelopes: PASS (tofu={tofu_path}, sops={sops_path}); identities removed")
 
 
+
+# S2 SOURCE: real read-only inspector wired through the existing root tool
+# port, with every remote child replaced by finite synthetic fixture results.
+# In deployed source the first gate is permanently closed.
+def test_root_inspect_source_gate() -> None:
+    root = fresh_root()
+    runner = RootRunner()
+    before = snapshot(root)
+    out, err = io.StringIO(), io.StringIO()
+    with fixtures.environment(root_env()), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = jev.main(["--root", str(root), "rent-root-inspect"])
+    assert code == 1 and out.getvalue() == ""
+    assert err.getvalue() == "RENT_ROOT_INSPECT=RED: envs at source_guard\n", err.getvalue()
+    assert runner.calls == [] and snapshot(root) == before
+    assert jev.ROOT_INSPECT_SOURCE_ACTIVE is False
+
+
+def test_root_inspect_bounded_fixture() -> None:
+    root = fresh_root()
+    before = snapshot(root)
+    managed = [{"mode": "managed", "type": kind, "name": "rent"}
+               for kind in sorted(jev.ROOT_INSPECT_RESOURCE_TYPES)]
+    state = json.dumps({"lineage": "fixture-lineage", "serial": 3, "resources": managed}).encode()
+
+    class InspectRunner:
+        def __init__(self, state_reply: bytes = state, lock: str = "404") -> None:
+            self.calls: list[tuple[list[str], bytes | None, dict[str, str]]] = []
+            self.state_reply, self.lock = state_reply, lock
+
+        def __call__(self, argv, input_data, env):
+            self.calls.append((list(argv), input_data, dict(env or {})))
+            if argv[0] == fixtures.TOOLS["curl"]:
+                config = input_data.decode()
+                assert argv == [fixtures.TOOLS["curl"], "-q", "-I", "--config", "-"]
+                assert 'request = "HEAD"' in config
+                assert "aws-sigv4" in config and "data-binary" not in config
+                assert not any(value in str(argv) for value in ROOT_SECRET_VALUES)
+                assert set(env or {}).isdisjoint(jev.ROOT_SECRETS)
+                code = self.lock if ".tflock" in config else "200"
+                return subprocess.CompletedProcess(argv, 0, stdout=b"", stderr=code.encode())
+            assert argv[0] == fixtures.TOOLS["tofu"]
+            if argv[2] == "init":
+                assert "-backend-config=bucket=" + ROOT_VALUES["RENT_STATE_BUCKET"] in argv
+                assert "-backend-config=key=" + ROOT_VALUES["RENT_STATE_KEY"] in argv
+                return subprocess.CompletedProcess(argv, 0, stdout=b"", stderr=b"")
+            assert argv[2:] == ["state", "pull"]
+            assert env["TF_ENCRYPTION"] == jev.encryption_config("k0", ROOT_VALUES["RENT_STATE_PASSPHRASE"])
+            assert "CLOUDFLARE_API_TOKEN" not in env
+            return subprocess.CompletedProcess(argv, 0, stdout=self.state_reply, stderr=b"")
+
+    calls: list[tuple[str, str, str, object]] = []
+
+    def world(method, path, token, body):
+        calls.append((method, path, token, body))
+        assert method == "GET" and token == ROOT_VALUES["CLOUDFLARE_API_TOKEN"] and body is None
+        return (200, {"success": True, "result": [{"id": "synthetic"}], "result_info": {"total_pages": 1}})
+
+    saved = jev.ROOT_INSPECT_SOURCE_ACTIVE
+    jev.ROOT_INSPECT_SOURCE_ACTIVE = True
+    try:
+        with fixtures.environment(root_env()):
+            positive = InspectRunner()
+            result = jev.rent_root_inspect(root, runner=positive, api=world)
+            assert result["status"] == "BOUNDED_READ_ONLY"
+            assert result["old_state"] == "PRESENT_ENCRYPTED_READ" and result["old_lock"] == "ABSENT"
+            assert result["managed_root_resources"] == 6
+            assert result["world_state_equivalence"] == "NOT_PROVEN"
+            assert result["provider_delta_F"] == "NOT_PROVEN" and result["native_migration"] == "NOT_RUN"
+            assert len(positive.calls) == 4 and len(calls) == 4
+            assert all(call[0] == "GET" for call in calls)
+            assert not any(c in {"apply", "plan", "import", "destroy"} for args, _, _ in positive.calls for c in args)
+            for wrong in (InspectRunner(lock="200"), InspectRunner(state_reply=b"{}")):
+                try:
+                    jev.rent_root_inspect(root, runner=wrong, api=world)
+                except jev.EnvsError:
+                    pass
+                else:
+                    raise AssertionError("unsafe inspect fixture passed")
+    finally:
+        jev.ROOT_INSPECT_SOURCE_ACTIVE = saved
+    assert snapshot(root) == before and jev.ROOT_INSPECT_SOURCE_ACTIVE is False
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--sops")
@@ -905,6 +987,8 @@ def main() -> None:
         test_root_after_write()
         test_root_main()
         test_root_init_hint()
+        test_root_inspect_source_gate()
+        test_root_inspect_bounded_fixture()
         if args.sops is None:
             print("real SOPS roundtrip: NOT RUN (the check workflow runs it with --sops, --age-keygen and --tofu)")
         else:

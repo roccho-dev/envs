@@ -655,7 +655,7 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]],
         require("workflow_dispatch:" in text, f"{name}: manual dispatch missing")
         require("\n  push:" not in text and "\n  pull_request:" not in text, f"{name}: automatic effect trigger")
         require(f"environment: {row['github_environment']}" in text, f"{name}: static Environment differs")
-        expected_repo = "roccho-org/envs" if name == "author-dev-jev-api.yml" else "roccho-dev/envs"
+        expected_repo = "roccho-org/envs" if name in {"author-dev-jev-api.yml", "project-dev-rent-tunnel.yml"} else "roccho-dev/envs"
         require(f"github.repository == '{expected_repo}'" in text, f"{name}: repository guard missing")
         require("github.ref_name == 'proposals'" in text, f"{name}: canonical ref guard missing")
         require("ref: ${{ github.sha }}" in text, f"{name}: exact checkout missing")
@@ -669,8 +669,20 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]],
     check_author_targets(texts["author-dev-jev-api.yml"], author_targets)
     require(f"{EFFECT_ENTRY} project" in texts["project-dev-jev-api.yml"], "project workflow entry call missing")
     rent = texts["project-dev-rent-tunnel.yml"]
-    require(f"run: '{EFFECT_ENTRY} rent-root'" in rent and rent.count(f"{EFFECT_ENTRY} rent-") == 1,
-            "rent workflow must run only the persistent root entry")
+    # S2: the selected whole-job if is literal false, before Environment
+    # resolution, consumer/artifact, inspect, apply, ciphertext or PR handoff.
+    rent_guard = ("    if: ${{ false && github.repository == 'roccho-org/envs' "
+                  "&& github.ref_name == 'proposals' }}")
+    require(rent.count(rent_guard) == 1 and
+            rent.find(rent_guard) < rent.find("    runs-on:") < rent.find("    environment:"),
+            "selected rent workflow must remain source-hard-inactive before Environment")
+    inspect_entry = f"run: '{EFFECT_ENTRY} rent-root-inspect'"
+    apply_entry = f"run: '{EFFECT_ENTRY} rent-root'"
+    require(rent.count(inspect_entry) == 1 and rent.count(apply_entry) == 1 and
+            rent.count(f"{EFFECT_ENTRY} rent-") == 2 and
+            rent.find("Record effect toolchain identity") < rent.find(inspect_entry) < rent.find(apply_entry)
+            < rent.find("Open ciphertext handoff PR"),
+            "rent must select inspect before apply/handoff, all under one hard-inactive job")
     require('"$tool/git" add ciphertexts/dev-rent-tunnel.sops.yaml ciphertexts/dev-rent-client.sops.yaml '
             'contracts/environments.jsonl\n' in rent and rent.count('"$tool/git" add ') == 1,
             "rent handoff must stage only both ciphertexts and plane state")

@@ -92,6 +92,15 @@ def main() -> None:
                      ("      github.event.issue.pull_request == null", "      true")):
         expect_red(replace_text(caller, old, new))
     expect_red(append_branch_effect)
+    # S2 selected workflow: removing/reversing the single literal false
+    # would admit secrets and possibly the entire old apply/handoff chain.
+    selected = ".github/workflows/project-dev-rent-tunnel.yml"
+    literal = "if: ${{ false && github.repository == 'roccho-org/envs' && github.ref_name == 'proposals' }}"
+    expect_red(replace_text(selected, literal, literal.replace("false", "true")))
+    expect_red(replace_text(selected, literal, literal.replace("false && ", "")))
+    expect_red(replace_text(selected, literal, literal.replace("roccho-org/envs", "roccho-dev/envs")))
+    expect_red(replace_text(selected, "rent-root-inspect'", "rent-root-other'"))
+    expect_red(replace_text(selected, "rent-root-inspect'", "rent-root'"))
 
     def add_database_path(root: Path) -> None:
         name = "duck" + "db"

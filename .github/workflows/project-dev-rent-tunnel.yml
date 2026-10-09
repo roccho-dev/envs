@@ -14,7 +14,9 @@ concurrency:
 
 jobs:
   project:
-    if: github.repository == 'roccho-dev/envs' && github.ref_name == 'proposals'
+    # S2 hard-inactive at the job admission gate BEFORE Environment secrets, checkout, or any child.
+    # Requires a separate readiness/operation source grant to activate any selector, including inspect.
+    if: ${{ false && github.repository == 'roccho-org/envs' && github.ref_name == 'proposals' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     environment: dev-rent-tunnel
@@ -63,6 +65,25 @@ jobs:
 
       - name: Record effect toolchain identity
         run: '"$ENVS_EFFECT_BIN/envs-effect" --root "$GITHUB_WORKSPACE" toolchain'
+
+      # Future read-only preflight. The job is explicitly hard-inactive:
+      # no Environment secrets or child can be reached in S2 SOURCE.
+      - name: Inspect old S3 state/lock and Cloudflare world (not activated)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          RENT_STATE_PASSPHRASE: ${{ secrets.RENT_STATE_PASSPHRASE }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_ZONE_ID: ${{ vars.CLOUDFLARE_ZONE_ID }}
+          RENT_HOSTNAME: ${{ vars.RENT_HOSTNAME }}
+          RENT_ORIGIN_SERVICE: ${{ vars.RENT_ORIGIN_SERVICE }}
+          RENT_SERVICE_TOKEN_DURATION: ${{ vars.RENT_SERVICE_TOKEN_DURATION }}
+          RENT_STATE_BUCKET: ${{ vars.RENT_STATE_BUCKET }}
+          RENT_STATE_KEY: ${{ vars.RENT_STATE_KEY }}
+          RENT_AGE_RECIPIENT: ${{ vars.RENT_AGE_RECIPIENT }}
+          RENT_CLIENT_AGE_RECIPIENT: ${{ vars.RENT_CLIENT_AGE_RECIPIENT }}
+        run: '"$ENVS_EFFECT_BIN/envs-effect" --root "$GITHUB_WORKSPACE" rent-root-inspect'
 
       # Standard OpenTofu applies the persistent root on its encrypted, locked R2 backend; its sensitive credentials
       # output stays in memory and is sealed to the two target recipients. Secrets reach only the OpenTofu and SOPS
