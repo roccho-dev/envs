@@ -1081,9 +1081,32 @@ jobs:
         run: |
           set -euo pipefail
           test "$MISSING" = failure
+          # Old fixture: overwriting offset 4096 with 'x' did not alter an
+          # artifact that already contained 'x' there. Regress both x (the
+          # collision) and y (the ordinary case) with existing native tools.
+          for original_byte in x y; do
+            original="$RUNNER_TEMP/altered-byte-$original_byte"
+            changed="$original.changed"
+            printf '%4096s%s' '' "$original_byte" >"$original"
+            cp "$original" "$changed"
+            printf 'x' >>"$changed"
+            if cmp -s "$original" "$changed"; then
+              echo "synthetic altered fixture was unchanged" >&2
+              exit 1
+            fi
+          done
+          # Check the unmodified downloaded artifact against its actual
+          # expected SHA-256; never replace/relax the trusted digest.
+          echo "${ENVS_EFFECT_DIGEST#sha256:}  $ENVS_EFFECT_ZIP" | sha256sum -c -
           altered="$RUNNER_TEMP/altered.zip"
           cp "$ENVS_EFFECT_ZIP" "$altered"
-          printf 'x' | dd of="$altered" bs=1 seek=4096 conv=notrunc status=none
+          # Appending a byte changes the file for *every* original byte
+          # pattern, including an existing 'x' at the old fixed offset.
+          printf 'x' >>"$altered"
+          if cmp -s "$ENVS_EFFECT_ZIP" "$altered"; then
+            echo "altered artifact copy matched original" >&2
+            exit 1
+          fi
           if echo "${ENVS_EFFECT_DIGEST#sha256:}  $altered" | sha256sum -c -; then
             echo "altered artifact was accepted" >&2
             exit 1

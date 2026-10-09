@@ -607,6 +607,21 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]],
     source_check = CONSUMER_BINDING[-1]
     require(clean_start.count(program) == 3 and clean_start.count(source_check) == 3,
             "clean-start must run the canonical producer and SOURCE checks against mismatches")
+    # The altered-archive fixture MUST demonstrably change bytes, not just
+    # repeat a literal that may already occupy the previous fixed offset.
+    # The two cases are exercised by the existing clean-start native shell.
+    for marker in (
+        "for original_byte in x y; do",
+        """printf '%4096s%s' '' "$original_byte" >"$original" """.strip(),
+        """printf 'x' >>"$changed" """.strip(),
+        'if cmp -s "$original" "$changed"; then',
+        'echo "${ENVS_EFFECT_DIGEST#sha256:}  $ENVS_EFFECT_ZIP" | sha256sum -c -',
+        """printf 'x' >>"$altered" """.strip(),
+        'if cmp -s "$ENVS_EFFECT_ZIP" "$altered"; then',
+    ):
+        require(marker in clean_start, f"clean-start altered-artifact guarantee missing: {marker}")
+    require("""printf 'x' | dd of="$altered" bs=1 seek=4096""" not in clean_start,
+            "clean-start must not reuse the collision-prone fixed-offset overwrite")
     for marker in (
         'test "$MISSING" = failure',
         'if echo "${ENVS_EFFECT_DIGEST#sha256:}  $altered" | sha256sum -c -; then',
