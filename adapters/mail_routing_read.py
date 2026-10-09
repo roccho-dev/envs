@@ -26,12 +26,19 @@ STEPS = ("token", "zone", "dns", "routing", "routing_dns", "rules", "catch_all",
 MAX_RESPONSE = 1_000_000
 MAX_PAGES = 100
 PAGE_SIZE = 50
+# Only one bounded, non-secret reason for an UNKNOWN zone selection. Never
+# include response bodies, HTTP codes, identifiers, request URLs or exceptions.
+ZONE_UNKNOWN_REASONS = frozenset((
+    "transport", "http_other", "invalid_payload_or_pagination",
+    "zero_match", "multiple_match", "owner_or_id_mismatch", "unclassified",
+))
 Opener = Callable[..., Any]
 
 
 class ReadFailure(Exception):
-    def __init__(self, state: str = "UNKNOWN") -> None:
+    def __init__(self, state: str = "UNKNOWN", reason: str = "invalid_payload_or_pagination") -> None:
         self.state = state
+        self.reason = reason if state == "UNKNOWN" and reason in ZONE_UNKNOWN_REASONS else None
 
 
 class DenyRedirect(urllib.request.HTTPRedirectHandler):
@@ -89,7 +96,7 @@ def _request(opener: Opener, token: str, path: str, params: Mapping[str, object]
     try:
         with opener(req, timeout=12) as response:
             if getattr(response, "status", 200) != 200:
-                raise ReadFailure("DENIED" if response.status in (401, 403) else "UNKNOWN")
+                raise ReadFailure("DENIED" if response.status in (401, 403) else "UNKNOWN", "http_other")
             raw = response.read(MAX_RESPONSE + 1)
         if len(raw) > MAX_RESPONSE:
             raise ReadFailure()
@@ -100,9 +107,11 @@ def _request(opener: Opener, token: str, path: str, params: Mapping[str, object]
             raise ReadFailure()
         return payload
     except urllib.error.HTTPError as error:
-        raise ReadFailure("DENIED" if error.code in (401, 403) else "UNKNOWN") from None
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError, TypeError, UnicodeError):
-        raise ReadFailure() from None
+        raise ReadFailure("DENIED" if error.code in (401, 403) else "UNKNOWN", "http_other") from None
+    except (urllib.error.URLError, TimeoutError, OSError):
+        raise ReadFailure(reason="transport") from None
+    except (ValueError, TypeError, UnicodeError):
+        raise ReadFailure(reason="invalid_payload_or_pagination") from None
 
 
 def _list(opener: Opener, token: str, path: str,
@@ -120,8 +129,17 @@ def _list(opener: Opener, token: str, path: str,
         total_pages = info.get("total_pages")
         total_count = info.get("total_count")
         if (type(total_pages) is not int or type(total_count) is not int
-                or total_pages < 1 or total_pages > MAX_PAGES or total_count < 0
-                or total_count > MAX_PAGES * PAGE_SIZE):
+                or total_pages < 0 or total_pages > MAX_PAGES or total_count < 0
+                or total_count > MAX_PAGES * PAGE_SIZE
+                or info.get("page", page) != page
+                or info.get("count", len(batch)) != len(batch)
+                or info.get("per_page", PAGE_SIZE) != PAGE_SIZE):
+            raise ReadFailure()
+        # Cloudflare may express an empty paginated list as total_pages=0
+        # or 1. Both mean zero matches, not a malformed response.
+        if page == 1 and total_count == 0 and total_pages == 0 and not batch:
+            return []
+        if total_pages == 0:
             raise ReadFailure()
         if expected_total is not None and total_count != expected_total:
             raise ReadFailure()
@@ -169,10 +187,14 @@ def observe(event_path: str, environ: Mapping[str, str], opener: Opener | None =
             result = fetch()
         except ReadFailure as failure:
             output["read"][step] = failure.state
+            if step == "zone" and failure.state == "UNKNOWN":
+                output["zone_unknown_reason"] = failure.reason or "unclassified"
             return None
         except Exception:
             # Fail closed even for malformed provider/opener implementations.
             output["read"][step] = "UNKNOWN"
+            if step == "zone":
+                output["zone_unknown_reason"] = "unclassified"
             return None
         output["read"][step] = "OBSERVED"
         return result
@@ -200,12 +222,14 @@ def observe(event_path: str, environ: Mapping[str, str], opener: Opener | None =
         return output
     if len(zones) != 1:
         output["read"]["zone"] = "UNKNOWN"
+        output["zone_unknown_reason"] = "zero_match" if not zones else "multiple_match"
         return output
     zone = zones[0]
     owner = zone.get("account")
     if (zone.get("name") != domain or not isinstance(owner, dict)
             or owner.get("id") != account or not ACCOUNT.fullmatch(str(zone.get("id", "")))):
         output["read"]["zone"] = "UNKNOWN"
+        output["zone_unknown_reason"] = "owner_or_id_mismatch"
         return output
 
     zone_id = zone["id"]

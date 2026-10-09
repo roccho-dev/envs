@@ -56,13 +56,22 @@ class Response:
 class Fake:
     """Every mocked call asserts pinned origin, GET and correct bearer."""
     def __init__(self, deny: str = "", bad: str = "", wrong_account: bool = False,
-                 duplicate: bool = False, overrides: dict[str, object] | None = None) -> None:
+                 duplicate: bool = False, overrides: dict[str, object] | None = None,
+                 zone_reply: bytes | None = None, zone_http: int | None = None,
+                 zone_transport: bool = False, zone_id: str = ZONE,
+                 wrong_name: bool = False, zone_unexpected: bool = False) -> None:
         self.calls: list[str] = []
         self.deny = deny
         self.bad = bad
         self.wrong_account = wrong_account
         self.duplicate = duplicate
         self.overrides = overrides or {}
+        self.zone_reply = zone_reply
+        self.zone_http = zone_http
+        self.zone_transport = zone_transport
+        self.zone_id = zone_id
+        self.wrong_name = wrong_name
+        self.zone_unexpected = zone_unexpected
 
     def __call__(self, req: urllib.request.Request, **kwargs: object):
         assert req.get_method() == "GET"
@@ -87,7 +96,16 @@ class Fake:
                 "name": [DOMAIN], "account.id": [ACCOUNT], "match": ["all"],
                 "page": ["1"], "per_page": ["50"],
             }
-            wanted = {"name": DOMAIN, "id": ZONE,
+            if self.zone_http is not None:
+                raise urllib.error.HTTPError(req.full_url, self.zone_http, TOKEN, {}, None)
+            if self.zone_transport:
+                raise urllib.error.URLError("private transport " + TOKEN)
+            if self.zone_unexpected:
+                raise RuntimeError("private internal " + TOKEN)
+            if self.zone_reply is not None:
+                return Response(self.zone_reply)
+            wanted = {"name": DOMAIN + ".other" if self.wrong_name else DOMAIN,
+                      "id": self.zone_id,
                       "account": {"id": "f" * 32 if self.wrong_account else ACCOUNT}}
             return Response(wrap([wanted, wanted] if self.duplicate else [wanted]))
         if path == f"/zones/{ZONE}/dns_records":
@@ -177,6 +195,7 @@ def main() -> None:
         assert answer["status"] == "READ_OBSERVED", answer
         assert all(s == "OBSERVED" for s in answer["read"].values())
         assert len(success.calls) == len(mail.STEPS)
+        assert "zone_unknown_reason" not in answer
         assert answer["write_authority"] == answer["mail_arrival"] == "NOT_PROVEN"
         assert answer["facts"]["token_active"] is True
         assert answer["facts"]["routing_ready"] is True and answer["facts"]["catch_all_enabled"] is False
@@ -203,6 +222,7 @@ def main() -> None:
         for fixture in (Fake(wrong_account=True), Fake(duplicate=True)):
             result = mail.observe(selected, ENV, fixture)
             assert result["status"] == "INCOMPLETE"
+            assert result["zone_unknown_reason"] in ("owner_or_id_mismatch", "multiple_match")
             assert "addresses" not in result["counts"]
             safe(result)
 
@@ -251,6 +271,86 @@ def main() -> None:
             assert result["status"] == "INCOMPLETE"
             assert result["read"]["token"] == "OBSERVED" and result["facts"]["token_active"] is False
             safe(result)
+
+        # Zone diagnostic is a single closed non-secret reason code for
+        # UNKNOWN *only*: these are fully synthetic original decision paths,
+        # never a second Cloudflare dispatch or a guessed scope diagnosis.
+        def zone_case(fixture: Fake, expected: str) -> None:
+            result = mail.observe(selected, ENV, fixture)
+            assert result["status"] == "INCOMPLETE"
+            assert result["read"]["token"] == "OBSERVED"
+            assert result["read"]["zone"] == "UNKNOWN"
+            assert result["zone_unknown_reason"] == expected, (result, expected)
+            assert expected in mail.ZONE_UNKNOWN_REASONS
+            assert result["facts"] == {"token_active": True}
+            assert result["counts"] == {}
+            assert all(result["read"][step] == "UNKNOWN"
+                       for step in mail.STEPS if step not in ("token", "zone"))
+            assert fixture.calls == ["/user/tokens/verify", "/zones"], fixture.calls
+            safe(result)
+
+        zone_case(Fake(overrides={"/zones": []}), "zero_match")
+        zero_pages = json.loads(wrap([]))
+        zero_pages["result_info"]["total_pages"] = 0
+        zone_case(Fake(zone_reply=json.dumps(zero_pages).encode()), "zero_match")
+        zone_case(Fake(duplicate=True), "multiple_match")
+        zone_case(Fake(wrong_account=True), "owner_or_id_mismatch")
+        zone_case(Fake(wrong_name=True), "owner_or_id_mismatch")
+        zone_case(Fake(zone_id="not-an-id"), "owner_or_id_mismatch")
+        for http_status in (302, 429, 500):
+            zone_case(Fake(zone_http=http_status), "http_other")
+        zone_case(Fake(zone_transport=True), "transport")
+        zone_case(Fake(zone_unexpected=True), "unclassified")
+        zone_case(Fake(bad="/zones"), "invalid_payload_or_pagination")
+        zone_case(Fake(zone_reply=b'{not-json-private-body'), "invalid_payload_or_pagination")
+        for broken in (
+            {"result_info": {"page": 1, "per_page": 50, "total_pages": 1, "total_count": 1},
+             "success": True, "result": []},
+            {"result_info": {"page": 2, "per_page": 50, "total_pages": 1, "total_count": 0},
+             "success": True, "result": []},
+            {"result_info": {"page": 1, "per_page": 50, "total_pages": 0, "total_count": 1},
+             "success": True, "result": [{"name": DOMAIN, "id": ZONE, "account": {"id": ACCOUNT}}]},
+            {"result_info": {"page": 1, "per_page": 50, "total_pages": "1", "total_count": 0},
+             "success": True, "result": []},
+        ):
+            zone_case(Fake(zone_reply=json.dumps(broken).encode()), "invalid_payload_or_pagination")
+
+        # An explicit 401/403 is DENIED, not UNKNOWN; a valid empty rules
+        # or account-destinations list is OBSERVED with an actual zero count.
+        for http_status in (401, 403):
+            fixture = Fake(zone_http=http_status)
+            denied = mail.observe(selected, ENV, fixture)
+            assert denied["read"]["zone"] == "DENIED"
+            assert "zone_unknown_reason" not in denied
+            safe(denied)
+        for path_name, count_key in (
+            (f"/zones/{ZONE}/email/routing/rules", "rules"),
+            (f"/accounts/{ACCOUNT}/email/routing/addresses", "account_destinations"),
+        ):
+            passed = mail.observe(selected, ENV, Fake(overrides={path_name: []}))
+            assert passed["status"] == "READ_OBSERVED"
+            assert passed["counts"][count_key] == 0
+            assert "zone_unknown_reason" not in passed
+            safe(passed)
+
+        # Exercise main() with synthetic *valid* account and mocked opener
+        # to establish that its actual public JSON retains only the enum.
+        prior_opener = mail.safe_opener
+        saved_env = dict(os.environ)
+        try:
+            mail.safe_opener = lambda: Fake(zone_transport=True)
+            os.environ.clear()
+            os.environ.update({**ENV, "GITHUB_EVENT_PATH": selected})
+            output = io.StringIO()
+            with redirect_stdout(output):
+                assert mail.main() == 2
+            exposed = json.loads(output.getvalue())
+            assert exposed["zone_unknown_reason"] == "transport"
+            safe(exposed)
+        finally:
+            mail.safe_opener = prior_opener
+            os.environ.clear()
+            os.environ.update(saved_env)
 
         result = mail.observe(selected, ENV, Fake(bad=f"/zones/{ZONE}/dns_records"))
         assert result["status"] == "INCOMPLETE" and result["read"]["dns"] == "UNKNOWN"
