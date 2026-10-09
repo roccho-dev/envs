@@ -161,7 +161,10 @@ def observe(event_path: str, environ: Mapping[str, str], opener: Opener = urllib
     zones = check("zone", lambda: _list(opener, token, "/zones", {
         "name": domain, "account.id": account, "match": "all",
     }))
-    if zones is None or len(zones) != 1:
+    if zones is None:
+        # Preserve an exact HTTP DENIED rather than rewriting it UNKNOWN.
+        return output
+    if len(zones) != 1:
         output["read"]["zone"] = "UNKNOWN"
         return output
     zone = zones[0]
