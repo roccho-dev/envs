@@ -49,6 +49,15 @@ same-Issue append/readback and first/next real evaluation are separate app gates
 
 `main` remains available, but it has no independent meaning, direct changes, pull-request base, Environment effect, or handoff identity. When `main` is refreshed, its push-time check requires that revision to equal the then-current `proposals` revision. There is no continuous synchronization claim; `main` may be stale between explicit compatibility refreshes.
 
+## Mail Cell: Consumer追加と認証追加の区別（設計提案）
+
+[ADRS #578](https://github.com/roccho-dev/adrs/issues/578) / [apps PR #80](https://github.com/roccho-dev/apps/pull/80) / [ops PR #509](https://github.com/roccho-org/ops/pull/509) / [envs PR #58](https://github.com/roccho-org/envs/pull/58)
+
+- 既存の内部capabilityを使う**新Consumer**は、Provider Secretの新規配布を必要としない。Consumer追加とProvider認証追加を同一扱いしない。
+- **新Providerまたは新実行target**で実際に新しい認証が必要な場合のみ、既存envs契約へ差分を宣言し、承認済みtargetへ投影・readbackする。利用者の初回OAuth同意と、毎回の手動設定は別。
+- [envs PR #48](https://github.com/roccho-org/envs/pull/48) はpublic provision投影、[envs PR #54](https://github.com/roccho-org/envs/pull/54) はJevの実Org投影を示すが、全Providerの自動配置は未実証。[envs #14](https://github.com/roccho-org/envs/issues/14) のgeneric authoringは未完了。
+- 新Mail専用Secret名やBinding名をこの提案だけで増やさない。通常Consumer実行はenvs CI/SOPS/ageを呼ばない。配置の実証は別証拠。
+
 ## Ownership
 
 ```text
@@ -88,7 +97,7 @@ THIRD_PARTY_NOTICES.md
 
 ## Environment inputs
 
-`contracts/environments.jsonl` declares each GitHub Environment's `required_secrets` and `required_variables` by name, type, and lifecycle. The actual values live only in the GitHub Environment; the owner sets them there without a commit. Git never stores a value body: before any provider effect the adapter turns a missing or invalid required input RED, and turns RED when a live Variable value appears anywhere in the repository. The only exception is the recipient metadata that sops writes into `ciphertexts/dev-jev-api.sops.yaml`, `ciphertexts/dev-rent-tunnel.sops.yaml`, `ciphertexts/dev-rent-client.sops.yaml` and `ciphertexts/dev-jev-api.oci-dev.sops.yaml`. A binding may declare its own input on an existing Environment (`jev-api.oci-dev` declares `OCI_DEV_AGE_RECIPIENT` on `dev-authoring`); only that binding's authoring reads it.
+`contracts/environments.jsonl` declares each GitHub Environment's `required_secrets` and `required_variables` by name, type, and lifecycle. These GitHub Environment values are source-plane bootstrap inputs: an authorized owner supplies a missing initial value without committing it. This is not a per-consumer setting; consumers reuse admitted provider capabilities and target-native slots without receiving source credentials. Git never stores a value body: before any provider effect the adapter turns a missing or invalid required input RED, and turns RED when a live Variable value appears anywhere in the repository. The only exception is the recipient metadata that sops writes into `ciphertexts/dev-jev-api.sops.yaml`, `ciphertexts/dev-rent-tunnel.sops.yaml`, `ciphertexts/dev-rent-client.sops.yaml` and `ciphertexts/dev-jev-api.oci-dev.sops.yaml`. A binding may declare its own input on an existing Environment (`jev-api.oci-dev` declares `OCI_DEV_AGE_RECIPIENT` on `dev-authoring`); only that binding's authoring reads it.
 
 | Environment input | Kind | Type | Lifecycle |
 |---|---|---|---|
