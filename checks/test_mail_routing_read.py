@@ -180,7 +180,7 @@ def main() -> None:
         saved = dict(os.environ)
         try:
             os.environ.clear()
-            os.environ.update(ENV, {"GITHUB_EVENT_PATH": selected})
+            os.environ.update({**ENV, "GITHUB_EVENT_PATH": selected})
             # main is exercised only with invalid inputs: never contact a
             # real provider from a source test, even with fixture credentials.
             os.environ["CLOUDFLARE_ACCOUNT_ID"] = "wrong"
