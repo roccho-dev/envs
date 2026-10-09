@@ -8,9 +8,11 @@ zone identifier, email, request URL, exception message or traceback escapes.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import ssl
 import sys
 import urllib.error
 import urllib.parse
@@ -19,9 +21,17 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 API = "https://api.cloudflare.com/client/v4"
+# Existing dev-projection Environment Variable, read directly in memory with
+# the already provided Actions token; never expand its raw value into step env,
+# argv, GitHub log/script or run metadata.
+GITHUB_ACCOUNT_URL = (
+    "https://api.github.com/repos/roccho-org/envs/environments/"
+    "dev-projection/variables/CLOUDFLARE_ACCOUNT_ID"
+)
 ACCOUNT = re.compile(r"^[0-9a-f]{32}$")
+SELECTOR = re.compile(r"^[0-9a-f]{64}$")
 LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
-STEPS = ("token", "zone", "dns", "routing", "routing_dns", "rules", "catch_all", "addresses")
+STEPS = ("account", "token", "zone", "dns", "routing", "routing_dns", "rules", "catch_all", "addresses")
 MAX_RESPONSE = 1_000_000
 MAX_PAGES = 100
 PAGE_SIZE = 50
@@ -33,29 +43,68 @@ class ReadFailure(Exception):
         self.state = state
 
 
-def domain_from_event(path: str) -> str:
+class DenyRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *_args: Any, **_kwargs: Any) -> None:
+        # Refuse both same-origin and cross-origin 30x; no Bearer forwarding.
+        return None
+
+
+def safe_opener(https_handler: urllib.request.BaseHandler | None = None) -> Opener:
+    # An explicit empty ProxyHandler suppresses the OS/ambient HTTPS_PROXY,
+    # HTTP_PROXY and no_proxy lookup used by urllib's default urlopen.
+    # The test-only handler exercises the real urllib redirect/proxy chain
+    # without a socket or a provider request.
+    handler = https_handler or urllib.request.HTTPSHandler(context=ssl.create_default_context())
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), DenyRedirect(), handler).open
+
+
+def selector_from_event(path: str) -> str:
     try:
         event = json.loads(Path(path).read_text(encoding="utf-8"))
-        value = event["inputs"]["domain"]
-        if not isinstance(value, str):
+        value = event["inputs"]["domain_sha256"]
+        if not isinstance(value, str) or not SELECTOR.fullmatch(value):
             raise ValueError()
-        domain = value.lower()
-        if (len(domain) > 253 or len(domain) < 4 or domain != value.strip().lower()
-                or "." not in domain or any(not LABEL.fullmatch(part) for part in domain.split("."))):
-            raise ValueError()
-        return domain
+        return value
     except (OSError, ValueError, KeyError, TypeError, UnicodeError):
         raise ReadFailure() from None
 
 
 def private_inputs(event_path: str, environ: Mapping[str, str]) -> tuple[str, str, str]:
-    # Reject before any network operation. Never echo an invalid value.
-    domain = domain_from_event(event_path)
-    account = environ.get("CLOUDFLARE_ACCOUNT_ID", "")
+    # The dispatch metadata contains only a non-secret fingerprint, not the
+    # raw target. This is an opaque SELECTOR, not encryption or a secrecy proof
+    # against dictionary attacks on publicly known DNS names.
+    selector = selector_from_event(event_path)
     token = environ.get("CLOUDFLARE_API_TOKEN", "")
-    if not ACCOUNT.fullmatch(account) or not token or len(token) > 4096 or token != token.strip():
+    github = environ.get("GH_TOKEN", "")
+    if (not token or len(token) > 4096 or token != token.strip()
+            or not github or len(github) > 4096 or github != github.strip()):
         raise ReadFailure()
-    return domain, account, token
+    return selector, token, github
+
+
+def configured_account(opener: Opener, github_token: str) -> str:
+    request = urllib.request.Request(
+        GITHUB_ACCOUNT_URL,
+        headers={"Authorization": "Bearer " + github_token, "Accept": "application/vnd.github+json"},
+        method="GET",
+    )
+    try:
+        with opener(request, timeout=12) as response:
+            if getattr(response, "status", None) != 200:
+                raise ReadFailure()
+            raw = response.read(MAX_RESPONSE + 1)
+        if len(raw) > MAX_RESPONSE:
+            raise ReadFailure()
+        data = json.loads(raw)
+        if (not isinstance(data, dict) or data.get("name") != "CLOUDFLARE_ACCOUNT_ID"
+                or not isinstance(data.get("value"), str) or not ACCOUNT.fullmatch(data["value"])):
+            raise ReadFailure()
+        return data["value"]
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError,
+            ValueError, TypeError, UnicodeError):
+        # GitHub 403 means lack of access to this Variable, NOT a Cloudflare
+        # permission result. Do not fall back to a different Environment.
+        raise ReadFailure() from None
 
 
 def _request(opener: Opener, token: str, path: str, params: Mapping[str, object] | None = None) -> Any:
@@ -134,12 +183,15 @@ def _empty() -> dict[str, Any]:
     }
 
 
-def observe(event_path: str, environ: Mapping[str, str], opener: Opener = urllib.request.urlopen) -> dict[str, Any]:
+def observe(event_path: str, environ: Mapping[str, str], opener: Opener | None = None) -> dict[str, Any]:
     output = _empty()
     try:
-        domain, account, token = private_inputs(event_path, environ)
+        selector, token, github_token = private_inputs(event_path, environ)
     except ReadFailure:
         return output
+
+    if opener is None:
+        opener = safe_opener()
 
     def check(step: str, fetch: Callable[[], Any]) -> Any | None:
         try:
@@ -154,23 +206,44 @@ def observe(event_path: str, environ: Mapping[str, str], opener: Opener = urllib
         output["read"][step] = "OBSERVED"
         return result
 
-    verification = check("token", lambda: _single(opener, token, "/user/tokens/verify"))
-    if verification is None or verification.get("status") != "active":
+    account = check("account", lambda: configured_account(opener, github_token))
+    if account is None:
         return output
 
+    def read_token() -> dict[str, Any]:
+        data = _single(opener, token, "/user/tokens/verify")
+        if data.get("status") not in ("active", "disabled", "expired", "inactive"):
+            raise ReadFailure()
+        return data
+
+    verification = check("token", read_token)
+    if verification is None:
+        return output
+    output["facts"]["token_active"] = verification["status"] == "active"
+    if not output["facts"]["token_active"]:
+        return output
+
+    # Do not put the domain into workflow_dispatch metadata or a step env.
+    # Enumerate only the configured account; one matching SHA-256 selector
+    # must resolve, otherwise STOP with no fallback to another account/zone.
     zones = check("zone", lambda: _list(opener, token, "/zones", {
-        "name": domain, "account.id": account, "match": "all",
+        "account.id": account, "match": "all",
     }))
     if zones is None:
         # Preserve an exact HTTP DENIED rather than rewriting it UNKNOWN.
         return output
-    if len(zones) != 1:
+    matching = []
+    for candidate in zones:
+        name = candidate.get("name")
+        if isinstance(name, str) and hashlib.sha256(name.lower().encode()).hexdigest() == selector:
+            matching.append(candidate)
+    if len(matching) != 1:
         output["read"]["zone"] = "UNKNOWN"
         return output
-    zone = zones[0]
+    zone = matching[0]
     owner = zone.get("account")
-    if (zone.get("name") != domain or not isinstance(owner, dict) or owner.get("id") != account
-            or not ACCOUNT.fullmatch(str(zone.get("id", "")))):
+    if (not isinstance(zone.get("name"), str) or not isinstance(owner, dict)
+            or owner.get("id") != account or not ACCOUNT.fullmatch(str(zone.get("id", "")))):
         output["read"]["zone"] = "UNKNOWN"
         return output
 
@@ -184,10 +257,19 @@ def observe(event_path: str, environ: Mapping[str, str], opener: Opener = urllib
         output["counts"]["mx"] = sum(x.get("type") == "MX" for x in dns)
         output["counts"]["txt"] = sum(x.get("type") == "TXT" for x in dns)
 
-    routing = check("routing", lambda: _single(opener, token, f"/zones/{zone_id}/email/routing"))
+    def read_routing() -> dict[str, Any]:
+        data = _single(opener, token, f"/zones/{zone_id}/email/routing")
+        if (type(data.get("enabled")) is not bool
+                or data.get("status") not in (
+                    "ready", "unconfigured", "misconfigured", "misconfigured/locked", "unlocked",
+                )):
+            raise ReadFailure()
+        return data
+
+    routing = check("routing", read_routing)
     if routing is not None:
-        output["facts"]["routing_ready"] = routing.get("status") == "ready"
-        output["facts"]["routing_enabled"] = routing.get("enabled") is True
+        output["facts"]["routing_ready"] = routing["status"] == "ready"
+        output["facts"]["routing_enabled"] = routing["enabled"]
 
     def routing_dns_read() -> list[dict[str, Any]]:
         payload = _request(opener, token, f"/zones/{zone_id}/email/routing/dns")
@@ -202,20 +284,45 @@ def observe(event_path: str, environ: Mapping[str, str], opener: Opener = urllib
     if routing_dns is not None:
         output["counts"]["routing_dns_records"] = len(routing_dns)
 
-    rules = check("rules", lambda: _list(opener, token, f"/zones/{zone_id}/email/routing/rules"))
+    def read_rules() -> list[dict[str, Any]]:
+        rows = _list(opener, token, f"/zones/{zone_id}/email/routing/rules")
+        if any(type(row.get("enabled")) is not bool or not isinstance(row.get("source"), str)
+               or not isinstance(row.get("actions"), list) for row in rows):
+            raise ReadFailure()
+        return rows
+
+    rules = check("rules", read_rules)
     if rules is not None:
         output["counts"]["rules"] = len(rules)
         output["counts"]["enabled_rules"] = sum(x.get("enabled") is True for x in rules)
         output["counts"]["wrangler_rules"] = sum(x.get("source") == "wrangler" for x in rules)
 
-    catch = check("catch_all", lambda: _single(opener, token, f"/zones/{zone_id}/email/routing/rules/catch_all"))
-    if catch is not None:
-        output["facts"]["catch_all_enabled"] = catch.get("enabled") is True
+    def read_catch() -> dict[str, Any]:
+        data = _single(opener, token, f"/zones/{zone_id}/email/routing/rules/catch_all")
+        if type(data.get("enabled")) is not bool:
+            raise ReadFailure()
+        return data
 
-    addresses = check("addresses", lambda: _list(opener, token, f"/accounts/{account}/email/routing/addresses"))
+    catch = check("catch_all", read_catch)
+    if catch is not None:
+        output["facts"]["catch_all_enabled"] = catch["enabled"]
+
+    def read_addresses() -> list[dict[str, Any]]:
+        rows = _list(opener, token, f"/accounts/{account}/email/routing/addresses")
+        for row in rows:
+            value = row.get("verified", ...)
+            if (not isinstance(row.get("email"), str) or not row["email"]
+                    or (value is not None and (
+                        not isinstance(value, str)
+                        or re.fullmatch(r"\d{4}-\d{2}-\d{2}T[^\s]+", value) is None
+                    ))):
+                raise ReadFailure()
+        return rows
+
+    addresses = check("addresses", read_addresses)
     if addresses is not None:
         output["counts"]["account_destinations"] = len(addresses)
-        output["counts"]["verified_destinations"] = sum(bool(x.get("verified")) for x in addresses)
+        output["counts"]["verified_destinations"] = sum(x["verified"] is not None for x in addresses)
 
     if all(output["read"][key] == "OBSERVED" for key in STEPS):
         output["status"] = "READ_OBSERVED"

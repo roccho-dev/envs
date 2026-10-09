@@ -647,10 +647,12 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]],
         # The author Environment also carries each binding's declared inputs; its steps prove which one reads which.
         declared = set().union(*author_targets.values()) if name == "author-dev-jev-api.yml" else declared_inputs(row)
         if name == "probe-dev-mail-routing.yml":
-            # Reuse only the existing token/account slots. No need to inject the
-            # projection plane's SOPS age key into a read-only consumer.
-            declared = {("secrets", "CLOUDFLARE_API_TOKEN"), ("vars", "CLOUDFLARE_ACCOUNT_ID")}
-            require(declared <= declared_inputs(row), "Mail must use existing declared dev-projection slots")
+            # The existing account *Variable* is read only by the source-bound
+            # program using the existing masked github.token via REST, never
+            # emitted in a runner step environment as an unmasked vars value.
+            require({("secrets", "CLOUDFLARE_API_TOKEN"), ("vars", "CLOUDFLARE_ACCOUNT_ID")}
+                    <= declared_inputs(row), "Mail must reuse the existing dev-projection slots")
+            declared = {("secrets", "CLOUDFLARE_API_TOKEN")}
         keys = set(EFFECT_ENV.findall(rest))
         allowed = EFFECT_STEP_KEYS | {input_name for _, input_name in declared}
         require(keys <= allowed, f"{name}: step env or input not allowed: {sorted(keys - allowed)}")
@@ -721,14 +723,24 @@ def check_workflows(root: Path, environments: dict[str, dict[str, Any]],
             "Mail read workflow must have only repository read permissions")
     require("github.sha == inputs.expected_source_sha && github.run_attempt == 1" in mail,
             "Mail read is limited to approved exact source and first attempt")
-    require("      domain:\n" in mail and "        required: true\n" in mail,
-            "Mail read needs a caller-selected exact domain")
+    require("      domain_sha256:\n" in mail and "        required: true\n" in mail
+            and not re.search(r"(?m)^      domain:\s*$", mail),
+            "Mail dispatch metadata must contain only the non-plaintext selector")
     require('        run: \'"$ENVS_EFFECT_BIN/mail-routing-read"\'\n' in mail,
             "Mail read must use the provided toolchain entry")
     require("SOPS_AGE_KEY" not in mail and "AWS_" not in mail and "CLOUDFLARE_ZONE_ID" not in mail,
             "Mail read must not borrow age/rent/state secrets or zone identifiers")
-    require("GITHUB_EVENT_PATH" in mail and "inputs.domain" not in mail,
-            "Mail domain must stay in the event file, not argv/environment")
+    require("GITHUB_EVENT_PATH" not in mail or "domain_sha256" in mail,
+            "Mail dispatch must not claim confidential plaintext in GitHub metadata")
+    require(re.search(r"inputs\.domain(?!_sha256)", mail) is None,
+            "Mail cannot carry a raw domain into metadata, argv, or step env")
+    require("${{ vars.CLOUDFLARE_ACCOUNT_ID }}" not in mail,
+            "GitHub Environment Variables are not automatically masked in step logs")
+    require("GH_TOKEN: ${{ github.token }}" in mail,
+            "Read GitHub Environment Variable in memory using existing masked GitHub token")
+    require("github.actor == 'roccho-dev'" in mail and "github.actor_id == '40359643'" in mail
+            and "github.triggering_actor == 'roccho-dev'" in mail,
+            "Mail dispatch must admit only the fixed GitHub controller, without claiming chat role identity")
 
 
 def check_toolchain(root: Path, adapter) -> None:
